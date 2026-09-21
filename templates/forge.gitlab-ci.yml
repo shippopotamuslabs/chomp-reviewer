@@ -1,0 +1,228 @@
+# Forge CI-native consolidated code reviewer (reusable template).
+#
+# Usage in your .gitlab-ci.yml:
+#
+#   include:
+#     - project: 'browntown.development/forge-reviewer'
+#       ref: v1.0.0
+#       file: '/templates/forge.gitlab-ci.yml'
+#
+#   variables:
+#     FORGE_ENABLED: "true"   # opt-in; defaults to "false"
+#
+# Required CI variables (set in your project):
+#   OPENROUTER_API_KEY:     API key for OpenRouter (thermos lenses + master dedup)
+#   PR_AGENT_GITLAB_TOKEN:  GitLab token with `api` scope (diff fetch + posting reviews)
+#
+# Optional CI variables:
+#   FORGE_MODEL:            Model ID (default: openrouter/meta/muse-spark-1.3-contributor)
+#   FORGE_REF:              forge-reviewer ref to download scripts from (default: v1.0.0)
+#   FORGE_ENABLED:          Set to "true" to enable (default: "false")
+#
+# Your repo must have a `.pr_agent.toml` with review guidance. See the
+# forge-reviewer README for details.
+
+variables:
+  FORGE_ENABLED: "false"
+  FORGE_MODEL: "openrouter/meta/muse-spark-1.3-contributor"
+  FORGE_REF: "v1.0.0"
+  FORGE_PROJECT_ID: "86730853"
+
+# ---------------------------------------------------------------------------
+# Internal: download the .forge/ scripts from the forge-reviewer repo.
+# This makes the template versioned: pin FORGE_REF to a tag.
+# ---------------------------------------------------------------------------
+.forge-setup:
+  script:
+    - |
+      set -o pipefail
+      if [ "${FORGE_ENABLED}" != "true" ]; then
+        echo "Forge disabled: set FORGE_ENABLED=true to enable."
+        exit 0
+      fi
+      if [ -z "${PR_AGENT_GITLAB_TOKEN:-}" ]; then
+        echo "ERROR: PR_AGENT_GITLAB_TOKEN not set."
+        exit 1
+      fi
+      echo "Downloading Forge scripts (ref ${FORGE_REF})..."
+      mkdir -p .forge/prompts
+      FORGE_API="https://gitlab.com/api/v4/projects/${FORGE_PROJECT_ID}"
+      for f in fetch_diff.py thermos.py master.py openrouter_client.py; do
+        curl -s --fail --header "PRIVATE-TOKEN: ${PR_AGENT_GITLAB_TOKEN}" \
+          "${FORGE_API}/repository/files/.forge%2F${f}/raw?ref=${FORGE_REF}" \
+          -o .forge/${f} || { echo "ERROR: failed to download ${f}"; exit 1; }
+      done
+      for f in thermos-correctness.md thermos-structure.md master-dedup.md; do
+        curl -s --fail --header "PRIVATE-TOKEN: ${PR_AGENT_GITLAB_TOKEN}" \
+          "${FORGE_API}/repository/files/.forge%2Fprompts%2F${f}/raw?ref=${FORGE_REF}" \
+          -o .forge/prompts/${f} || { echo "ERROR: failed to download ${f}"; exit 1; }
+      done
+      echo "Forge scripts ready."
+
+# ---------------------------------------------------------------------------
+# forge:diff — fetches the MR diff once, shares via artifacts.
+# ---------------------------------------------------------------------------
+forge:diff:
+  stage: lint
+  tags: [home-server]
+  allow_failure: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  needs: []
+  script:
+    - !reference [.forge-setup, script]
+    - |
+      set -o pipefail
+      if [ "${FORGE_ENABLED}" != "true" ]; then exit 0; fi
+      echo "Fetching MR diff for !${CI_MERGE_REQUEST_IID}..."
+      python3 .forge/fetch_diff.py "${CI_API_V4_URL}" "${CI_PROJECT_ID}" "${CI_MERGE_REQUEST_IID}" "${PR_AGENT_GITLAB_TOKEN}" --output mr.diff || { echo "ERROR: failed to fetch MR diff."; exit 1; }
+  artifacts:
+    paths:
+      - mr.diff
+    expire_in: 1 week
+    when: always
+
+# ---------------------------------------------------------------------------
+# forge:review — PR-Agent as a silent producer (plain-diff mode).
+# ---------------------------------------------------------------------------
+forge:review:
+  stage: lint
+  tags: [home-server]
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  needs:
+    - job: forge:diff
+      artifacts: true
+  script:
+    - !reference [.forge-setup, script]
+    - |
+      set -o pipefail
+      if [ "${FORGE_ENABLED}" != "true" ]; then exit 0; fi
+      if [ -z "${PR_AGENT_GITLAB_TOKEN:-}" ]; then
+        echo "Forge review skipped: PR_AGENT_GITLAB_TOKEN not set."
+        exit 0
+      fi
+      if [ ! -s mr.diff ]; then
+        echo "ERROR: mr.diff missing; cannot run PR-Agent."
+        exit 1
+      fi
+      if [ ! -f .pr_agent.toml ]; then
+        echo "ERROR: .pr_agent.toml not found; cannot run PR-Agent."
+        exit 1
+      fi
+      # Install PR-Agent from PyPI (unmodified upstream)
+      python3 -m venv /tmp/pr-agent-venv
+      /tmp/pr-agent-venv/bin/pip install -q pr-agent || { echo "ERROR: pip install pr-agent failed."; exit 1; }
+      # Run in plain-diff mode (silent producer, no GitLab posting)
+      /tmp/pr-agent-venv/bin/python -m pr_agent.cli --diff-file mr.diff --output pr-agent-findings.md || { echo "ERROR: PR-Agent failed."; exit 1; }
+      if ! grep -q "## PR Reviewer Guide" pr-agent-findings.md; then
+        echo "ERROR: PR-Agent output lacks the Guide header."
+        exit 1
+      fi
+      echo "PR-Agent findings captured."
+  artifacts:
+    paths:
+      - pr-agent-findings.md
+    expire_in: 1 week
+    when: always
+
+# ---------------------------------------------------------------------------
+# Forge thermos lenses (parallel producers).
+# ---------------------------------------------------------------------------
+.forge-thermos-base:
+  stage: lint
+  tags: [home-server]
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  needs:
+    - job: forge:diff
+      artifacts: true
+
+forge:thermos-correctness:
+  extends: .forge-thermos-base
+  script:
+    - !reference [.forge-setup, script]
+    - |
+      set -o pipefail
+      if [ "${FORGE_ENABLED}" != "true" ]; then exit 0; fi
+      if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+        echo "Forge thermos skipped: OPENROUTER_API_KEY not set."
+        exit 0
+      fi
+      if [ ! -s mr.diff ]; then
+        echo "ERROR: mr.diff missing; cannot run thermos lens."
+        exit 1
+      fi
+      python3 .forge/thermos.py --lens correctness --diff mr.diff --output thermos-correctness.json
+  artifacts:
+    paths:
+      - thermos-correctness.json
+    expire_in: 1 week
+    when: always
+
+forge:thermos-structure:
+  extends: .forge-thermos-base
+  script:
+    - !reference [.forge-setup, script]
+    - |
+      set -o pipefail
+      if [ "${FORGE_ENABLED}" != "true" ]; then exit 0; fi
+      if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+        echo "Forge thermos skipped: OPENROUTER_API_KEY not set."
+        exit 0
+      fi
+      if [ ! -s mr.diff ]; then
+        echo "ERROR: mr.diff missing; cannot run thermos lens."
+        exit 1
+      fi
+      python3 .forge/thermos.py --lens structure --diff mr.diff --output thermos-structure.json
+  artifacts:
+    paths:
+      - thermos-structure.json
+    expire_in: 1 week
+    when: always
+
+# ---------------------------------------------------------------------------
+# forge:master — dedups all three sources, posts ONE consolidated review.
+# This is the only job that posts to GitLab.
+# ---------------------------------------------------------------------------
+forge:master:
+  stage: lint
+  tags: [home-server]
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  needs:
+    - job: forge:diff
+      artifacts: true
+    - job: forge:review
+      artifacts: true
+    - job: forge:thermos-correctness
+      artifacts: true
+    - job: forge:thermos-structure
+      artifacts: true
+  script:
+    - !reference [.forge-setup, script]
+    - |
+      set -o pipefail
+      if [ "${FORGE_ENABLED}" != "true" ]; then exit 0; fi
+      if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+        echo "Forge master skipped: OPENROUTER_API_KEY not set."
+        exit 0
+      fi
+      if [ -z "${PR_AGENT_GITLAB_TOKEN:-}" ]; then
+        echo "Forge master skipped: PR_AGENT_GITLAB_TOKEN not set."
+        exit 0
+      fi
+      python3 .forge/master.py --iid "${CI_MERGE_REQUEST_IID}" --sha "${CI_COMMIT_SHA}" \
+        --pr-agent pr-agent-findings.md \
+        --thermos-a thermos-correctness.json \
+        --thermos-b thermos-structure.json \
+        --diff mr.diff
+  artifacts:
+    paths:
+      - forge-recorded.json
+    expire_in: 1 week
+    when: always
