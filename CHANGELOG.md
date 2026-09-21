@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.1 (2026-09-21)
+
+- Fix: single-pass placeholder substitution in `thermos.py` and `master.py`. The chained `.replace()` could corrupt prompts if a diff or findings contained a placeholder string (e.g. `{file_contents}`).
+- Fix: pin `pr-agent==0.46.0` in a venv (was unpinned `pip install pr-agent` with `--break-system-packages`).
+
 ## v1.0.0 (2026-09-21)
 
 Initial release. Extracted from the Stratum project's CI-native Forge implementation.
