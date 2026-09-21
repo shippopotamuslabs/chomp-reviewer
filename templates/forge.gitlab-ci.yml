@@ -115,7 +115,12 @@ forge:review:
       # Uses a venv to avoid --break-system-packages on the shared runner.
       python3 -m venv /tmp/pr-agent-venv
       /tmp/pr-agent-venv/bin/pip install -q "pr-agent==0.46.0" || { echo "ERROR: pip install pr-agent failed."; exit 1; }
-      # Run in plain-diff mode (silent producer, no GitLab posting)
+      # Run in plain-diff mode (silent producer, no GitLab posting).
+      # PR-Agent uses dynaconf: OPENROUTER__KEY (double underscore) maps to [openrouter].key.
+      # OPENROUTER_API_KEY alone is NOT picked up, causing fallback to GPT-5/dummy_token.
+      CONFIG__MODEL="${FORGE_MODEL:-openrouter/meta/muse-spark-1.3-contributor}" \
+      OPENROUTER__KEY="${OPENROUTER_API_KEY}" \
+      CONFIG__CUSTOM_MODEL_MAX_TOKENS="1000000" \
       /tmp/pr-agent-venv/bin/python -m pr_agent.cli --diff-file=mr.diff --output=pr-agent-findings.md review || { echo "ERROR: PR-Agent failed."; exit 1; }
       if ! grep -q "## PR Reviewer Guide" pr-agent-findings.md; then
         echo "ERROR: PR-Agent output lacks the Guide header."
