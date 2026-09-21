@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.2 (2026-09-21)
+
+- Fix: add missing `review` command to `pr_agent.cli` invocation (was failing with "arguments are required: command, rest").
+
 ## v1.0.1 (2026-09-21)
 
 - Fix: single-pass placeholder substitution in `thermos.py` and `master.py`. The chained `.replace()` could corrupt prompts if a diff or findings contained a placeholder string (e.g. `{file_contents}`).
