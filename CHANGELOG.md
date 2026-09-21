@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.3 (2026-09-21)
+
+- Fix: set `OPENROUTER__KEY` (dynaconf) and `CONFIG__MODEL` for PR-Agent; without these it fell back to GPT-5/dummy_token.
+
 ## v1.0.2 (2026-09-21)
 
 - Fix: add missing `review` command to `pr_agent.cli` invocation (was failing with "arguments are required: command, rest").
