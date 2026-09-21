@@ -116,7 +116,7 @@ forge:review:
       python3 -m venv /tmp/pr-agent-venv
       /tmp/pr-agent-venv/bin/pip install -q "pr-agent==0.46.0" || { echo "ERROR: pip install pr-agent failed."; exit 1; }
       # Run in plain-diff mode (silent producer, no GitLab posting)
-      /tmp/pr-agent-venv/bin/python -m pr_agent.cli --diff-file mr.diff --output pr-agent-findings.md || { echo "ERROR: PR-Agent failed."; exit 1; }
+      /tmp/pr-agent-venv/bin/python -m pr_agent.cli --diff-file=mr.diff --output=pr-agent-findings.md review || { echo "ERROR: PR-Agent failed."; exit 1; }
       if ! grep -q "## PR Reviewer Guide" pr-agent-findings.md; then
         echo "ERROR: PR-Agent output lacks the Guide header."
         exit 1
