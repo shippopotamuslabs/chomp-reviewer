@@ -13,10 +13,18 @@ Environment:
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from openrouter_client import get_model, call_openrouter
+
+def substitute_placeholders(template, mapping):
+    """Single-pass placeholder substitution. Unlike chained .replace(),
+    substituted values are never re-scanned, so a diff containing a
+    placeholder string (e.g. "{file_contents}") cannot corrupt the prompt."""
+    pattern = re.compile("|".join(re.escape(k) for k in mapping.keys()))
+    return pattern.sub(lambda m: mapping[m.group(0)], template)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -47,7 +55,10 @@ def main():
     # In CI, we can fetch file contents via the API if needed.
     file_contents = "(See diff above for changed lines. Full file contents not fetched in CI mode.)"
 
-    prompt = template.replace("{diff}", diff).replace("{file_contents}", file_contents)
+    prompt = substitute_placeholders(template, {
+        "{diff}": diff,
+        "{file_contents}": file_contents,
+    })
 
     print(f"Calling OpenRouter ({model}) for {args.lens} lens...", file=sys.stderr)
     response = call_openrouter(api_key, model, prompt)
