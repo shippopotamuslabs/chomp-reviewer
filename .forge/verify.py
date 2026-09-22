@@ -78,6 +78,22 @@ def get_forge_discussions(api_url, project_id, iid, token):
     return forge_open
 
 
+def resolve_discussion(api_url, project_id, iid, disc_id, token):
+    """Resolve one MR discussion via the GitLab API.
+
+    GitLab resolves a thread with PUT on the discussion resource itself:
+    PUT /projects/:id/merge_requests/:iid/discussions/:discussion_id
+    with {"resolved": true}. There is no .../discussions/:id/resolve
+    sub-resource (it 404s).
+    """
+    return gitlab_request(
+        "PUT",
+        f"{api_url}/projects/{project_id}/merge_requests/{iid}/discussions/{disc_id}",
+        token,
+        data={"resolved": True},
+    )
+
+
 def build_verify_prompt(finding_body, diff):
     """Build the verification prompt for the LLM."""
     return f"""You are verifying whether a code review finding has been addressed by a new diff.
@@ -187,14 +203,7 @@ def main():
         if verdict == "ADDRESSED":
             addressed += 1
             if not args.dry_run:
-                # Resolve the discussion
-                # GitLab API: PUT /projects/:id/merge_requests/:iid/discussions/:discussion_id/resolve
-                gitlab_request(
-                    "PUT",
-                    f"{api_url}/projects/{project_id}/merge_requests/{args.iid}/discussions/{disc_id}/resolve",
-                    gitlab_token,
-                    data={"resolved": True},
-                )
+                resolve_discussion(api_url, project_id, args.iid, disc_id, gitlab_token)
                 print(f"  Resolved discussion {disc_id}", file=sys.stderr)
         else:
             not_addressed += 1
