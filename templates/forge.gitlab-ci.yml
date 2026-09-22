@@ -47,7 +47,7 @@ variables:
       echo "Downloading Forge scripts (ref ${FORGE_REF})..."
       mkdir -p .forge/prompts
       FORGE_API="https://gitlab.com/api/v4/projects/${FORGE_PROJECT_ID}"
-      for f in fetch_diff.py thermos.py master.py openrouter_client.py; do
+      for f in fetch_diff.py thermos.py master.py verify.py openrouter_client.py; do
         curl -s --fail --header "PRIVATE-TOKEN: ${PR_AGENT_GITLAB_TOKEN}" \
           "${FORGE_API}/repository/files/.forge%2F${f}/raw?ref=${FORGE_REF}" \
           -o .forge/${f} || { echo "ERROR: failed to download ${f}"; exit 1; }
