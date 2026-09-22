@@ -14,6 +14,32 @@ import sys
 import urllib.request
 
 
+def assemble_mr_diff(changes):
+    """Assemble per-file GitLab API diff fragments into one mr.diff document.
+
+    Each fragment is preserved byte-for-byte apart from the prepended
+    'diff --git' header and newline separators between file sections. In
+    particular a file diff ending in a blank context line (a single ' '
+    line) must keep that line: dropping it leaves the hunk one body line
+    short and unidiff aborts with 'Hunk diff line expected: diff --git ...'.
+    Only newline padding is trimmed, never trailing whitespace content.
+    Returns the document string, or "" when there are no diffs.
+    """
+    diff_parts = []
+    for change in changes:
+        diff = change.get("diff", "")
+        old_path = change.get("old_path", "")
+        new_path = change.get("new_path", "")
+        if diff and diff.strip():
+            header = f"diff --git a/{old_path} b/{new_path}"
+            diff_parts.append(header + "\n" + diff.strip("\n"))
+
+    if not diff_parts:
+        return ""
+
+    return "\n".join(diff_parts) + "\n"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("api_url", help="GitLab API base URL")
@@ -31,22 +57,15 @@ def main():
         print(f"ERROR: could not fetch MR changes: {e}", file=sys.stderr)
         sys.exit(1)
 
-    diff_parts = []
-    for change in data.get("changes", []):
-        diff = change.get("diff", "")
-        old_path = change.get("old_path", "")
-        new_path = change.get("new_path", "")
-        if diff and diff.strip():
-            header = f"diff --git a/{old_path} b/{new_path}"
-            diff_parts.append(header + "\n" + diff.strip())
+    document = assemble_mr_diff(data.get("changes", []))
 
-    if not diff_parts:
+    if not document:
         print("ERROR: MR has no diffs; nothing to review.", file=sys.stderr)
         sys.exit(1)
 
     with open(args.output, "w") as f:
-        f.write("\n".join(diff_parts) + "\n")
-    print(f"Wrote {args.output} with {len(diff_parts)} file diffs")
+        f.write(document)
+    print(f"Wrote {args.output} with {document.count('diff --git ')} file diffs")
 
 
 if __name__ == "__main__":
