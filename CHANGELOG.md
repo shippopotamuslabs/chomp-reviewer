@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.4 (2026-09-21)
+
+- Feat: add `verify.py` for AI-based discussion resolution on subsequent pushes. `forge:master` now checks for an existing consolidated review; if found, it runs verification (LLM determines ADDRESSED/NOT_ADDRESSED for each open Forge discussion, resolves addressed ones) instead of re-posting the full review. Eliminates reviewer churn.
+
 ## v1.0.3 (2026-09-21)
 
 - Fix: set `OPENROUTER__KEY` (dynaconf) and `CONFIG__MODEL` for PR-Agent; without these it fell back to GPT-5/dummy_token.
