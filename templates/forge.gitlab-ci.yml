@@ -222,11 +222,35 @@ forge:master:
         echo "Forge master skipped: PR_AGENT_GITLAB_TOKEN not set."
         exit 0
       fi
-      python3 .forge/master.py --iid "${CI_MERGE_REQUEST_IID}" --sha "${CI_COMMIT_SHA}" \
-        --pr-agent pr-agent-findings.md \
-        --thermos-a thermos-correctness.json \
-        --thermos-b thermos-structure.json \
-        --diff mr.diff
+      # Review-once guard: check if a consolidated review already exists.
+      # If yes, run verification (resolve addressed discussions) instead of a full review.
+      # If no, run the full review.
+      REVIEW_EXISTS="$(python3 - "${CI_API_V4_URL}" "${CI_PROJECT_ID}" "${CI_MERGE_REQUEST_IID}" "${PR_AGENT_GITLAB_TOKEN}" <<'FORGE_PY'
+      import json, sys, urllib.request
+      api, pid, iid, token = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+      url = f"{api}/projects/{pid}/merge_requests/{iid}/notes?per_page=100"
+      req = urllib.request.Request(url, headers={"PRIVATE-TOKEN": token})
+      try:
+          notes = json.load(urllib.request.urlopen(req))
+          found = any("forge:consolidated-review" in (n.get("body") or "") for n in notes)
+          print("yes" if found else "no")
+      except Exception as e:
+          print(f"ERROR checking for existing review: {e}", file=sys.stderr)
+          print("no")
+      FORGE_PY
+      )"
+      if [ "${REVIEW_EXISTS}" = "yes" ]; then
+        echo "Consolidated review already exists; running verification (not a full review)."
+        python3 .forge/verify.py --iid "${CI_MERGE_REQUEST_IID}" --sha "${CI_COMMIT_SHA}" \
+          --diff mr.diff
+      else
+        echo "No existing review; running full review."
+        python3 .forge/master.py --iid "${CI_MERGE_REQUEST_IID}" --sha "${CI_COMMIT_SHA}" \
+          --pr-agent pr-agent-findings.md \
+          --thermos-a thermos-correctness.json \
+          --thermos-b thermos-structure.json \
+          --diff mr.diff
+      fi
   artifacts:
     paths:
       - forge-recorded.json
