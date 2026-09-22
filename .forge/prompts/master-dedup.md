@@ -41,6 +41,16 @@ Return a JSON object with two keys:
 
 Order findings by severity: Critical first, then High, Medium, Low.
 
+## Line-number grounding (required — GitLab rejects off-diff positions)
+
+Each finding is posted as an inline comment, and GitLab only accepts
+positions on lines that are part of the MR Diff above. A wrong line means
+the comment is never posted inline:
+
+- `file` MUST be a path that appears in the MR Diff (after a `diff --git a/... b/...` header).
+- `line_start`/`line_end` MUST be NEW-file line numbers on added (`+`) or context (` `) hunk lines — never on deleted (`-`) lines, and never on lines outside a hunk.
+- If the problem sits on a deleted line, anchor to the nearest surviving added/context line in the same hunk and say so in `evidence`.
+
 - If all three sources are clean, return `{"summary": "...", "findings": []}` — a clean bill is valid.
 - Severity guide: Critical (blocks merge: crashes, data loss, security vuln), High (bug in normal use), Medium (edge case or risky pattern), Low (polish).
 - The `sources` array lists which producers flagged this (after dedup): "pr-agent", "thermos-a", "thermos-b".

@@ -17,6 +17,7 @@ Environment:
     FORGE_MODEL: model to use (default: openrouter/meta/muse-spark-1.3-contributor)
 """
 import argparse
+import bisect
 import json
 import os
 import re
@@ -34,6 +35,201 @@ def substitute_placeholders(template, mapping):
     placeholder string cannot corrupt the prompt."""
     pattern = re.compile("|".join(re.escape(k) for k in mapping.keys()))
     return pattern.sub(lambda m: mapping[m.group(0)], template)
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+def _strip_git_prefix(token, prefix):
+    if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
+        token = token[1:-1]
+    if token.startswith(prefix):
+        return token[len(prefix):]
+    return token
+
+def parse_diff_line_map(diff_text):
+    """Parse a unified diff into per-file valid diff-line maps.
+
+    GitLab only accepts inline-discussion positions on lines that are part
+    of the MR diff: added/context lines (addressed via new_line) and
+    deleted lines (addressed via old_line). Lines outside hunks are invalid
+    and make the API reject the discussion with a 400.
+
+    Returns (line_map, file_order) where line_map maps new_path to
+    {"old_path", "new_path", "new_lines": set, "old_lines": set,
+     "new_to_old": {new: old}} plus an "aliases" sub-dict mapping old_path
+    to new_path for renames. file_order lists new_paths in diff order.
+    """
+    line_map = {}
+    aliases = {}
+    file_order = []
+    cur = None
+    old_line = new_line = None
+    for raw in diff_text.splitlines():
+        if raw.startswith("diff --git "):
+            parts = raw[len("diff --git "):].split()
+            if len(parts) < 2:
+                cur = None
+                old_line = new_line = None
+                continue
+            old_path = _strip_git_prefix(parts[-2], "a/")
+            new_path = _strip_git_prefix(parts[-1], "b/")
+            cur = {"old_path": old_path, "new_path": new_path,
+                   "new_lines": set(), "old_lines": set(), "new_to_old": {}}
+            line_map[new_path] = cur
+            if old_path != new_path:
+                aliases[old_path] = new_path
+            file_order.append(new_path)
+            old_line = new_line = None
+            continue
+        if cur is None:
+            continue
+        if raw.startswith("@@ "):
+            m = HUNK_RE.match(raw)
+            if not m:
+                old_line = new_line = None
+                continue
+            old_line = int(m.group(1))
+            new_line = int(m.group(3))
+            continue
+        if old_line is None or new_line is None:
+            continue  # file headers (---/+++/index/...) outside hunks
+        if raw.startswith("+"):
+            cur["new_lines"].add(new_line)
+            new_line += 1
+        elif raw.startswith("-"):
+            cur["old_lines"].add(old_line)
+            old_line += 1
+        elif raw.startswith(" "):
+            cur["new_lines"].add(new_line)
+            cur["old_lines"].add(old_line)
+            cur["new_to_old"][new_line] = old_line
+            old_line += 1
+            new_line += 1
+        # else: "\ No newline at end of file", "Binary files ... differ", etc.
+    return {"files": line_map, "aliases": aliases}, file_order
+
+def _nearest_line(sorted_lines, target):
+    i = bisect.bisect_left(sorted_lines, target)
+    cands = []
+    if i < len(sorted_lines):
+        cands.append(sorted_lines[i])
+    if i > 0:
+        cands.append(sorted_lines[i - 1])
+    return min(cands, key=lambda c: (abs(c - target), c))
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def build_inline_attempts(parsed, file_order, file_path, line_start, line_end):
+    """Build ordered inline-position attempts for one finding.
+
+    Returns (attempts, meta). Each attempt is {"new_path", "old_path",
+    "new_line" or None, "old_line" or None}. Attempts are guaranteed
+    non-empty whenever the diff contains any valid diff line, so with the
+    retry loop below every finding lands as an inline discussion instead
+    of being silently dropped. meta carries "relocated" (True when the
+    finding's own file/line was unusable) and the requested location.
+    """
+    requested = {"file": file_path, "line_start": line_start, "line_end": line_end}
+    files = parsed["files"]
+    entry = files.get(file_path)
+    if entry is None and file_path in parsed["aliases"]:
+        entry = files.get(parsed["aliases"][file_path])
+    if entry is None:
+        # Tolerate a stray a-/b- prefix from the model.
+        for prefix in ("a/", "b/"):
+            if file_path.startswith(prefix) and file_path[len(prefix):] in files:
+                entry = files[file_path[len(prefix):]]
+                break
+
+    attempts = []
+    if entry is not None and entry["new_lines"]:
+        new_sorted = sorted(entry["new_lines"])
+        in_range = [n for n in range(line_start, line_end + 1) if n in entry["new_lines"]]
+        if in_range:
+            primary = in_range[0]
+        else:
+            primary = _nearest_line(new_sorted, line_start)
+        ordered = [primary] + [n for n in sorted(new_sorted, key=lambda c: (abs(c - line_start), c)) if n != primary]
+        # Cap retries: primary + closest alternates + file's first diff line.
+        seen = set()
+        for n in ordered + ([new_sorted[0]] if new_sorted[0] != primary else []):
+            if n not in seen:
+                seen.add(n)
+                attempts.append({"new_path": entry["new_path"], "old_path": entry["old_path"],
+                                 "new_line": n, "old_line": None})
+            if len(attempts) >= 5:
+                break
+        relocated = (file_path != entry["new_path"]) or (line_start not in entry["new_lines"] and not in_range)
+        return attempts, {"relocated": relocated, "requested": requested}
+    if entry is not None and entry["old_lines"]:
+        # Deletion-only file: nothing survives on the new side, anchor via old_line.
+        old_sorted = sorted(entry["old_lines"])
+        in_range = [n for n in range(line_start, line_end + 1) if n in entry["old_lines"]]
+        primary = in_range[0] if in_range else _nearest_line(old_sorted, line_start)
+        seen = set()
+        for n in [primary] + [c for c in sorted(old_sorted, key=lambda c: (abs(c - line_start), c)) if c != primary]:
+            if n not in seen:
+                seen.add(n)
+                attempts.append({"new_path": entry["new_path"], "old_path": entry["old_path"],
+                                 "new_line": None, "old_line": n})
+            if len(attempts) >= 5:
+                break
+        return attempts, {"relocated": line_start not in entry["old_lines"] and not in_range, "requested": requested}
+    # Unknown file (or file with no diff lines): fall back to the first
+    # valid diff lines elsewhere so the finding still lands inline. The
+    # body notes the originally flagged location.
+    for fallback_path in file_order[:3]:
+        fb = files[fallback_path]
+        if fb["new_lines"]:
+            n = sorted(fb["new_lines"])[0]
+            attempts.append({"new_path": fb["new_path"], "old_path": fb["old_path"],
+                             "new_line": n, "old_line": None})
+    return attempts, {"relocated": True, "requested": requested}
+
+def post_inline_attempt(api_url, project_id, iid, token, body, attempt,
+                        base_sha, head_sha, start_sha):
+    """Post one inline-discussion attempt. Returns the parsed discussion."""
+    params = {
+        "body": body,
+        "position[position_type]": "text",
+        "position[base_sha]": base_sha,
+        "position[head_sha]": head_sha,
+        "position[start_sha]": start_sha,
+        "position[new_path]": attempt["new_path"],
+    }
+    if attempt.get("new_line") is not None:
+        params["position[new_line]"] = str(attempt["new_line"])
+    if attempt.get("old_line") is not None:
+        params["position[old_path]"] = attempt["old_path"]
+        params["position[old_line]"] = str(attempt["old_line"])
+    data = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request(
+        f"{api_url}/projects/{project_id}/merge_requests/{iid}/discussions",
+        data=data,
+        method="POST",
+        headers={
+            "PRIVATE-TOKEN": token,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)
+
+def post_inline_with_fallback(post_fn, body, attempts):
+    """Try each attempt in order. Returns (result, index of winning attempt).
+
+    Raises RuntimeError if every attempt fails.
+    """
+    last_err = None
+    for i, attempt in enumerate(attempts):
+        try:
+            return post_fn(body, attempt), i
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"all {len(attempts)} inline positions rejected: {last_err}")
 
 def gitlab_request(method, url, token, data=None):
     """Make a GitLab API request."""
@@ -162,12 +358,25 @@ def build_rollup(sha, summary, findings, project_path):
 
     return "\n".join(lines)
 
-def build_inline(sha, finding):
-    """Build the inline discussion body."""
+def build_inline(sha, finding, meta=None):
+    """Build the inline discussion body.
+
+    When the comment had to be anchored to a different line than the one
+    flagged (nearest valid diff line), an invisible HTML comment records
+    the originally requested location for debugging.
+    """
     badge = severity_badge(finding.get("severity", "Low"))
     cat = category_tag(finding.get("category", ""))
     title = finding.get("title", "Untitled")
-    return f"""<!-- forge:consolidated-review sha:{sha} -->
+    anchor_note = ""
+    if meta and meta.get("relocated"):
+        req = meta.get("requested", {})
+        anchor_note = (
+            f"\n<!-- forge:anchor originally flagged "
+            f"{req.get('file')}[L{req.get('line_start')}-{req.get('line_end')}] "
+            f"— anchored to nearest valid diff line -->"
+        )
+    return f"""<!-- forge:consolidated-review sha:{sha} -->{anchor_note}
 {badge} — {title} <code>{cat}</code>
 
 <pre>
@@ -280,61 +489,65 @@ def main():
     )
     print(f"Rollup posted: note {note.get('id')}", file=sys.stderr)
 
+    # Parse mr.diff into valid diff-line maps. GitLab rejects inline
+    # positions on lines outside the diff, so every finding is resolved to
+    # the nearest valid diff line (with retries) instead of trusting the
+    # model's line number blindly.
+    parsed_map, file_order = parse_diff_line_map(diff)
+    n_valid = sum(len(e["new_lines"]) + len(e["old_lines"]) for e in parsed_map["files"].values())
+    print(f"Diff covers {len(file_order)} files with {n_valid} positionable lines", file=sys.stderr)
+
     # Post inline discussions
     recorded = []
+    failed = []
     for f in findings:
-        file_path = f.get("file", "")
-        line_start = f.get("line_start", 0)
-        inline_body = build_inline(args.sha, f)
+        file_path = (f.get("file", "") or "").strip()
+        line_start = _safe_int(f.get("line_start", 0))
+        line_end = _safe_int(f.get("line_end", line_start), line_start)
+        if line_end < line_start:
+            line_start, line_end = line_end, line_start
 
-        # Build position
-        # For simplicity, use new_path/new_line (assumes added lines; the LLM should ground line numbers in the diff)
-        position = {
-            "position_type": "text",
-            "base_sha": base_sha,
-            "head_sha": head_sha,
-            "start_sha": start_sha,
-            "new_path": file_path,
-            "new_line": line_start,
-        }
+        attempts, meta = build_inline_attempts(parsed_map, file_order, file_path, line_start, line_end)
+        inline_body = build_inline(args.sha, f, meta)
+        if not attempts:
+            print(f"  ERROR: No positionable lines in diff; cannot post inline for "
+                  f"{file_path}:{line_start}-{line_end}", file=sys.stderr)
+            failed.append({"file": file_path, "line_start": line_start,
+                           "line_end": line_end, "error": "empty diff"})
+            continue
 
-        print(f"Posting inline for {file_path}:{line_start}...", file=sys.stderr)
-        # GitLab discussions API with position
-        # We need to use form-encoded for nested position params
-        import urllib.parse
-        params = {
-            "body": inline_body,
-            "position[position_type]": "text",
-            "position[base_sha]": base_sha,
-            "position[head_sha]": head_sha,
-            "position[start_sha]": start_sha,
-            "position[new_path]": file_path,
-            "position[new_line]": str(line_start),
-        }
-        data = urllib.parse.urlencode(params).encode()
-        req = urllib.request.Request(
-            f"{api_url}/projects/{project_id}/merge_requests/{args.iid}/discussions",
-            data=data,
-            method="POST",
-            headers={
-                "PRIVATE-TOKEN": gitlab_token,
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-        )
+        anchor = attempts[0]
+        anchor_desc = (f"{anchor['new_path']}:{anchor['new_line']}"
+                       if anchor.get("new_line") is not None
+                       else f"{anchor['old_path']}:{anchor['old_line']} (old)")
+        print(f"Posting inline for {file_path}:{line_start}-{line_end} "
+              f"(resolved {anchor_desc}, {len(attempts)} attempts)...", file=sys.stderr)
+
+        def post_fn(body, attempt, _a=args, _t=gitlab_token):
+            return post_inline_attempt(api_url, project_id, _a.iid, _t, body, attempt,
+                                       base_sha, head_sha, start_sha)
+
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                discussion = json.load(resp)
-                disc_id = discussion.get("id")
-                print(f"  Discussion {disc_id} posted", file=sys.stderr)
-                recorded.append({
-                    "id": disc_id,
-                    "file": file_path,
-                    "line_start": line_start,
-                    "line_end": f.get("line_end", line_start),
-                    "source": "+".join(f.get("sources", ["forge"])),
-                })
+            discussion, won = post_inline_with_fallback(post_fn, inline_body, attempts)
+            used = attempts[won]
+            disc_id = discussion.get("id")
+            print(f"  Discussion {disc_id} posted at "
+                  f"{used['new_path']}:{used.get('new_line') or used.get('old_line')}", file=sys.stderr)
+            recorded.append({
+                "id": disc_id,
+                "file": file_path,
+                "line_start": line_start,
+                "line_end": line_end,
+                "source": "+".join(f.get("sources", ["forge"])),
+                "resolved_path": used["new_path"],
+                "resolved_line": used.get("new_line") if used.get("new_line") is not None else used.get("old_line"),
+                "anchor": "new" if used.get("new_line") is not None else "old",
+                "relocated": meta["relocated"] or won > 0,
+            })
         except Exception as e:
-            print(f"  WARNING: Failed to post inline for {file_path}:{line_start}: {e}", file=sys.stderr)
+            print(f"  ERROR: Failed to post inline for {file_path}:{line_start}: {e}", file=sys.stderr)
+            failed.append({"file": file_path, "line_start": line_start,
+                           "line_end": line_end, "error": str(e)})
             # Continue with other findings
 
     # Write recorded discussions for the verify job
@@ -343,8 +556,11 @@ def main():
             "iid": args.iid,
             "sha": args.sha,
             "discussions": recorded,
+            "failed": failed,
         }, f, indent=2)
     print(f"Recorded {len(recorded)} discussions to forge-recorded.json", file=sys.stderr)
+    if failed:
+        print(f"ERROR: {len(failed)} findings could not be posted inline: {failed}", file=sys.stderr)
 
     # Summary counts
     counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
