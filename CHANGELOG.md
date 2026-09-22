@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.6 (2026-09-22)
+
+- Fix: preserve trailing blank context lines in `forge:diff` assembly. `fetch_diff.py` trimmed each per-file fragment with `.strip()`, dropping a file diff's final blank context line (`' '`), which left the hunk one body line short and crashed `forge:review` in pr-agent with `UnidiffParseError: Hunk diff line expected: diff --git ...`. Fragments now pass through byte-for-byte apart from the prepended header (only newline padding is trimmed). Adds `tests/test_fetch_diff.py` regression coverage.
+- Chore: untrack compiled bytecode (`.forge/__pycache__/*.pyc`) and ignore `__pycache__/`.
+
 ## v1.0.5 (2026-09-21)
 
 - Fix: include `verify.py` in the `.forge-setup` download list (was missing, causing `forge:master` to fail on verification runs).
