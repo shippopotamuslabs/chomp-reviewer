@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.7 (2026-09-22)
+
+- Fix: post every finding as an inline discussion. `forge:master` positioned each comment with a single-shot `position[new_line]=line_start` and silently dropped any finding GitLab rejected (WARNING only) — deleted lines, lines outside a hunk, or mismatched paths never appeared inline even though the rollup Guide listed them. `master.py` now parses `mr.diff` into per-file valid diff-line maps, resolves each finding to the nearest valid line (in-range lines first, `old_line` anchoring for deletion-only files, cross-file fallback for unknown paths so a comment is always inline), and retries across candidate positions instead of dropping the finding. Relocated comments carry an invisible `forge:anchor` note with the originally flagged location, and `forge-recorded.json` now records the resolved anchor plus any failures. The dedup prompt requires diff-grounded line numbers. Adds `tests/test_master_position.py` regression coverage.
+
 ## v1.0.6 (2026-09-22)
 
 - Fix: preserve trailing blank context lines in `forge:diff` assembly. `fetch_diff.py` trimmed each per-file fragment with `.strip()`, dropping a file diff's final blank context line (`' '`), which left the hunk one body line short and crashed `forge:review` in pr-agent with `UnidiffParseError: Hunk diff line expected: diff --git ...`. Fragments now pass through byte-for-byte apart from the prepended header (only newline padding is trimmed). Adds `tests/test_fetch_diff.py` regression coverage.
