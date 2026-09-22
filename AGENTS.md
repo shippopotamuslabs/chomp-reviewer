@@ -16,7 +16,13 @@
    commit. Patch-bump for fixes (`v1.0.6` → `v1.0.7`).
 4. Tag the changelog commit (`git tag vX.Y.Z`). Versions ARE git tags;
    there is no version file.
-5. Never `push` (branch or tags) unless the user explicitly asks.
+5. Publish the release as part of the same flow — including when the
+   change is going out via MR. Push the branch and the tag
+   (`git push origin <branch> vX.Y.Z`) and verify with
+   `git ls-remote --tags origin`. A local-only tag is NOT a release
+   (this bit us with v1.0.7: upstream showed only v1.0.6 until the tag
+   was pushed, blocking consumers pinning `FORGE_REF`).
+6. Any other `push` still needs an explicit ask.
 
 ## Conventions
 
