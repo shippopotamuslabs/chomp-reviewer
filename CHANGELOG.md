@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.8 (2026-09-22)
+
+- Fix: resolve addressed discussions via the correct GitLab endpoint. `verify.py` used `PUT .../merge_requests/:iid/discussions/:id/resolve`, which does not exist, so every ADDRESSED verdict failed with `404 Not Found` and no discussion was ever resolved. Resolution now uses `PUT .../merge_requests/:iid/discussions/:discussion_id` with `{"resolved": true}` via a new `resolve_discussion()` helper. Adds `tests/test_verify_resolve.py` regression coverage.
+
 ## v1.0.7 (2026-09-22)
 
 - Fix: post every finding as an inline discussion. `forge:master` positioned each comment with a single-shot `position[new_line]=line_start` and silently dropped any finding GitLab rejected (WARNING only) — deleted lines, lines outside a hunk, or mismatched paths never appeared inline even though the rollup Guide listed them. `master.py` now parses `mr.diff` into per-file valid diff-line maps, resolves each finding to the nearest valid line (in-range lines first, `old_line` anchoring for deletion-only files, cross-file fallback for unknown paths so a comment is always inline), and retries across candidate positions instead of dropping the finding. Relocated comments carry an invisible `forge:anchor` note with the originally flagged location, and `forge-recorded.json` now records the resolved anchor plus any failures. The dedup prompt requires diff-grounded line numbers. Adds `tests/test_master_position.py` regression coverage.
