@@ -116,6 +116,90 @@ def resolve_discussion(api_url, project_id, iid, disc_id, token):
     )
 
 
+FOCUS_FILES_RE = re.compile(r"([\w\-.]+/[\w\-.]+/\S+?\.\w+)\[L?\d+(?:-\d+)?\]")
+DIFF_BUDGET_CHARS = 30000
+
+
+def split_diff_sections(diff):
+    """Split an assembled mr.diff into (new_path, section) pairs.
+
+    Sections split on 'diff --git' headers; the section keeps its header so
+    it stays a valid fragment on its own. Paths come from the b/ side.
+    """
+    sections = []
+    current_path = None
+    current_lines = []
+    for line in diff.split("\n"):
+        if line.startswith("diff --git "):
+            if current_path is not None:
+                sections.append((current_path, "\n".join(current_lines)))
+            parts = line.split(" b/", 1)
+            current_path = parts[1] if len(parts) == 2 else line
+            current_lines = [line]
+        elif current_path is not None:
+            current_lines.append(line)
+    if current_path is not None:
+        sections.append((current_path, "\n".join(current_lines)))
+    return sections
+
+
+def extract_focus_files(finding_body):
+    """Extract repo-relative file paths cited by a finding.
+
+    Findings cite files as `path[N-M]` (Fix Focus Areas) and as
+    `[path[LN-M]](url)` (Code links). Only the file is used — cited line
+    numbers go stale after pushes, so hunks are never filtered by line.
+    Returns deduplicated paths in first-seen order.
+    """
+    seen = []
+    for match in FOCUS_FILES_RE.finditer(finding_body):
+        path = match.group(1).rstrip(".,;:")
+        if path not in seen:
+            seen.append(path)
+    return seen
+
+
+def truncate_marked(text, budget):
+    """Truncate to budget chars with an explicit marker, or return unchanged.
+
+    A silent mid-file cut makes the LLM report "diff does not touch X" for
+    files past the cut; the marker keeps that failure honest instead.
+    """
+    if len(text) <= budget:
+        return text
+    return (
+        text[:budget]
+        + f"\n...[diff truncated: showing first {budget} of {len(text)} chars; "
+        + "files beyond this point were NOT reviewed]"
+    )
+
+
+def select_diff_for_finding(diff, finding_body):
+    """Scope the verification diff to the finding's cited files.
+
+    A flat head-truncation of a large MR diff drops whole files (e.g. every
+    domain file when app/ sorts first), and the LLM then verdicts
+    NOT_ADDRESSED with "diff does not touch X" for fixes that are present.
+    Scoping to the cited files keeps each verdict's evidence complete.
+    Falls back to legacy head-truncation when no files are cited.
+    """
+    focus = extract_focus_files(finding_body)
+    if focus:
+        by_path = {}
+        for new_path, section in split_diff_sections(diff):
+            by_path.setdefault(new_path, section)
+        picked = []
+        for path in focus:
+            for new_path, section in by_path.items():
+                if new_path == path or new_path.endswith("/" + path):
+                    picked.append(section)
+                    break
+        scoped = "\n".join(picked)
+        if scoped.strip():
+            return truncate_marked(scoped, DIFF_BUDGET_CHARS)
+    return truncate_marked(diff, 8000)
+
+
 def build_verify_prompt(finding_body, diff):
     """Build the verification prompt for the LLM."""
     return f"""You are verifying whether a code review finding has been addressed by a new diff.
@@ -123,7 +207,7 @@ def build_verify_prompt(finding_body, diff):
 ## Finding (from the review discussion)
 {finding_body}
 
-## New diff (changes since the review)
+## Diff under review (MR changes scoped to this finding's files)
 {diff}
 
 ## Task
@@ -192,7 +276,7 @@ def main():
         if len(body) > 4000:
             body = body[:4000] + "\n...[truncated]"
 
-        prompt = build_verify_prompt(body, diff[:8000])  # Truncate diff if huge
+        prompt = build_verify_prompt(body, select_diff_for_finding(diff, body))
 
         print(f"Verifying discussion {disc_id}...", file=sys.stderr)
         try:
