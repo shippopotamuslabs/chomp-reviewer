@@ -28,8 +28,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from openrouter_client import get_model, call_openrouter
 
 
-def gitlab_request(method, url, token, data=None, form_data=None):
-    """Make a GitLab API request."""
+def gitlab_request(method, url, token, data=None, form_data=None, fatal=True):
+    """Make a GitLab API request.
+
+    With fatal=True (default) an HTTP error prints and exits, for requests
+    the run cannot proceed without (e.g. listing discussions). Pass
+    fatal=False for per-item requests where one failure must not abort the
+    whole run; the HTTP error is raised as RuntimeError instead.
+    """
     headers = {"PRIVATE-TOKEN": token}
     if data is not None:
         data = json.dumps(data).encode()
@@ -44,8 +50,11 @@ def gitlab_request(method, url, token, data=None, form_data=None):
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:1000]
-        print(f"ERROR: GitLab API {method} {url} failed: {e.code} {body}", file=sys.stderr)
-        sys.exit(1)
+        msg = f"ERROR: GitLab API {method} {url} failed: {e.code} {body}"
+        if fatal:
+            print(msg, file=sys.stderr)
+            sys.exit(1)
+        raise RuntimeError(msg)
 
 
 def get_forge_discussions(api_url, project_id, iid, token):
@@ -57,10 +66,19 @@ def get_forge_discussions(api_url, project_id, iid, token):
     )
     forge_open = []
     for d in discussions:
-        # Skip resolved discussions
+        # Skip the standalone rollup note (posted via POST /notes): it
+        # surfaces in the discussions list as an individual (non-thread)
+        # note and is not resolvable. PUT {"resolved": true} on it fails
+        # with 403 Forbidden.
+        if d.get("individual_note"):
+            continue
         notes = d.get("notes", [])
         if not notes:
             continue
+        # Skip threads GitLab marks as not resolvable.
+        if notes[0].get("resolvable") is False:
+            continue
+        # Skip resolved discussions
         # Check if any note is not resolved (discussions resolve as a unit)
         # GitLab marks individual notes as resolved; a discussion is resolved if all are
         if all(n.get("resolved", False) for n in notes):
@@ -86,11 +104,15 @@ def resolve_discussion(api_url, project_id, iid, disc_id, token):
     with {"resolved": true}. There is no .../discussions/:id/resolve
     sub-resource (it 404s).
     """
+    # fatal=False: one unresolvable thread (e.g. a 403 for a token
+    # without the Developer role) must not abort verification of the
+    # remaining discussions; the caller logs the ERROR and continues.
     return gitlab_request(
         "PUT",
         f"{api_url}/projects/{project_id}/merge_requests/{iid}/discussions/{disc_id}",
         token,
         data={"resolved": True},
+        fatal=False,
     )
 
 
@@ -161,6 +183,7 @@ def main():
 
     addressed = 0
     not_addressed = 0
+    resolve_failed = 0
 
     for disc in discussions:
         disc_id = disc["id"]
@@ -203,12 +226,19 @@ def main():
         if verdict == "ADDRESSED":
             addressed += 1
             if not args.dry_run:
-                resolve_discussion(api_url, project_id, args.iid, disc_id, gitlab_token)
-                print(f"  Resolved discussion {disc_id}", file=sys.stderr)
+                try:
+                    resolve_discussion(api_url, project_id, args.iid, disc_id, gitlab_token)
+                    print(f"  Resolved discussion {disc_id}", file=sys.stderr)
+                except Exception as e:
+                    resolve_failed += 1
+                    print(f"  ERROR: Failed to resolve discussion {disc_id}: {e}", file=sys.stderr)
         else:
             not_addressed += 1
 
     print(f"Verification complete: {addressed} addressed, {not_addressed} still open", file=sys.stderr)
+    if resolve_failed:
+        print(f"ERROR: {resolve_failed} discussions could not be resolved", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
