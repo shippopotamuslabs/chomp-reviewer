@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.9 (2026-09-23)
+
+- Fix: skip unresolvable discussions in `verify.py` selection. `get_forge_discussions()` included the standalone rollup note (posted via POST `/notes`, `individual_note=true`, not resolvable), so the first ADDRESSED verdict attempted `PUT {"resolved": true}` on it and failed with `403 Forbidden` — and `gitlab_request`'s `sys.exit(1)` aborted verification of the remaining discussions. Selection now skips individual notes and threads GitLab marks `resolvable: false`; resolution uses non-fatal requests so one failure logs ERROR and the run continues through all discussions (exiting 1 at the end if any resolve failed). Extends `tests/test_verify_resolve.py` regression coverage.
+
 ## v1.0.8 (2026-09-22)
 
 - Fix: resolve addressed discussions via the correct GitLab endpoint. `verify.py` used `PUT .../merge_requests/:iid/discussions/:id/resolve`, which does not exist, so every ADDRESSED verdict failed with `404 Not Found` and no discussion was ever resolved. Resolution now uses `PUT .../merge_requests/:iid/discussions/:discussion_id` with `{"resolved": true}` via a new `resolve_discussion()` helper. Adds `tests/test_verify_resolve.py` regression coverage.
