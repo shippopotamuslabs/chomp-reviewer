@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.10 (2026-09-24)
+
+- Fix: scope `verify.py` evidence to the finding's cited files instead of a flat 8000-char head-truncation. Large MR diffs dropped whole files from the verification prompt (a 74k-char diff showed only the first 8k, covering app/ files but no domain files), so the LLM verdicted NOT_ADDRESSED with "diff does not touch X" for fixes that were present. `select_diff_for_finding()` parses `path[N-M]` Fix Focus Areas entries and `[path[LN-M]](url)` Code links, passes those whole file sections (cited line numbers go stale after pushes and never filter hunks), marks any remaining truncation explicitly instead of cutting silently, and keeps legacy head-truncation only when no files are cited. Adds `tests/test_verify_diff_scoping.py` regression coverage.
+
 ## v1.0.9 (2026-09-23)
 
 - Fix: skip unresolvable discussions in `verify.py` selection. `get_forge_discussions()` included the standalone rollup note (posted via POST `/notes`, `individual_note=true`, not resolvable), so the first ADDRESSED verdict attempted `PUT {"resolved": true}` on it and failed with `403 Forbidden` — and `gitlab_request`'s `sys.exit(1)` aborted verification of the remaining discussions. Selection now skips individual notes and threads GitLab marks `resolvable: false`; resolution uses non-fatal requests so one failure logs ERROR and the run continues through all discussions (exiting 1 at the end if any resolve failed). Extends `tests/test_verify_resolve.py` regression coverage.
