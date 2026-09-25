@@ -174,6 +174,60 @@ def truncate_marked(text, budget):
     )
 
 
+FINAL_STATE_BUDGET_CHARS = 12000
+
+
+def fetch_file_at_ref(api_url, project_id, path, ref, token):
+    """Fetch a file's content at a commit via the repository API.
+
+    Returns (status, text) with status "present", "absent" (404: deleted or
+    never added — itself a verdict signal), or "unknown" (network/API failure,
+    which must never be treated as proof of absence).
+    """
+    encoded = urllib.parse.quote(path, safe="")
+    url = f"{api_url}/projects/{project_id}/repository/files/{encoded}/raw?ref={ref}"
+    req = urllib.request.Request(url, headers={"PRIVATE-TOKEN": token})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        return "present", raw
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return "absent", ""
+        print(f"  WARNING: file fetch failed for {path}: {e}", file=sys.stderr)
+        return "unknown", ""
+    except Exception as e:
+        print(f"  WARNING: file fetch failed for {path}: {e}", file=sys.stderr)
+        return "unknown", ""
+
+
+def build_final_state_block(api_url, project_id, focus_files, ref, token):
+    """Ground verdicts in the verified commit's actual file state.
+
+    The evidence diff is net vs target, so a fix that removes lines the same
+    MR added shows no removal hunk — the LLM then concludes "no removal
+    happened" for a fix that is present. The final-state block is ground
+    truth for whether cited code still exists; absence here plus a matching
+    fix is ADDRESSED even when the diff shows no removal.
+    """
+    blocks = []
+    for path in focus_files:
+        status, text = fetch_file_at_ref(api_url, project_id, path, ref, token)
+        if status == "absent":
+            blocks.append(f"### {path}\n[file deleted at {ref}]")
+        elif status == "unknown":
+            blocks.append(f"### {path}\n[file state unavailable — judge from the diff]")
+        else:
+            blocks.append(f"### {path}\n{truncate_marked(text, FINAL_STATE_BUDGET_CHARS)}")
+    if not blocks:
+        return ""
+    return (
+        f"## Final file state at {ref} (ground truth for whether cited code "
+        + "still exists; net diffs hide add-then-remove within the MR)\n"
+        + "\n".join(blocks)
+    )
+
+
 def select_diff_for_finding(diff, finding_body):
     """Scope the verification diff to the finding's cited files.
 
@@ -215,6 +269,7 @@ Determine if the finding has been ADDRESSED by the changes in the diff.
 
 - ADDRESSED: The diff clearly fixes the issue described in the finding. The problematic code pattern is gone, or the recommended fix has been applied.
 - NOT_ADDRESSED: The diff does not fix the issue, the issue is still present, or you cannot determine from the diff alone.
+- The diff is net vs target: code the MR added and then removed shows NO removal hunk. The final-state section is ground truth for whether cited code still exists — absence there plus the recommended fix elsewhere is ADDRESSED, even when the diff shows no removal.
 
 Line overlap alone is NOT sufficient — you must verify the semantic fix. For example, if the finding was "missing null check on line 42" and the diff touches line 42 but doesn't add a null check, it is NOT_ADDRESSED.
 
@@ -276,7 +331,13 @@ def main():
         if len(body) > 4000:
             body = body[:4000] + "\n...[truncated]"
 
-        prompt = build_verify_prompt(body, select_diff_for_finding(diff, body))
+        evidence = select_diff_for_finding(diff, body)
+        final_state = build_final_state_block(
+            api_url, project_id, extract_focus_files(body), args.sha, gitlab_token,
+        )
+        if final_state:
+            evidence = evidence + "\n\n" + final_state
+        prompt = build_verify_prompt(body, evidence)
 
         print(f"Verifying discussion {disc_id}...", file=sys.stderr)
         try:
