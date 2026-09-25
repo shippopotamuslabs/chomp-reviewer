@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.11 (2026-09-25)
+
+- Fix: ground verify verdicts in the verified commit's final file state. Evidence is the net MR diff vs target, so a fix that removes lines the same MR added shows no removal hunk and the LLM concludes "no removal happened" (Stratum MR169 M1: the display field was removed in the fix commit but added two commits earlier, so the net diff showed only the new sidecar type). `build_final_state_block()` fetches cited files at the verified sha via the repository API and presents them as ground truth for whether cited code still exists — deleted vs unknown fetch outcomes stay distinct — with the prompt instructed that absence plus the recommended fix elsewhere is ADDRESSED. Adds `tests/test_verify_final_state.py` regression coverage.
+
 ## v1.0.10 (2026-09-24)
 
 - Fix: scope `verify.py` evidence to the finding's cited files instead of a flat 8000-char head-truncation. Large MR diffs dropped whole files from the verification prompt (a 74k-char diff showed only the first 8k, covering app/ files but no domain files), so the LLM verdicted NOT_ADDRESSED with "diff does not touch X" for fixes that were present. `select_diff_for_finding()` parses `path[N-M]` Fix Focus Areas entries and `[path[LN-M]](url)` Code links, passes those whole file sections (cited line numbers go stale after pushes and never filter hunks), marks any remaining truncation explicitly instead of cutting silently, and keeps legacy head-truncation only when no files are cited. Adds `tests/test_verify_diff_scoping.py` regression coverage.
