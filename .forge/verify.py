@@ -116,6 +116,40 @@ def resolve_discussion(api_url, project_id, iid, disc_id, token):
     )
 
 
+def build_verdict_reply(verdict, reason, sha):
+    """Build the inline reply body for a verification verdict.
+
+    Posted as a reply on the original discussion so the outcome is visible
+    where the finding was raised, not just in the job log.
+    """
+    short = (sha or "")[:8] or "unknown"
+    if verdict == "ADDRESSED":
+        header = f"✅ Forge verification at `{short}`: **ADDRESSED**"
+    else:
+        header = f"⏳ Forge verification at `{short}`: **NOT_ADDRESSED** (still open)"
+    reason = (reason or "").strip()
+    if reason:
+        return f"{header}\n\n{reason}"
+    return header
+
+
+def post_discussion_reply(api_url, project_id, iid, disc_id, token, body):
+    """Post a reply note on one MR discussion via the GitLab API.
+
+    Replies inherit the discussion's thread, so the verdict lands inline on
+    the original comment. A discussion-notes POST has no /resolve suffix.
+    """
+    # fatal=False: one unreplyable thread must not abort verification of
+    # the remaining discussions; the caller logs the ERROR and continues.
+    return gitlab_request(
+        "POST",
+        f"{api_url}/projects/{project_id}/merge_requests/{iid}/discussions/{disc_id}/notes",
+        token,
+        data={"body": body},
+        fatal=False,
+    )
+
+
 FOCUS_FILES_RE = re.compile(r"([\w\-.]+/[\w\-.]+/\S+?\.\w+)\[L?\d+(?:-\d+)?\]")
 DIFF_BUDGET_CHARS = 30000
 
@@ -323,6 +357,7 @@ def main():
     addressed = 0
     not_addressed = 0
     resolve_failed = 0
+    reply_failed = 0
 
     for disc in discussions:
         disc_id = disc["id"]
@@ -368,6 +403,21 @@ def main():
 
         print(f"  Verdict: {verdict} — {reason}", file=sys.stderr)
 
+        # Post the verdict as an inline reply so it is visible on the
+        # original comment, not just in the job log. Reply while the
+        # discussion is still open, before resolving.
+        if not args.dry_run:
+            try:
+                post_discussion_reply(
+                    api_url, project_id, args.iid, disc_id, gitlab_token,
+                    build_verdict_reply(verdict, reason, args.sha),
+                )
+                print(f"  Replied to discussion {disc_id}", file=sys.stderr)
+            except Exception as e:
+                reply_failed += 1
+                print(f"  ERROR: Failed to reply to discussion {disc_id}: {e}",
+                      file=sys.stderr)
+
         if verdict == "ADDRESSED":
             addressed += 1
             if not args.dry_run:
@@ -381,8 +431,11 @@ def main():
             not_addressed += 1
 
     print(f"Verification complete: {addressed} addressed, {not_addressed} still open", file=sys.stderr)
+    if reply_failed:
+        print(f"ERROR: {reply_failed} discussion replies could not be posted", file=sys.stderr)
     if resolve_failed:
         print(f"ERROR: {resolve_failed} discussions could not be resolved", file=sys.stderr)
+    if reply_failed or resolve_failed:
         sys.exit(1)
 
 
