@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.12 (2026-10-04)
+
+- Feat: post verify verdicts as inline replies on the original discussions. `verify.py` printed verdicts (ADDRESSED / NOT_ADDRESSED) to the job log only, so reviewers saw nothing inline. Each verdict is now posted via `POST .../discussions/:id/notes` (replying inherits the thread) for both outcomes — ✅ ADDRESSED before resolving, ⏳ NOT_ADDRESSED leaving the thread open — with the verified sha and LLM reason in the reply body. Reply failures log ERROR without aborting the run (non-fatal requests, same as resolution) and are surfaced at the end alongside resolve failures. Adds `tests/test_verify_replies.py` regression coverage.
+
 ## v1.0.11 (2026-09-25)
 
 - Fix: ground verify verdicts in the verified commit's final file state. Evidence is the net MR diff vs target, so a fix that removes lines the same MR added shows no removal hunk and the LLM concludes "no removal happened" (Stratum MR169 M1: the display field was removed in the fix commit but added two commits earlier, so the net diff showed only the new sidecar type). `build_final_state_block()` fetches cited files at the verified sha via the repository API and presents them as ground truth for whether cited code still exists — deleted vs unknown fetch outcomes stay distinct — with the prompt instructed that absence plus the recommended fix elsewhere is ADDRESSED. Adds `tests/test_verify_final_state.py` regression coverage.
