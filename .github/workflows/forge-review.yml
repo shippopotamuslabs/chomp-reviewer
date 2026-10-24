@@ -79,6 +79,11 @@ jobs:
         with:
           app-id: ${{ inputs.forge_app_id }}
           private-key: ${{ secrets.FORGE_APP_PRIVATE_KEY }}
+          # v1 scopes the token to the caller repo only unless told otherwise;
+          # the Forge scripts checkout needs forge-reviewer in scope too.
+          repositories: |
+            ${{ github.event.repository.name }}
+            forge-reviewer
 
       - name: Check out the pull request head
         uses: actions/checkout@v4
