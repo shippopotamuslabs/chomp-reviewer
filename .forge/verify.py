@@ -10,10 +10,12 @@ Usage:
 
 Environment:
     OPENROUTER_API_KEY: API key for OpenRouter
-    PR_AGENT_GITLAB_TOKEN: GitLab token for API access
-    CI_API_V4_URL: GitLab API base URL
-    CI_PROJECT_ID: Project ID
     FORGE_MODEL: model to use
+    FORGE_PLATFORM: "github" or "gitlab" (default: github under GitHub
+        Actions, gitlab otherwise)
+    GitLab: PR_AGENT_GITLAB_TOKEN, CI_API_V4_URL, CI_PROJECT_ID
+    GitHub: GITHUB_TOKEN (Forge app installation token), GITHUB_API_URL,
+        GITHUB_REPOSITORY — --iid carries the PR number
 """
 import argparse
 import json
@@ -26,6 +28,22 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from openrouter_client import get_model, call_openrouter
+import github_backend
+
+
+def detect_platform():
+    """Select the review platform backend from the environment.
+
+    FORGE_PLATFORM wins when set; otherwise runs under GitHub Actions
+    (GITHUB_ACTIONS=true) use the GitHub backend and everything else
+    keeps the historical GitLab default.
+    """
+    explicit = os.environ.get("FORGE_PLATFORM", "").strip().lower()
+    if explicit in ("github", "gitlab"):
+        return explicit
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        return "github"
+    return "gitlab"
 
 
 def gitlab_request(method, url, token, data=None, form_data=None, fatal=True):
@@ -235,7 +253,7 @@ def fetch_file_at_ref(api_url, project_id, path, ref, token):
         return "unknown", ""
 
 
-def build_final_state_block(api_url, project_id, focus_files, ref, token):
+def build_final_state_block(api_url, project_id, focus_files, ref, token, fetcher=None):
     """Ground verdicts in the verified commit's actual file state.
 
     The evidence diff is net vs target, so a fix that removes lines the same
@@ -243,10 +261,15 @@ def build_final_state_block(api_url, project_id, focus_files, ref, token):
     happened" for a fix that is present. The final-state block is ground
     truth for whether cited code still exists; absence here plus a matching
     fix is ADDRESSED even when the diff shows no removal.
+
+    fetcher overrides the file fetch (same (api_url, project, path, ref,
+    token) -> (status, text) contract); the GitHub path passes
+    github_backend.fetch_file_at_ref, whose project slot carries the repo.
     """
+    fetch = fetcher if fetcher is not None else fetch_file_at_ref
     blocks = []
     for path in focus_files:
-        status, text = fetch_file_at_ref(api_url, project_id, path, ref, token)
+        status, text = fetch(api_url, project_id, path, ref, token)
         if status == "absent":
             blocks.append(f"### {path}\n[file deleted at {ref}]")
         elif status == "unknown":
@@ -322,20 +345,31 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Don't resolve, just report")
     args = parser.parse_args()
 
+    platform = detect_platform()
+
     api_key = os.environ.get("OPENROUTER_API_KEY")
     gitlab_token = os.environ.get("PR_AGENT_GITLAB_TOKEN")
     api_url = os.environ.get("CI_API_V4_URL", "https://gitlab.com/api/v4")
     project_id = os.environ.get("CI_PROJECT_ID")
+    gh_api, gh_repo, gh_token = github_backend.gh_env()
 
     if not api_key:
         print("ERROR: OPENROUTER_API_KEY not set", file=sys.stderr)
         sys.exit(1)
-    if not gitlab_token and not args.dry_run:
-        print("ERROR: PR_AGENT_GITLAB_TOKEN not set", file=sys.stderr)
-        sys.exit(1)
-    if not project_id:
-        print("ERROR: CI_PROJECT_ID not set", file=sys.stderr)
-        sys.exit(1)
+    if platform == "github":
+        if not gh_token and not args.dry_run:
+            print("ERROR: GITHUB_TOKEN not set", file=sys.stderr)
+            sys.exit(1)
+        if not gh_repo:
+            print("ERROR: GITHUB_REPOSITORY not set", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if not gitlab_token and not args.dry_run:
+            print("ERROR: PR_AGENT_GITLAB_TOKEN not set", file=sys.stderr)
+            sys.exit(1)
+        if not project_id:
+            print("ERROR: CI_PROJECT_ID not set", file=sys.stderr)
+            sys.exit(1)
 
     model = get_model()
 
@@ -346,8 +380,12 @@ def main():
         print("No diff content; nothing to verify.", file=sys.stderr)
         return
 
-    # Get open Forge discussions
-    discussions = get_forge_discussions(api_url, project_id, args.iid, gitlab_token)
+    # Get open Forge discussions (GitHub: review threads)
+    if platform == "github":
+        discussions = github_backend.get_forge_review_threads(
+            gh_api, gh_repo, args.iid, gh_token)
+    else:
+        discussions = get_forge_discussions(api_url, project_id, args.iid, gitlab_token)
     print(f"Found {len(discussions)} open Forge discussions", file=sys.stderr)
 
     if not discussions:
@@ -367,9 +405,15 @@ def main():
             body = body[:4000] + "\n...[truncated]"
 
         evidence = select_diff_for_finding(diff, body)
-        final_state = build_final_state_block(
-            api_url, project_id, extract_focus_files(body), args.sha, gitlab_token,
-        )
+        if platform == "github":
+            final_state = build_final_state_block(
+                gh_api, gh_repo, extract_focus_files(body), args.sha, gh_token,
+                fetcher=github_backend.fetch_file_at_ref,
+            )
+        else:
+            final_state = build_final_state_block(
+                api_url, project_id, extract_focus_files(body), args.sha, gitlab_token,
+            )
         if final_state:
             evidence = evidence + "\n\n" + final_state
         prompt = build_verify_prompt(body, evidence)
@@ -408,10 +452,16 @@ def main():
         # discussion is still open, before resolving.
         if not args.dry_run:
             try:
-                post_discussion_reply(
-                    api_url, project_id, args.iid, disc_id, gitlab_token,
-                    build_verdict_reply(verdict, reason, args.sha),
-                )
+                if platform == "github":
+                    github_backend.reply_to_review_comment(
+                        gh_api, gh_repo, args.iid, gh_token, disc["comment_id"],
+                        build_verdict_reply(verdict, reason, args.sha),
+                    )
+                else:
+                    post_discussion_reply(
+                        api_url, project_id, args.iid, disc_id, gitlab_token,
+                        build_verdict_reply(verdict, reason, args.sha),
+                    )
                 print(f"  Replied to discussion {disc_id}", file=sys.stderr)
             except Exception as e:
                 reply_failed += 1
@@ -422,7 +472,11 @@ def main():
             addressed += 1
             if not args.dry_run:
                 try:
-                    resolve_discussion(api_url, project_id, args.iid, disc_id, gitlab_token)
+                    if platform == "github":
+                        github_backend.resolve_review_thread(
+                            gh_api, gh_token, disc_id)
+                    else:
+                        resolve_discussion(api_url, project_id, args.iid, disc_id, gitlab_token)
                     print(f"  Resolved discussion {disc_id}", file=sys.stderr)
                 except Exception as e:
                     resolve_failed += 1

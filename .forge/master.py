@@ -11,10 +11,12 @@ Usage:
 
 Environment:
     OPENROUTER_API_KEY: API key for OpenRouter
-    PR_AGENT_GITLAB_TOKEN: GitLab token for posting comments
-    CI_API_V4_URL: GitLab API base URL
-    CI_PROJECT_ID: Project ID
     FORGE_MODEL: model to use (default: openrouter/meta/muse-spark-1.3-contributor)
+    FORGE_PLATFORM: "github" or "gitlab" (default: github under GitHub
+        Actions, gitlab otherwise)
+    GitLab: PR_AGENT_GITLAB_TOKEN, CI_API_V4_URL, CI_PROJECT_ID
+    GitHub: GITHUB_TOKEN (Forge app installation token), GITHUB_API_URL,
+        GITHUB_REPOSITORY — --iid carries the PR number
 """
 import argparse
 import bisect
@@ -28,6 +30,21 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from openrouter_client import get_model, call_openrouter
+import github_backend
+
+def detect_platform():
+    """Select the review platform backend from the environment.
+
+    FORGE_PLATFORM wins when set; otherwise runs under GitHub Actions
+    (GITHUB_ACTIONS=true) use the GitHub backend and everything else
+    keeps the historical GitLab default.
+    """
+    explicit = os.environ.get("FORGE_PLATFORM", "").strip().lower()
+    if explicit in ("github", "gitlab"):
+        return explicit
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        return "github"
+    return "gitlab"
 
 def substitute_placeholders(template, mapping):
     """Single-pass placeholder substitution. Unlike chained .replace(),
@@ -231,6 +248,119 @@ def post_inline_with_fallback(post_fn, body, attempts):
             last_err = e
     raise RuntimeError(f"all {len(attempts)} inline positions rejected: {last_err}")
 
+def post_inline_findings(findings, diff, sha, post_fn):
+    """Post one inline comment per finding via post_fn(body, attempt).
+
+    post_fn returns the created object (a dict with an "id"). Positions
+    come from the diff line map: both GitLab and GitHub reject comments
+    on lines outside the diff, so every finding is resolved to the
+    nearest valid diff line (with retries) instead of trusting the
+    model's line number blindly. Returns (recorded, failed) in the
+    forge-recorded.json shape; unpostable findings are returned in
+    failed, never silently dropped.
+    """
+    parsed_map, file_order = parse_diff_line_map(diff)
+    n_valid = sum(len(e["new_lines"]) + len(e["old_lines"]) for e in parsed_map["files"].values())
+    print(f"Diff covers {len(file_order)} files with {n_valid} positionable lines", file=sys.stderr)
+
+    recorded = []
+    failed = []
+    for f in findings:
+        file_path = (f.get("file", "") or "").strip()
+        line_start = _safe_int(f.get("line_start", 0))
+        line_end = _safe_int(f.get("line_end", line_start), line_start)
+        if line_end < line_start:
+            line_start, line_end = line_end, line_start
+
+        attempts, meta = build_inline_attempts(parsed_map, file_order, file_path, line_start, line_end)
+        inline_body = build_inline(sha, f, meta)
+        if not attempts:
+            print(f"  ERROR: No positionable lines in diff; cannot post inline for "
+                  f"{file_path}:{line_start}-{line_end}", file=sys.stderr)
+            failed.append({"file": file_path, "line_start": line_start,
+                           "line_end": line_end, "error": "empty diff"})
+            continue
+
+        anchor = attempts[0]
+        anchor_desc = (f"{anchor['new_path']}:{anchor['new_line']}"
+                       if anchor.get("new_line") is not None
+                       else f"{anchor['old_path']}:{anchor['old_line']} (old)")
+        print(f"Posting inline for {file_path}:{line_start}-{line_end} "
+              f"(resolved {anchor_desc}, {len(attempts)} attempts)...", file=sys.stderr)
+
+        try:
+            discussion, won = post_inline_with_fallback(post_fn, inline_body, attempts)
+            used = attempts[won]
+            disc_id = discussion.get("id")
+            print(f"  Discussion {disc_id} posted at "
+                  f"{used['new_path']}:{used.get('new_line') or used.get('old_line')}", file=sys.stderr)
+            entry = {
+                "id": disc_id,
+                "file": file_path,
+                "line_start": line_start,
+                "line_end": line_end,
+                "source": "+".join(f.get("sources", ["forge"])),
+                "resolved_path": used["new_path"],
+                "resolved_line": used.get("new_line") if used.get("new_line") is not None else used.get("old_line"),
+                "anchor": "new" if used.get("new_line") is not None else "old",
+                "relocated": meta["relocated"] or won > 0,
+            }
+            if discussion.get("html_url"):
+                entry["url"] = discussion["html_url"]
+            recorded.append(entry)
+        except Exception as e:
+            print(f"  ERROR: Failed to post inline for {file_path}:{line_start}: {e}", file=sys.stderr)
+            failed.append({"file": file_path, "line_start": line_start,
+                           "line_end": line_end, "error": str(e)})
+            # Continue with other findings
+    return recorded, failed
+
+def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, diff):
+    """Post the consolidated review to GitLab: rollup note + inline
+    discussions. Returns (recorded, failed)."""
+    # Get project path for blob links
+    project = gitlab_request("GET", f"{api_url}/projects/{project_id}", token)
+    project_path = project.get("path_with_namespace", "browntown.development-group/stratum")
+
+    # Get MR diff_refs for positioning
+    mr = gitlab_request("GET", f"{api_url}/projects/{project_id}/merge_requests/{iid}", token)
+    diff_refs = mr.get("diff_refs", {})
+    base_sha = diff_refs.get("base_sha", "")
+    head_sha = diff_refs.get("head_sha", sha)
+    start_sha = diff_refs.get("start_sha", "")
+
+    # Post rollup first
+    rollup_body = build_rollup(sha, summary, findings, project_path)
+    print("Posting rollup...", file=sys.stderr)
+    note = gitlab_request(
+        "POST",
+        f"{api_url}/projects/{project_id}/merge_requests/{iid}/notes",
+        token,
+        {"body": rollup_body}
+    )
+    print(f"Rollup posted: note {note.get('id')}", file=sys.stderr)
+
+    def post_fn(body, attempt):
+        return post_inline_attempt(api_url, project_id, iid, token, body, attempt,
+                                   base_sha, head_sha, start_sha)
+
+    return post_inline_findings(findings, diff, sha, post_fn)
+
+def post_review_github(api_url, repo, number, token, sha, summary, findings, diff):
+    """Post the consolidated review to GitHub: rollup as a PR conversation
+    comment + inline review comments. Returns (recorded, failed)."""
+    rollup_body = build_rollup(sha, summary, findings, repo,
+                               blob_base=f"https://github.com/{repo}/blob")
+    print("Posting rollup...", file=sys.stderr)
+    comment = github_backend.post_issue_comment(api_url, repo, number, token, rollup_body)
+    print(f"Rollup posted: comment {comment.get('id')}", file=sys.stderr)
+
+    def post_fn(body, attempt):
+        return github_backend.post_review_comment_attempt(
+            api_url, repo, number, token, body, sha, attempt)
+
+    return post_inline_findings(findings, diff, sha, post_fn)
+
 def gitlab_request(method, url, token, data=None):
     """Make a GitLab API request."""
     headers = {"PRIVATE-TOKEN": token}
@@ -284,8 +414,13 @@ def build_agent_prompt(finding):
 <code>ⓘ Copy this prompt and use it to remediate the issue with your preferred AI generation tools</code>
 </details>"""
 
-def build_rollup(sha, summary, findings, project_path):
-    """Build the rollup comment markdown."""
+def build_rollup(sha, summary, findings, project_path, blob_base=None):
+    """Build the rollup comment markdown.
+
+    blob_base overrides the blob-link prefix (GitHub passes
+    "https://github.com/<owner>/<repo>/blob"); the default keeps the
+    historical GitLab URL shape.
+    """
     # Count by severity
     counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
     for f in findings:
@@ -318,7 +453,10 @@ def build_rollup(sha, summary, findings, project_path):
         le = f.get("line_end", 0)
 
         # Blob link
-        blob_url = f"https://gitlab.com/{project_path}/-/blob/{sha}/{file}#L{ls}-{le}"
+        if blob_base:
+            blob_url = f"{blob_base}/{sha}/{file}#L{ls}-L{le}"
+        else:
+            blob_url = f"https://gitlab.com/{project_path}/-/blob/{sha}/{file}#L{ls}-{le}"
 
         lines.extend([
             f"{badge}",
@@ -387,7 +525,7 @@ def build_inline(sha, finding, meta=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--iid", required=True, help="MR internal ID")
+    parser.add_argument("--iid", required=True, help="MR internal ID (GitHub: PR number)")
     parser.add_argument("--sha", required=True, help="MR head SHA")
     parser.add_argument("--pr-agent", required=True, help="Path to PR-Agent findings markdown")
     parser.add_argument("--thermos-a", required=True, help="Path to thermos-a JSON")
@@ -397,6 +535,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Don't post, just print")
     args = parser.parse_args()
 
+    platform = detect_platform()
+
     api_key = os.environ.get("OPENROUTER_API_KEY")
     gitlab_token = os.environ.get("PR_AGENT_GITLAB_TOKEN")
     api_url = os.environ.get("CI_API_V4_URL", "https://gitlab.com/api/v4")
@@ -405,9 +545,17 @@ def main():
     if not api_key:
         print("ERROR: OPENROUTER_API_KEY not set", file=sys.stderr)
         sys.exit(1)
-    if not gitlab_token and not args.dry_run:
-        print("ERROR: PR_AGENT_GITLAB_TOKEN not set", file=sys.stderr)
-        sys.exit(1)
+    if not args.dry_run:
+        if platform == "github":
+            if not os.environ.get("GITHUB_TOKEN"):
+                print("ERROR: GITHUB_TOKEN not set", file=sys.stderr)
+                sys.exit(1)
+            if not os.environ.get("GITHUB_REPOSITORY"):
+                print("ERROR: GITHUB_REPOSITORY not set", file=sys.stderr)
+                sys.exit(1)
+        elif not gitlab_token:
+            print("ERROR: PR_AGENT_GITLAB_TOKEN not set", file=sys.stderr)
+            sys.exit(1)
 
     model = get_model()
 
@@ -467,94 +615,20 @@ def main():
         print(json.dumps(result, indent=2))
         return
 
-    # Get project path for blob links
-    project = gitlab_request("GET", f"{api_url}/projects/{project_id}", gitlab_token)
-    project_path = project.get("path_with_namespace", "browntown.development-group/stratum")
-
-    # Get MR diff_refs for positioning
-    mr = gitlab_request("GET", f"{api_url}/projects/{project_id}/merge_requests/{args.iid}", gitlab_token)
-    diff_refs = mr.get("diff_refs", {})
-    base_sha = diff_refs.get("base_sha", "")
-    head_sha = diff_refs.get("head_sha", args.sha)
-    start_sha = diff_refs.get("start_sha", "")
-
-    # Post rollup first
-    rollup_body = build_rollup(args.sha, summary, findings, project_path)
-    print("Posting rollup...", file=sys.stderr)
-    note = gitlab_request(
-        "POST",
-        f"{api_url}/projects/{project_id}/merge_requests/{args.iid}/notes",
-        gitlab_token,
-        {"body": rollup_body}
-    )
-    print(f"Rollup posted: note {note.get('id')}", file=sys.stderr)
-
-    # Parse mr.diff into valid diff-line maps. GitLab rejects inline
-    # positions on lines outside the diff, so every finding is resolved to
-    # the nearest valid diff line (with retries) instead of trusting the
-    # model's line number blindly.
-    parsed_map, file_order = parse_diff_line_map(diff)
-    n_valid = sum(len(e["new_lines"]) + len(e["old_lines"]) for e in parsed_map["files"].values())
-    print(f"Diff covers {len(file_order)} files with {n_valid} positionable lines", file=sys.stderr)
-
-    # Post inline discussions
-    recorded = []
-    failed = []
-    for f in findings:
-        file_path = (f.get("file", "") or "").strip()
-        line_start = _safe_int(f.get("line_start", 0))
-        line_end = _safe_int(f.get("line_end", line_start), line_start)
-        if line_end < line_start:
-            line_start, line_end = line_end, line_start
-
-        attempts, meta = build_inline_attempts(parsed_map, file_order, file_path, line_start, line_end)
-        inline_body = build_inline(args.sha, f, meta)
-        if not attempts:
-            print(f"  ERROR: No positionable lines in diff; cannot post inline for "
-                  f"{file_path}:{line_start}-{line_end}", file=sys.stderr)
-            failed.append({"file": file_path, "line_start": line_start,
-                           "line_end": line_end, "error": "empty diff"})
-            continue
-
-        anchor = attempts[0]
-        anchor_desc = (f"{anchor['new_path']}:{anchor['new_line']}"
-                       if anchor.get("new_line") is not None
-                       else f"{anchor['old_path']}:{anchor['old_line']} (old)")
-        print(f"Posting inline for {file_path}:{line_start}-{line_end} "
-              f"(resolved {anchor_desc}, {len(attempts)} attempts)...", file=sys.stderr)
-
-        def post_fn(body, attempt, _a=args, _t=gitlab_token):
-            return post_inline_attempt(api_url, project_id, _a.iid, _t, body, attempt,
-                                       base_sha, head_sha, start_sha)
-
-        try:
-            discussion, won = post_inline_with_fallback(post_fn, inline_body, attempts)
-            used = attempts[won]
-            disc_id = discussion.get("id")
-            print(f"  Discussion {disc_id} posted at "
-                  f"{used['new_path']}:{used.get('new_line') or used.get('old_line')}", file=sys.stderr)
-            recorded.append({
-                "id": disc_id,
-                "file": file_path,
-                "line_start": line_start,
-                "line_end": line_end,
-                "source": "+".join(f.get("sources", ["forge"])),
-                "resolved_path": used["new_path"],
-                "resolved_line": used.get("new_line") if used.get("new_line") is not None else used.get("old_line"),
-                "anchor": "new" if used.get("new_line") is not None else "old",
-                "relocated": meta["relocated"] or won > 0,
-            })
-        except Exception as e:
-            print(f"  ERROR: Failed to post inline for {file_path}:{line_start}: {e}", file=sys.stderr)
-            failed.append({"file": file_path, "line_start": line_start,
-                           "line_end": line_end, "error": str(e)})
-            # Continue with other findings
+    if platform == "github":
+        gh_api, gh_repo, gh_token = github_backend.gh_env()
+        recorded, failed = post_review_github(
+            gh_api, gh_repo, args.iid, gh_token, args.sha, summary, findings, diff)
+    else:
+        recorded, failed = post_review_gitlab(
+            api_url, project_id, args.iid, gitlab_token, args.sha, summary, findings, diff)
 
     # Write recorded discussions for the verify job
     with open("forge-recorded.json", "w") as f:
         json.dump({
             "iid": args.iid,
             "sha": args.sha,
+            "platform": platform,
             "discussions": recorded,
             "failed": failed,
         }, f, indent=2)
