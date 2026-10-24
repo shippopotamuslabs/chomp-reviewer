@@ -1,0 +1,18 @@
+name: Forge Selftest
+
+# Throwaway self-test: calls the reusable workflow locally to prove the
+# workflow file is valid and runnable inside its own repo. Not part of
+# the platform PR; this branch is deleted after the pilot.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  forge-review:
+    uses: ./.github/workflows/forge-review.yml
+    secrets: inherit
