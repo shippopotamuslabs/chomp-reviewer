@@ -13,7 +13,7 @@ import urllib.error
 
 def get_model():
     """Get the model ID, stripping the openrouter/ provider prefix if present."""
-    model = os.environ.get("FORGE_MODEL", "openrouter/meta/muse-spark-1.3-contributor")
+    model = os.environ.get("FORGE_MODEL") or "openrouter/meta/muse-spark-1.3-contributor"
     if model.startswith("openrouter/"):
         model = model[len("openrouter/"):]
     return model
