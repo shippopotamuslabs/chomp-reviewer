@@ -129,23 +129,21 @@ The full flow needs GitLab. Master and verify read merge request state, post dis
 
 ## Repository layout
 
-```
-.forge/
-  fetch_diff.py         Fetches MR changes from the GitLab API, assembles mr.diff
-  thermos.py            Runs one Thermos lens against a diff, writes findings JSON
-  master.py             Dedups the three producer outputs, posts the review
-  verify.py             Verdicts open discussions on later pushes, resolves fixed ones
-  openrouter_client.py  Shared OpenRouter client and model selection
-  prompts/
-    thermos-correctness.md
-    thermos-structure.md
-    master-dedup.md
-templates/
-  forge.gitlab-ci.yml   The include template consuming projects use
-tests/                  Regression tests for the .forge scripts, unittest based
-CHANGELOG.md            One entry per release tag
-AGENTS.md               Contributor rules: tests, release process, conventions
-```
+| Path | Job |
+| --- | --- |
+| `.forge/fetch_diff.py` | Fetches MR changes from the GitLab API, assembles mr.diff |
+| `.forge/fetch_diff_github.py` | Fetches PR changes from the GitHub API |
+| `.forge/github_backend.py` | The GitHub backend: PR and diff reads, rollup and inline review posting, review-thread resolution |
+| `.github/workflows/forge-review.yml` | The reusable workflow consuming repos call (the GitHub port, in review) |
+| `.forge/thermos.py` | Runs one Thermos lens against a diff, writes findings JSON |
+| `.forge/master.py` | Dedups the three producer outputs, posts the review |
+| `.forge/verify.py` | Verdicts open discussions on later pushes, resolves fixed ones |
+| `.forge/openrouter_client.py` | Shared OpenRouter client and model selection |
+| `.forge/prompts/` | The prompt files: `thermos-correctness.md`, `thermos-structure.md`, `master-dedup.md` |
+| `templates/forge.gitlab-ci.yml` | The include template consuming projects use |
+| `tests/` | Regression tests for the .forge scripts, unittest based |
+| `CHANGELOG.md` | One entry per release tag |
+| `AGENTS.md` | Contributor rules: tests, release process, conventions |
 
 ## Platform status
 
