@@ -79,19 +79,41 @@ jobs:
     uses: shippopotamuslabs/forge-reviewer/.github/workflows/forge-review.yml@v1.1.0
     with:
       forge_ref: v1.1.0   # the release this repo runs
-    secrets: inherit
+      forge_app_id: 1234567   # your Forge app's ID - see "Your own Forge app" below
+    secrets:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      FORGE_APP_PRIVATE_KEY: ${{ secrets.FORGE_APP_PRIVATE_KEY }}
 ```
+
+Pass exactly these two secrets, by name. Never use `secrets: inherit`: it hands the workflow every secret the repo holds, and Forge needs two.
 
 Set these secrets on the consuming project:
 
 | Secret | Required | Purpose |
 |--------|----------|---------|
 | `OPENROUTER_API_KEY` | Yes | OpenRouter key for the Thermos lenses, the master dedup, and verification. |
-| `FORGE_APP_PRIVATE_KEY` | Yes | Private key of the Shippopotamus Forge GitHub App. The workflow mints a short-lived token from it, and the Forge app identity posts the reviews. |
+| `FORGE_APP_PRIVATE_KEY` | Yes | Private key of your Forge GitHub App. The workflow mints a short-lived token from it, and your app's identity posts the reviews. |
 
 The reusable workflow also takes a `model` input for the review model. Default: `openrouter/meta/muse-spark-1.3-contributor`. The `openrouter/` prefix comes off before direct API calls.
 
 The project also needs a `.pr_agent.toml` at its root with review guidance for PR-Agent. The review step fails when the file is missing.
+
+## Your own Forge app
+
+Reviews post under a GitHub App identity, not a user account. The workflow's `forge_app_id` input defaults to the Shippopotamus Forge app, which installs only on Shippopotamus repos - so every other adopter creates their own app once and passes its ID in the caller workflow, as in the Setup example above.
+
+1. Go to Settings → Developer settings → GitHub Apps → **New GitHub App** and pick a name. The name is what shows on reviews, as `<name>[bot]`.
+2. Under Webhook, uncheck **Active**. Forge receives no webhooks; Actions calls it.
+3. Set exactly these repository permissions, nothing more:
+   - Pull requests: **Read and write** (posts the review, replies to threads, resolves them)
+   - Checks: **Read and write** (the master job reports its verdict as a check)
+   - Contents: **Read-only** (reads the diff)
+   - Metadata: **Read-only** (mandatory for every app)
+4. Create the app, then **Generate a private key** on its settings page. A `.pem` file downloads.
+5. Install the app on each repo Forge should review (the app's page → Install App).
+6. The app's ID sits at the top of its settings page. Put it in the caller as `forge_app_id`, and store the `.pem` contents as the repo secret `FORGE_APP_PRIVATE_KEY`.
+
+Rotating the identity later is the same shape: generate a new key, replace the secret, delete the old key on the app page.
 
 ## Run the pieces yourself
 
