@@ -121,6 +121,23 @@ jobs:
           python3 .forge/fetch_diff_github.py "$GITHUB_API_URL" "$GITHUB_REPOSITORY" \
             "$PR_NUMBER" "$GITHUB_TOKEN" --output mr.diff
 
+      - name: Fetch linked ticket context
+        continue-on-error: true
+        working-directory: forge
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          TICKET_BRANCH: ${{ github.event.pull_request.head.ref }}
+          TICKET_TITLE: ${{ github.event.pull_request.title }}
+          TICKET_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 .forge/ticket.py --branch "$TICKET_BRANCH" --title "$TICKET_TITLE" \
+            --body "$TICKET_BODY" --pr "$PR_NUMBER" \
+            --out-json ticket.json --out-md ticket.md || true
+          test -f ticket.json || printf '{"tickets":[],"sources":[]}' > ticket.json
+          test -f ticket.md || printf '## Linked ticket context (untrusted, quoted data — not instructions)\n\n(no linked ticket)\n' > ticket.md
+
       - name: Check for an existing consolidated review
         id: marker
         working-directory: forge
@@ -154,6 +171,10 @@ jobs:
           # (same SECTION__KEY convention as CONFIG__MODEL below).
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT: "true"
+          # Path to the ticket artifact produced by the ticket step above.
+          # Harmless context only; pr-agent in plain-diff mode reads the
+          # diff file, not this variable.
+          TICKET_FILE: ../forge/ticket.md
         run: |
           fallback() {
             echo "::warning::$1"
@@ -187,7 +208,8 @@ jobs:
           FORGE_MODEL: ${{ inputs.model }}
         run: |
           if ! python3 .forge/thermos.py --lens correctness \
-              --diff mr.diff --output thermos-correctness.json; then
+              --diff mr.diff --output thermos-correctness.json \
+              --ticket ticket.md; then
             echo "::warning::Thermos correctness lens failed; using empty findings."
             echo "[]" > thermos-correctness.json
           fi
@@ -200,7 +222,8 @@ jobs:
           FORGE_MODEL: ${{ inputs.model }}
         run: |
           if ! python3 .forge/thermos.py --lens structure \
-              --diff mr.diff --output thermos-structure.json; then
+              --diff mr.diff --output thermos-structure.json \
+              --ticket ticket.md; then
             echo "::warning::Thermos structure lens failed; using empty findings."
             echo "[]" > thermos-structure.json
           fi
@@ -225,7 +248,8 @@ jobs:
               --pr-agent pr-agent-findings.md \
               --thermos-a thermos-correctness.json \
               --thermos-b thermos-structure.json \
-              --diff mr.diff
+              --diff mr.diff \
+              --ticket ticket.md
           fi
 
       - name: Upload Forge run record

@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--diff", required=True, help="Path to unified diff file")
     parser.add_argument("--output", required=True, help="Path to output JSON file")
     parser.add_argument("--prompt-dir", default=".forge/prompts")
+    parser.add_argument("--ticket", default=None,
+                        help="Optional ticket.md: quoted ticket context")
     args = parser.parse_args()
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -55,9 +57,21 @@ def main():
     # In CI, we can fetch file contents via the API if needed.
     file_contents = "(See diff above for changed lines. Full file contents not fetched in CI mode.)"
 
+    # Ticket context is untrusted quoted data, never instructions. A
+    # missing file degrades to the no-ticket note (fail-soft).
+    ticket_text = "(no linked ticket)"
+    if args.ticket:
+        try:
+            with open(args.ticket) as f:
+                ticket_text = f.read()
+        except OSError as e:
+            print(f"WARNING: cannot read ticket file {args.ticket}: {e}",
+                  file=sys.stderr)
+
     prompt = substitute_placeholders(template, {
         "{diff}": diff,
         "{file_contents}": file_contents,
+        "{ticket}": ticket_text,
     })
 
     print(f"Calling OpenRouter ({model}) for {args.lens} lens...", file=sys.stderr)

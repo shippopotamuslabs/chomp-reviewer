@@ -315,7 +315,47 @@ def post_inline_findings(findings, diff, sha, post_fn):
             # Continue with other findings
     return recorded, failed
 
-def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, diff):
+def load_ticket(ticket_path):
+    """Load ticket context for the prompt and recorded keys.
+
+    Returns (ticket_text, keys_or_None). keys is None when no --ticket
+    was passed (historical behavior); otherwise the resolved key list
+    (possibly empty, which notes the no-linked-ticket outcome).
+    Ticket text is untrusted quoted data, never instructions.
+    """
+    if not ticket_path:
+        return "(no linked ticket)", None
+    text = "(no linked ticket)"
+    try:
+        with open(ticket_path) as f:
+            text = f.read()
+    except OSError as e:
+        print(f"WARNING: cannot read ticket file {ticket_path}: {e}",
+              file=sys.stderr)
+    artifact = None
+    if ticket_path.endswith(".json"):
+        try:
+            artifact = json.loads(text)
+        except ValueError:
+            artifact = None
+    else:
+        sibling = os.path.join(os.path.dirname(os.path.abspath(ticket_path)),
+                               "ticket.json")
+        try:
+            with open(sibling) as f:
+                artifact = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"WARNING: cannot read ticket JSON {sibling}: {e}",
+                  file=sys.stderr)
+    keys = []
+    if isinstance(artifact, dict):
+        keys = [t.get("key") for t in artifact.get("tickets", []) or []
+                if isinstance(t, dict) and t.get("key")]
+    return text, keys
+
+
+def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, diff,
+                       tickets=None):
     """Post the consolidated review to GitLab: rollup note + inline
     discussions. Returns (recorded, failed)."""
     # Get project path for blob links
@@ -330,7 +370,8 @@ def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, 
     start_sha = diff_refs.get("start_sha", "")
 
     # Post rollup first
-    rollup_body = build_rollup(sha, summary, findings, project_path)
+    rollup_body = build_rollup(sha, summary, findings, project_path,
+                               tickets=tickets)
     print("Posting rollup...", file=sys.stderr)
     note = gitlab_request(
         "POST",
@@ -346,11 +387,13 @@ def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, 
 
     return post_inline_findings(findings, diff, sha, post_fn)
 
-def post_review_github(api_url, repo, number, token, sha, summary, findings, diff):
+def post_review_github(api_url, repo, number, token, sha, summary, findings, diff,
+                       tickets=None):
     """Post the consolidated review to GitHub: rollup as a PR conversation
     comment + inline review comments. Returns (recorded, failed)."""
     rollup_body = build_rollup(sha, summary, findings, repo,
-                               blob_base=f"https://github.com/{repo}/blob")
+                               blob_base=f"https://github.com/{repo}/blob",
+                               tickets=tickets)
     print("Posting rollup...", file=sys.stderr)
     comment = github_backend.post_issue_comment(api_url, repo, number, token, rollup_body)
     print(f"Rollup posted: comment {comment.get('id')}", file=sys.stderr)
@@ -414,12 +457,28 @@ def build_agent_prompt(finding):
 <code>ⓘ Copy this prompt and use it to remediate the issue with your preferred AI generation tools</code>
 </details>"""
 
-def build_rollup(sha, summary, findings, project_path, blob_base=None):
+def ticket_note_lines(tickets):
+    """Render the linked-ticket note for the rollup.
+
+    tickets is None when no --ticket artifact was passed (no note at
+    all); [] notes the no-linked-ticket outcome; otherwise the keys.
+    """
+    if tickets is None:
+        return []
+    if tickets:
+        return ["", "Linked tickets: " + ", ".join(tickets)]
+    return ["", "_No linked ticket found for this MR._"]
+
+
+def build_rollup(sha, summary, findings, project_path, blob_base=None,
+                 tickets=None):
     """Build the rollup comment markdown.
 
     blob_base overrides the blob-link prefix (GitHub passes
     "https://github.com/<owner>/<repo>/blob"); the default keeps the
-    historical GitLab URL shape.
+    historical GitLab URL shape. tickets is None by default, which keeps
+    the historical output byte-identical; pass [] or [keys...] to note
+    the linked-ticket outcome.
     """
     # Count by severity
     counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
@@ -494,6 +553,8 @@ def build_rollup(sha, summary, findings, project_path, blob_base=None):
             "",
         ])
 
+    lines.extend(ticket_note_lines(tickets))
+
     return "\n".join(lines)
 
 def build_inline(sha, finding, meta=None):
@@ -532,6 +593,8 @@ def main():
     parser.add_argument("--thermos-b", required=True, help="Path to thermos-b JSON")
     parser.add_argument("--diff", required=True, help="Path to diff file")
     parser.add_argument("--prompt-dir", default=".forge/prompts")
+    parser.add_argument("--ticket", default=None,
+                        help="Path to ticket.md artifact (quoted context)")
     parser.add_argument("--dry-run", action="store_true", help="Don't post, just print")
     args = parser.parse_args()
 
@@ -578,11 +641,15 @@ def main():
     with open(os.path.join(args.prompt_dir, "master-dedup.md")) as f:
         template = f.read()
 
+    # Ticket context is untrusted quoted data, never instructions.
+    ticket_text, ticket_keys = load_ticket(args.ticket)
+
     prompt = substitute_placeholders(template, {
         "{pr_agent_md}": pr_agent_md,
         "{thermos_a_json}": thermos_a,
         "{thermos_b_json}": thermos_b,
         "{diff}": diff,
+        "{ticket}": ticket_text,
     })
 
     print("Calling OpenRouter for master dedup...", file=sys.stderr)
@@ -613,15 +680,23 @@ def main():
 
     if args.dry_run:
         print(json.dumps(result, indent=2))
+        if ticket_keys is not None:
+            if ticket_keys:
+                print("Linked tickets: %s" % ", ".join(ticket_keys),
+                      file=sys.stderr)
+            else:
+                print("No linked ticket found.", file=sys.stderr)
         return
 
     if platform == "github":
         gh_api, gh_repo, gh_token = github_backend.gh_env()
         recorded, failed = post_review_github(
-            gh_api, gh_repo, args.iid, gh_token, args.sha, summary, findings, diff)
+            gh_api, gh_repo, args.iid, gh_token, args.sha, summary, findings, diff,
+            tickets=ticket_keys)
     else:
         recorded, failed = post_review_gitlab(
-            api_url, project_id, args.iid, gitlab_token, args.sha, summary, findings, diff)
+            api_url, project_id, args.iid, gitlab_token, args.sha, summary, findings, diff,
+            tickets=ticket_keys)
 
     # Write recorded discussions for the verify job
     with open("forge-recorded.json", "w") as f:
@@ -631,6 +706,7 @@ def main():
             "platform": platform,
             "discussions": recorded,
             "failed": failed,
+            "tickets": ticket_keys if ticket_keys is not None else [],
         }, f, indent=2)
     print(f"Recorded {len(recorded)} discussions to forge-recorded.json", file=sys.stderr)
     if failed:

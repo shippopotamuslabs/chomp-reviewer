@@ -67,13 +67,17 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
         self.assertIn("LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}", body)
         self.assertIn('PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT: "true"', body)
 
-    def test_linear_secret_forwarded_only_to_pr_agent_step(self):
+    def test_linear_secret_forwarded_to_pr_agent_and_ticket_steps(self):
+        # FRG-6b: the ticket step also receives LINEAR_API_KEY (consumer
+        # key for the Linear GraphQL fetch); no other step may hold it.
         steps = _steps(_read(WORKFLOW))
         holders = [n for n, b in steps if "secrets.LINEAR_API_KEY" in b]
         self.assertEqual(
             holders,
-            ["PR-Agent producer (silent, plain-diff)"],
-            "LINEAR_API_KEY must be forwarded only to the PR-Agent producer step",
+            ["Fetch linked ticket context",
+             "PR-Agent producer (silent, plain-diff)"],
+            "LINEAR_API_KEY must be forwarded only to the ticket and "
+            "PR-Agent producer steps",
         )
 
     def test_producer_stays_silent_plain_diff_fail_soft(self):
