@@ -36,6 +36,22 @@ Set these CI variables in your project (masked):
 
 Add a `.pr_agent.toml` to your repo root with review guidance. The `forge:review` job fails if it's missing.
 
+## GitHub Actions
+
+Callers on GitHub add a small workflow that uses the reusable workflow at
+`.github/workflows/forge-review.yml` (see the header comments there for the
+exact snippet) with `secrets: inherit`.
+
+| Secret | Required | Purpose |
+|--------|----------|---------|
+| `OPENROUTER_API_KEY` | Yes | Thermos lenses + master dedup + verify. |
+| `FORGE_APP_PRIVATE_KEY` | Yes | Private key of the Shippopotamus Forge GitHub App (ID 5455197). The review posts as `shippopotamus-forge[bot]` via an installation token minted in the workflow. |
+| `LINEAR_API_KEY` | No | Forwarded to the PR-Agent producer step only, so ticket-aware PR-Agent features resolve Linear tickets for consumers who provide one. Absence changes nothing. |
+
+The PR-Agent producer step also sets `PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT=true`
+(the dynaconf env override for `pr_reviewer.check_pr_additional_content`), so
+changes unrelated to the stated intent get flagged.
+
 ## Pipeline
 
 ```

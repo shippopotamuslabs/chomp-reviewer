@@ -23,6 +23,12 @@ name: Forge Review
 #                           shippopotamus-forge[bot] via an installation
 #                           token minted in this workflow.
 #
+# Optional secrets in the CALLER repo:
+#   LINEAR_API_KEY:         Forwarded to the PR-Agent producer step only,
+#                           so ticket-aware PR-Agent features resolve Linear
+#                           tickets for consumers who provide one. Absence
+#                           changes nothing.
+#
 # Behavior mirrors the GitLab template: producers are silent and
 # fail-soft (a failed producer never blocks the caller's pipeline),
 # master posts one consolidated review, and pushes after the first
@@ -52,6 +58,8 @@ on:
         required: true
       FORGE_APP_PRIVATE_KEY:
         required: true
+      LINEAR_API_KEY:
+        required: false
 
 jobs:
   review:
@@ -139,6 +147,13 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           FORGE_MODEL: ${{ inputs.model }}
+          # Ticket context for the PR-Agent handler. LINEAR_API_KEY is
+          # optional: when the caller does not provide it the value is
+          # empty and nothing changes. PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT
+          # is the dynaconf env override for pr_reviewer.check_pr_additional_content
+          # (same SECTION__KEY convention as CONFIG__MODEL below).
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT: "true"
         run: |
           fallback() {
             echo "::warning::$1"
