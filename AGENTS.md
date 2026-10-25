@@ -37,3 +37,35 @@
   ERROR (not WARNING) and are recorded in `forge-recorded.json`.
 - Keep `verify.py` compatible with any `forge-recorded.json` shape changes
   (it re-fetches discussions via API; the JSON file is write-only context).
+
+## PR titles and commit messages
+
+PR titles follow Conventional Commits, because squash merging makes the
+PR title the commit subject on main - and Forge's ticket cascade reads
+titles when linking a PR to its ticket.
+
+Format:
+
+    type(scope): imperative subject (KEY-123)
+
+- type - feat, fix, polish, chore, docs, refactor, test, ci, build,
+  perf, style. Types mirror the Linear type labels (feature -> feat,
+  bug -> fix).
+- scope - the area the change touches, lowercase: a module, layer, or
+  surface.
+- subject - imperative mood, lowercase, no trailing period:
+  "add linear progression", not "adds" or "added".
+- (KEY-123) - the Linear ticket key in parentheses at the end, when
+  the work has a ticket. Branch names stay the primary ticket link
+  (name the branch after the key); the title key is the backup the
+  cascade reads second.
+
+Examples:
+
+    feat(tickets): add linked-ticket extraction cascade (FRG-6)
+    docs(setup): document bring-your-own GitHub App (FRG-2)
+
+A CI check (pr-title) enforces the shape on every PR. Individual
+commit messages on a branch are NOT linted - write them for the
+humans and agents reading the branch, and let the PR title carry
+the standard.
