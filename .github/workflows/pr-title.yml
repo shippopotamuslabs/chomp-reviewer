@@ -1,0 +1,30 @@
+name: PR Title
+
+# PR titles are the squash-merge commit subjects on main, and Forge's
+# ticket cascade reads them when linking a PR to its ticket - so titles
+# follow the house format:  type(scope): imperative subject (KEY-123)
+# The full convention lives in AGENTS.md ("PR titles and commit messages").
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  pr-title:
+    name: pr-title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title format
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|polish|chore|docs|refactor|test|ci|build|perf|style)(\([a-z0-9][a-z0-9./-]*\))?!?: [^ ].*( \([A-Z]{2,}-[0-9]+\))?$'
+          if [[ ! "$PR_TITLE" =~ $pattern ]]; then
+            echo "::error::PR title must follow: type(scope): imperative subject (KEY-123) - see AGENTS.md"
+            echo "Got: $PR_TITLE"
+            exit 1
+          fi
+          echo "Title OK: $PR_TITLE"
