@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.1.4 (2026-10-25)
+
+- Fix: render finding descriptions and evidence as wrapped markdown instead of `<pre>` blocks (FRG-8). `build_rollup` drops the `<pre>` wrappers and prefixes every line of multi-line description/evidence with the blockquote marker so all paragraphs stay inside the details structure; `build_inline` emits the description as a normal markdown paragraph. The Agent Prompt triple-backtick fence is kept deliberately as a copy-paste artifact. Adds `tests/test_master_wrapped_markdown.py`.
+
 ## v1.1.3 (2026-10-24)
 
 - Feat: ticket conformance verdict in the master rollup, covered by the verify loop (FRG-7). Master now renders a `## Ticket conformance` section (resolved tickets with links, per-criterion addressed/not evident/contradicted with evidence, neutral unrelated-changes list, one overall conforms/partially conforms/does not conform/no linked ticket line; advisory only, never a merge gate, no invented criteria for sparse tickets), Thermos correctness treats ticket-specified behavior as checkable fact and structure judges refactors against the ticket, and `verify.py` re-evaluates open criteria on re-push with the same final-state evidence as findings, posting one summary re-check comment. Adds `tests/test_conformance_rollup.py` and `tests/test_verify_conformance.py`.

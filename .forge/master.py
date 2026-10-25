@@ -471,6 +471,13 @@ def category_tag(category):
         "Test gap": "🧪 Test gap",
     }.get(category, category)
 
+def _quote_block_lines(text):
+    """Prefix every line with the blockquote marker so multi-line text
+    stays inside the surrounding quote/details structure."""
+    lines = str(text).split("\n") if str(text) else [""]
+    return ["> " + line if line.strip() else ">" for line in lines]
+
+
 def build_agent_prompt(finding):
     """Build the Agent Prompt block."""
     focus_areas = "\n".join(f"- {area}" for area in finding.get("fix_focus_areas", []))
@@ -630,9 +637,7 @@ def build_rollup(sha, summary, findings, project_path, blob_base=None,
             "> <details open>",
             "> <summary>Description</summary>",
             "> <br/>",
-            "> <pre>",
-            f"> {f.get('description', '')}",
-            "> </pre>",
+            *_quote_block_lines(f.get('description', '')),
             "> </details>",
             "",
             "> <details>",
@@ -644,9 +649,7 @@ def build_rollup(sha, summary, findings, project_path, blob_base=None,
             "> <details>",
             "> <summary>Evidence</summary>",
             "> <br/>",
-            "> <pre>",
-            f"> {f.get('evidence', '')}",
-            "> </pre>",
+            *_quote_block_lines(f.get('evidence', '')),
             "> </details>",
             "",
             build_agent_prompt(f),
@@ -682,9 +685,7 @@ def build_inline(sha, finding, meta=None):
     return f"""<!-- forge:consolidated-review sha:{sha} -->{anchor_note}
 {badge} — {title} <code>{cat}</code>
 
-<pre>
 {finding.get('description', '')}
-</pre>
 
 {build_agent_prompt(finding)}"""
 
