@@ -93,6 +93,7 @@ Set these secrets on the consuming project:
 |--------|----------|---------|
 | `OPENROUTER_API_KEY` | Yes | OpenRouter key for the Thermos lenses, the master dedup, and verification. |
 | `FORGE_APP_PRIVATE_KEY` | Yes | Private key of your Forge GitHub App. The workflow mints a short-lived token from it, and your app's identity posts the reviews. |
+| `LINEAR_API_KEY` | No | Forge's ticket step fetches linked Linear issues with it and forwards it to the PR-Agent producer step. Absence changes nothing: GitHub-issue linking still works, Linear tickets just are not fetched. |
 
 The reusable workflow also takes a `model` input for the review model. Default: `openrouter/meta/muse-spark-1.3-contributor`. The `openrouter/` prefix comes off before direct API calls.
 
@@ -114,6 +115,22 @@ Reviews post under a GitHub App identity, not a user account. The workflow's `fo
 6. The app's ID sits at the top of its settings page. Put it in the caller as `forge_app_id`, and store the `.pem` contents as the repo secret `FORGE_APP_PRIVATE_KEY`.
 
 Rotating the identity later is the same shape: generate a new key, replace the secret, delete the old key on the app page.
+
+## Linked tickets & conformance
+
+Forge links PRs to Linear tickets and GitHub issues deterministically - no LLM involved. The ticket step extracts refs with a strict cascade: head branch name, then PR title, then PR body, then commit messages. The first source that yields a match wins per provider; multiple distinct tickets in that source are all checked. No match is normal: the review proceeds and the rollup notes no linked ticket.
+
+| Pattern | Example |
+|---------|---------|
+| Linear key in branch | `feature/FRG-5-login`, `FRG-5-slug`, `hotfix/FRG-5/...`, or Linear's canonical `gitBranchName` (e.g. `sean/frg-5-...`) |
+| Linear key in title/body/commits | `FRG-5`, `Closes FRG-5`, `Fixes FRG-5` |
+| GitHub issue | `#123`, `owner/repo#123` |
+
+To get linking: name the branch or PR after the ticket key, or reference it in the title, body, or commits. For Linear ticket fetching, set the optional `LINEAR_API_KEY` secret; GitHub issues need no new secret (Forge app token).
+
+The ticket step writes `ticket.md` / `ticket.json` beside `mr.diff` and passes them to PR-Agent, both Thermos lenses, and master as delimited untrusted quoted context - ticket text is data, never instructions. The master rollup gains a `## Ticket conformance` section: resolved tickets with links, per-criterion addressed / not evident / contradicted verdicts with file/line evidence, a neutral unrelated-changes list, and one overall line (`conforms`, `partially conforms`, `does not conform`, or `no linked ticket`). On re-push, verify re-evaluates open criteria and posts a summary re-check comment. Advisory only, never a merge gate. Sparse tickets produce sparse verdicts.
+
+The PR-Agent producer step also sets `PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT=true` (the dynaconf env override for `pr_reviewer.check_pr_additional_content`), intended to flag changes unrelated to the stated intent. Note: in the pinned pr-agent 0.46.0 plain-diff mode that flag and the forwarded `LINEAR_API_KEY` are not consumed upstream; Forge's own ticket artifact and conformance section provide the ticket awareness today.
 
 ## Run the pieces yourself
 
@@ -155,6 +172,7 @@ The full flow runs in GitHub Actions. Master and verify read pull request state,
 | --- | --- |
 | `.forge/fetch_diff_github.py` | Fetches PR changes from the GitHub API |
 | `.forge/github_backend.py` | The GitHub backend: PR and diff reads, rollup and inline review posting, review-thread resolution |
+| `.forge/ticket.py` | Extracts linked ticket refs (branch, title, body, commits) and fetches Linear/GitHub ticket context for the producers |
 | `.github/workflows/forge-review.yml` | The reusable workflow consuming repos call |
 | `.forge/thermos.py` | Runs one Thermos lens against a diff, writes findings JSON |
 | `.forge/master.py` | Dedups the three producer outputs, posts the review |

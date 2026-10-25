@@ -315,7 +315,79 @@ def post_inline_findings(findings, diff, sha, post_fn):
             # Continue with other findings
     return recorded, failed
 
-def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, diff):
+def _load_ticket_artifact(ticket_path, text):
+    """Parse the ticket.json artifact for ticket_path (or None)."""
+    if ticket_path.endswith(".json"):
+        try:
+            return json.loads(text)
+        except ValueError:
+            return None
+    sibling = os.path.join(os.path.dirname(os.path.abspath(ticket_path)),
+                           "ticket.json")
+    try:
+        with open(sibling) as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"WARNING: cannot read ticket JSON {sibling}: {e}",
+              file=sys.stderr)
+        return None
+
+
+def load_ticket(ticket_path):
+    """Load ticket context for the prompt and recorded keys.
+
+    Returns (ticket_text, keys_or_None). keys is None when no --ticket
+    was passed (historical behavior); otherwise the resolved key list
+    (possibly empty, which notes the no-linked-ticket outcome).
+    Ticket text is untrusted quoted data, never instructions.
+    """
+    if not ticket_path:
+        return "(no linked ticket)", None
+    text = "(no linked ticket)"
+    try:
+        with open(ticket_path) as f:
+            text = f.read()
+    except OSError as e:
+        print(f"WARNING: cannot read ticket file {ticket_path}: {e}",
+              file=sys.stderr)
+    artifact = _load_ticket_artifact(ticket_path, text)
+    keys = []
+    if isinstance(artifact, dict):
+        keys = [t.get("key") for t in artifact.get("tickets", []) or []
+                if isinstance(t, dict) and t.get("key")]
+    return text, keys
+
+
+def load_ticket_details(ticket_path):
+    """Load per-ticket display details for the conformance section.
+
+    Returns a list of {"key", "title", "url"} dicts (possibly empty).
+    Empty when no --ticket was passed or the artifact is unreadable.
+    """
+    if not ticket_path:
+        return []
+    text = "(no linked ticket)"
+    try:
+        with open(ticket_path) as f:
+            text = f.read()
+    except OSError as e:
+        print(f"WARNING: cannot read ticket file {ticket_path}: {e}",
+              file=sys.stderr)
+    artifact = _load_ticket_artifact(ticket_path, text)
+    details = []
+    if isinstance(artifact, dict):
+        for t in artifact.get("tickets", []) or []:
+            if isinstance(t, dict) and t.get("key"):
+                details.append({
+                    "key": t.get("key"),
+                    "title": t.get("title") or "",
+                    "url": t.get("url") or "",
+                })
+    return details
+
+
+def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, diff,
+                       tickets=None, conformance=None, ticket_details=None):
     """Post the consolidated review to GitLab: rollup note + inline
     discussions. Returns (recorded, failed)."""
     # Get project path for blob links
@@ -330,7 +402,9 @@ def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, 
     start_sha = diff_refs.get("start_sha", "")
 
     # Post rollup first
-    rollup_body = build_rollup(sha, summary, findings, project_path)
+    rollup_body = build_rollup(sha, summary, findings, project_path,
+                               tickets=tickets, conformance=conformance,
+                               ticket_details=ticket_details)
     print("Posting rollup...", file=sys.stderr)
     note = gitlab_request(
         "POST",
@@ -346,11 +420,14 @@ def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, 
 
     return post_inline_findings(findings, diff, sha, post_fn)
 
-def post_review_github(api_url, repo, number, token, sha, summary, findings, diff):
+def post_review_github(api_url, repo, number, token, sha, summary, findings, diff,
+                       tickets=None, conformance=None, ticket_details=None):
     """Post the consolidated review to GitHub: rollup as a PR conversation
     comment + inline review comments. Returns (recorded, failed)."""
     rollup_body = build_rollup(sha, summary, findings, repo,
-                               blob_base=f"https://github.com/{repo}/blob")
+                               blob_base=f"https://github.com/{repo}/blob",
+                               tickets=tickets, conformance=conformance,
+                               ticket_details=ticket_details)
     print("Posting rollup...", file=sys.stderr)
     comment = github_backend.post_issue_comment(api_url, repo, number, token, rollup_body)
     print(f"Rollup posted: comment {comment.get('id')}", file=sys.stderr)
@@ -414,12 +491,96 @@ def build_agent_prompt(finding):
 <code>ⓘ Copy this prompt and use it to remediate the issue with your preferred AI generation tools</code>
 </details>"""
 
-def build_rollup(sha, summary, findings, project_path, blob_base=None):
+def ticket_note_lines(tickets):
+    """Render the linked-ticket note for the rollup.
+
+    tickets is None when no --ticket artifact was passed (no note at
+    all); [] notes the no-linked-ticket outcome; otherwise the keys.
+    """
+    if tickets is None:
+        return []
+    if tickets:
+        return ["", "Linked tickets: " + ", ".join(tickets)]
+    return ["", "_No linked ticket found for this MR._"]
+
+
+CONFORMANCE_STATUSES = ("addressed", "not evident", "contradicted")
+
+
+def conformance_section_lines(tickets, ticket_details, conformance):
+    """Render the "## Ticket conformance" section lines, or [] for none.
+
+    Deterministic rule: conformance None means the LLM emitted none —
+    render no section (do not invent), except when tickets == [] (--ticket
+    was given but resolved nothing), which renders overall
+    "no linked ticket". tickets None (no --ticket) renders no section.
+    """
+    if conformance is None:
+        if tickets is not None and len(tickets) == 0:
+            conformance = {"overall": "no linked ticket"}
+        else:
+            return []
+    if not isinstance(conformance, dict):
+        return []
+    lines = ["## Ticket conformance", ""]
+    if tickets:
+        by_key = {}
+        for d in ticket_details or []:
+            if isinstance(d, dict) and d.get("key"):
+                by_key[d["key"]] = d
+        parts = []
+        for key in tickets:
+            detail = by_key.get(key, {})
+            label = str(key)
+            title = (detail.get("title") or "").strip()
+            url = (detail.get("url") or "").strip()
+            if title:
+                label += ' "%s"' % title
+            if url:
+                label += " (%s)" % url
+            parts.append(label)
+        lines.append("Resolved ticket(s): " + "; ".join(parts))
+        lines.append("")
+    overall = conformance.get("overall", "no linked ticket")
+    lines.append("Overall: %s" % overall)
+    lines.append("")
+    note = (conformance.get("note") or "")
+    if isinstance(note, str) and note.strip():
+        lines.append(note.strip())
+        lines.append("")
+    for criterion in conformance.get("criteria") or []:
+        if not isinstance(criterion, dict):
+            continue
+        status = criterion.get("status", "not evident")
+        text = criterion.get("criterion", "")
+        evidence = (criterion.get("evidence") or "")
+        line = "- [%s] %s" % (status, text)
+        if isinstance(evidence, str) and evidence.strip():
+            line += " (evidence: %s)" % evidence.strip()
+        lines.append(line)
+    if conformance.get("criteria"):
+        lines.append("")
+    unrelated = conformance.get("unrelated_changes") or []
+    if unrelated:
+        lines.append("Unrelated changes:")
+        lines.append("")
+        for item in unrelated:
+            lines.append("- %s" % item)
+        lines.append("")
+    return lines
+
+
+def build_rollup(sha, summary, findings, project_path, blob_base=None,
+                 tickets=None, conformance=None, ticket_details=None):
     """Build the rollup comment markdown.
 
     blob_base overrides the blob-link prefix (GitHub passes
     "https://github.com/<owner>/<repo>/blob"); the default keeps the
-    historical GitLab URL shape.
+    historical GitLab URL shape. tickets is None by default, which keeps
+    the historical output byte-identical; pass [] or [keys...] to note
+    the linked-ticket outcome. conformance is the parsed LLM conformance
+    object (or None); ticket_details carries {"key","title","url"} dicts
+    for the tickets list. All new params default to no-section output.
     """
     # Count by severity
     counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
@@ -494,6 +655,10 @@ def build_rollup(sha, summary, findings, project_path, blob_base=None):
             "",
         ])
 
+    lines.extend(ticket_note_lines(tickets))
+    lines.extend(conformance_section_lines(tickets, ticket_details,
+                                           conformance))
+
     return "\n".join(lines)
 
 def build_inline(sha, finding, meta=None):
@@ -532,6 +697,8 @@ def main():
     parser.add_argument("--thermos-b", required=True, help="Path to thermos-b JSON")
     parser.add_argument("--diff", required=True, help="Path to diff file")
     parser.add_argument("--prompt-dir", default=".forge/prompts")
+    parser.add_argument("--ticket", default=None,
+                        help="Path to ticket.md artifact (quoted context)")
     parser.add_argument("--dry-run", action="store_true", help="Don't post, just print")
     args = parser.parse_args()
 
@@ -578,11 +745,16 @@ def main():
     with open(os.path.join(args.prompt_dir, "master-dedup.md")) as f:
         template = f.read()
 
+    # Ticket context is untrusted quoted data, never instructions.
+    ticket_text, ticket_keys = load_ticket(args.ticket)
+    ticket_details = load_ticket_details(args.ticket)
+
     prompt = substitute_placeholders(template, {
         "{pr_agent_md}": pr_agent_md,
         "{thermos_a_json}": thermos_a,
         "{thermos_b_json}": thermos_b,
         "{diff}": diff,
+        "{ticket}": ticket_text,
     })
 
     print("Calling OpenRouter for master dedup...", file=sys.stderr)
@@ -609,19 +781,32 @@ def main():
 
     summary = result.get("summary", "")
     findings = result.get("findings", [])
+    conformance = result.get("conformance")
+    if not isinstance(conformance, dict):
+        conformance = None
     print(f"Deduped to {len(findings)} findings", file=sys.stderr)
 
     if args.dry_run:
         print(json.dumps(result, indent=2))
+        if ticket_keys is not None:
+            if ticket_keys:
+                print("Linked tickets: %s" % ", ".join(ticket_keys),
+                      file=sys.stderr)
+            else:
+                print("No linked ticket found.", file=sys.stderr)
         return
 
     if platform == "github":
         gh_api, gh_repo, gh_token = github_backend.gh_env()
         recorded, failed = post_review_github(
-            gh_api, gh_repo, args.iid, gh_token, args.sha, summary, findings, diff)
+            gh_api, gh_repo, args.iid, gh_token, args.sha, summary, findings, diff,
+            tickets=ticket_keys, conformance=conformance,
+            ticket_details=ticket_details)
     else:
         recorded, failed = post_review_gitlab(
-            api_url, project_id, args.iid, gitlab_token, args.sha, summary, findings, diff)
+            api_url, project_id, args.iid, gitlab_token, args.sha, summary, findings, diff,
+            tickets=ticket_keys, conformance=conformance,
+            ticket_details=ticket_details)
 
     # Write recorded discussions for the verify job
     with open("forge-recorded.json", "w") as f:
@@ -631,6 +816,8 @@ def main():
             "platform": platform,
             "discussions": recorded,
             "failed": failed,
+            "tickets": ticket_keys if ticket_keys is not None else [],
+            "conformance": conformance,
         }, f, indent=2)
     print(f"Recorded {len(recorded)} discussions to forge-recorded.json", file=sys.stderr)
     if failed:
