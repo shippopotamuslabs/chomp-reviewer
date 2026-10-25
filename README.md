@@ -161,4 +161,6 @@ Read `AGENTS.md` before changing anything. The short version: every behavior cha
 
 ## License
 
-The `.forge/` scripts are original work. PR-Agent runs unmodified from PyPI at review time and stays under its own license, AGPL-3.0. Running an unmodified AGPL package inside your own CI carries no source-offer obligation for your code.
+0BSD license. Do whatever you want with the code. Just don't expect it to work or sue me.
+
+ PR-Agent runs unmodified from PyPI at review time and stays under its own license, AGPL-3.0. Running an unmodified AGPL package inside your own CI carries no source-offer obligation for your code.
