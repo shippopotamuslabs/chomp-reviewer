@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.1.3 (2026-10-24)
+
+- Feat: ticket conformance verdict in the master rollup, covered by the verify loop (FRG-7). Master now renders a `## Ticket conformance` section (resolved tickets with links, per-criterion addressed/not evident/contradicted with evidence, neutral unrelated-changes list, one overall conforms/partially conforms/does not conform/no linked ticket line; advisory only, never a merge gate, no invented criteria for sparse tickets), Thermos correctness treats ticket-specified behavior as checkable fact and structure judges refactors against the ticket, and `verify.py` re-evaluates open criteria on re-push with the same final-state evidence as findings, posting one summary re-check comment. Adds `tests/test_conformance_rollup.py` and `tests/test_verify_conformance.py`.
+
+## v1.1.2 (2026-10-24)
+
+- Feat: deterministic ticket resolution for all producers (FRG-6). New `.forge/ticket.py` extracts ticket refs with a strict branch → title → body → commits cascade (first match per provider wins, distinct tickets kept, no match is normal), fetches Linear issues via GraphQL with the consumer `LINEAR_API_KEY` and GitHub issues via the Forge app token, clips descriptions, and writes `ticket.md`/`ticket.json` beside `mr.diff`; all producers receive the artifact as delimited untrusted quoted context and master records resolved IDs in `forge-recorded.json`. Fully fail-soft. Adds `tests/test_ticket_extract.py` and `tests/test_ticket_fetch.py`.
+
+## v1.1.1 (2026-10-24)
+
+- Feat: wire PR-Agent ticket-context plumbing into the GitHub workflow (FRG-5). The reusable workflow declares an optional `LINEAR_API_KEY` secret (absence changes nothing) forwarded to the PR-Agent and ticket steps, and enables `pr_reviewer.check_pr_additional_content` via the dynaconf `PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT` env override. Verified against the pinned pr-agent 0.46.0 source: in `--diff-file` plain-diff mode its provider hardcodes title/branch/description, so no PR context can be consumed there and `LINEAR_API_KEY`/`check_pr_additional_content` are inert until upstream honors them — Forge's own ticket artifact (v1.1.2) is the working ticket path. Adds `tests/test_forge_review_workflow.py`.
+
 ## v1.1.0 (2026-10-24)
 
 - Feat: GitHub Actions platform. Forge now runs on GitHub as a reusable workflow (`.github/workflows/forge-review.yml`) that consuming repos call on `pull_request`: the Shippopotamus Forge GitHub App mints an installation token, producers run silent and fail-soft exactly as in the GitLab template, master posts one consolidated review (rollup as a PR conversation comment with github.com blob links, inline comments through the pulls comments API anchored by the same diff line map that positions GitLab discussions), and re-pushes run verification — verdict replies through the review-comment replies endpoint, thread resolution through GraphQL `resolveReviewThread`. New `.forge/github_backend.py` (REST + GraphQL, stdlib only) and `.forge/fetch_diff_github.py` (pulls API diff media type); `master.py` and `verify.py` select the backend by environment (`FORGE_PLATFORM`, defaulting to GitHub under GitHub Actions) with the GitLab paths unchanged, and scripts come from a checkout of this repo instead of the GitLab file-download the template relied on. `openrouter_client.get_model()` treats an empty `FORGE_MODEL` as unset. Adds `tests/test_github_backend.py` (suite: 55 tests). The GitLab template keeps working as is; per the GitHub PR flow, the v1.1.0 tag is cut on the merge commit.
