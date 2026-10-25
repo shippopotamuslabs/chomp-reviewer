@@ -336,6 +336,245 @@ or
 {{"verdict": "NOT_ADDRESSED", "reason": "brief explanation"}}"""
 
 
+CONFORMANCE_OPEN_STATUSES = ("not evident", "contradicted")
+
+CONFORMANCE_CRITERION_RE = re.compile(r"^-\s*\[([^\]]+)\]\s*(.*?)\s*$")
+CONFORMANCE_EVIDENCE_RE = re.compile(r"\(evidence:\s*(.*)\)\s*$")
+
+
+def parse_conformance_criteria(rollup_body):
+    """Parse the ## Ticket conformance section from a rollup comment body.
+
+    Returns (overall, criteria). overall is None when the rollup carries
+    no conformance section (the caller no-ops). Each criterion is
+    {"status", "criterion", "evidence"}, mirroring the lines
+    conformance_section_lines in master.py renders:
+    "- [status] criterion (evidence: ...)".
+    """
+    if not rollup_body or "## Ticket conformance" not in rollup_body:
+        return None, []
+    section = rollup_body.split("## Ticket conformance", 1)[1]
+    overall = ""
+    match = re.search(r"^Overall:\s*(.+?)\s*$", section, re.MULTILINE)
+    if match:
+        overall = match.group(1).strip()
+    criteria = []
+    for line in section.splitlines():
+        match = CONFORMANCE_CRITERION_RE.match(line.strip())
+        if not match:
+            continue
+        rest = match.group(2).strip()
+        evidence = ""
+        ev = CONFORMANCE_EVIDENCE_RE.search(rest)
+        if ev:
+            evidence = ev.group(1).strip()
+            rest = rest[:ev.start()].strip()
+        criteria.append({
+            "status": match.group(1).strip(),
+            "criterion": rest,
+            "evidence": evidence,
+        })
+    return overall, criteria
+
+
+def open_conformance_criteria(criteria):
+    """Select criteria still needing work: not evident or contradicted."""
+    return [c for c in criteria
+            if c.get("status", "").strip() in CONFORMANCE_OPEN_STATUSES]
+
+
+def build_conformance_prompt(criterion_text, evidence):
+    """Build the re-check prompt for one conformance criterion."""
+    return f"""You are re-checking whether a ticket conformance criterion is now addressed by new changes.
+
+## Criterion (from the review's Ticket conformance section)
+{criterion_text}
+
+## Diff under review (changes scoped to this criterion's files)
+{evidence}
+
+## Task
+Determine if the criterion is now ADDRESSED by the changes in the evidence.
+
+- ADDRESSED: The evidence clearly shows the criterion's requirement is now met. The previously missing behavior exists, or the contradicted claim is now true of the code.
+- NOT_ADDRESSED: The requirement is still not met, the code still contradicts it, or you cannot determine this from the evidence alone.
+- The diff is net vs target: code the MR added and then removed shows NO removal hunk. The final-state section is ground truth for whether cited code still exists — absence there plus the required behavior elsewhere is ADDRESSED, even when the diff shows no removal.
+
+Respond with ONLY a JSON object:
+{{"verdict": "ADDRESSED", "reason": "brief explanation"}}
+or
+{{"verdict": "NOT_ADDRESSED", "reason": "brief explanation"}}"""
+
+
+def parse_verdict_response(response):
+    """Strip fences and parse an LLM verdict JSON object.
+
+    Anything unparseable is NOT_ADDRESSED (mirrors the discussion loop's
+    invalid-JSON handling); only an exact "ADDRESSED" verdict counts.
+    """
+    text = (response or "").strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        result = json.loads(text)
+        if not isinstance(result, dict):
+            raise ValueError("verdict is not a JSON object")
+        verdict = result.get("verdict", "NOT_ADDRESSED")
+        reason = result.get("reason", "")
+    except (ValueError, AttributeError):
+        return "NOT_ADDRESSED", "LLM returned invalid JSON"
+    if verdict != "ADDRESSED":
+        verdict = "NOT_ADDRESSED"
+    return verdict, reason
+
+
+def build_conformance_recheck_body(sha, results):
+    """Build the single re-check summary comment.
+
+    results entries carry {"criterion", "status", "verdict", "reason"}.
+    Addressed criteria are marked resolved in text; still-open ones stay
+    listed. Never a merge gate.
+    """
+    short = (sha or "")[:8] or "unknown"
+    lines = [f"Forge conformance re-check at `{short}`", ""]
+    for r in results:
+        reason = (r.get("reason") or "").strip()
+        suffix = f" — {reason}" if reason else ""
+        if r.get("verdict") == "ADDRESSED":
+            lines.append(
+                f"- ✅ RESOLVED [{r.get('status')}] {r.get('criterion')}{suffix}")
+        else:
+            lines.append(
+                f"- ⏳ STILL OPEN [{r.get('status')}] {r.get('criterion')}{suffix}")
+    return "\n".join(lines)
+
+
+def get_rollup_body_gitlab(api_url, project_id, iid, token):
+    """Return the rollup note body carrying ## Ticket conformance, or None.
+
+    fatal=False: a listing failure raises RuntimeError for the caller to
+    treat as a fail-soft skip, never an abort.
+    """
+    notes = gitlab_request(
+        "GET",
+        f"{api_url}/projects/{project_id}/merge_requests/{iid}/notes?per_page=100",
+        token,
+        fatal=False,
+    )
+    for note in notes or []:
+        body = (note or {}).get("body") or ""
+        if "## Ticket conformance" in body:
+            return body
+    return None
+
+
+def verify_conformance_recheck(platform, api_url, project_id, iid, sha, diff,
+                               token, gh_api, gh_repo, gh_token,
+                               api_key, model, dry_run):
+    """Re-evaluate open conformance criteria against the new diff.
+
+    Criteria live in the rollup comment, not in resolvable threads, so the
+    outcome is posted as ONE summary comment: a new PR conversation
+    comment on GitHub (issue comments have no replies, so replying on the
+    rollup is impossible) and a new MR note on GitLab (the rollup is an
+    individual, non-resolvable note that verify deliberately skips). The
+    rollup itself is never resolved. Fail-soft per criterion: an LLM
+    failure logs ERROR and skips that criterion; only a failed summary
+    post returns True (the caller exits 1, mirroring reply_failed).
+    """
+    try:
+        if platform == "github":
+            comment = github_backend.find_marker_comment(
+                gh_api, gh_repo, iid, gh_token, "## Ticket conformance")
+            rollup_body = (comment or {}).get("body") if comment else None
+        else:
+            rollup_body = get_rollup_body_gitlab(api_url, project_id, iid, token)
+    except Exception as e:
+        print(f"  WARNING: conformance rollup fetch failed: {e}", file=sys.stderr)
+        return False
+
+    overall, criteria = parse_conformance_criteria(rollup_body or "")
+    if overall is None:
+        print("No Ticket conformance section; skipping conformance re-check.",
+              file=sys.stderr)
+        return False
+    if overall == "no linked ticket":
+        print("No linked ticket; skipping conformance re-check.", file=sys.stderr)
+        return False
+    pending = open_conformance_criteria(criteria)
+    if not pending:
+        print("No open conformance criteria; nothing to re-check.",
+              file=sys.stderr)
+        return False
+
+    print(f"Re-checking {len(pending)} open conformance criteria...",
+          file=sys.stderr)
+    results = []
+    for criterion in pending:
+        text = criterion["criterion"]
+        if criterion.get("evidence"):
+            text = f"{text} (evidence: {criterion['evidence']})"
+        evidence = select_diff_for_finding(diff, text)
+        if platform == "github":
+            final_state = build_final_state_block(
+                gh_api, gh_repo, extract_focus_files(text), sha, gh_token,
+                fetcher=github_backend.fetch_file_at_ref,
+            )
+        else:
+            final_state = build_final_state_block(
+                api_url, project_id, extract_focus_files(text), sha, token,
+            )
+        if final_state:
+            evidence = evidence + "\n\n" + final_state
+        prompt = build_conformance_prompt(text, evidence)
+        try:
+            response = call_openrouter(api_key, model, prompt)
+        except Exception as e:
+            print(f"  ERROR: conformance LLM call failed for "
+                  f"{criterion['criterion'][:80]}: {e}", file=sys.stderr)
+            continue
+        verdict, reason = parse_verdict_response(response)
+        print(f"  Criterion verdict: {verdict} — {criterion['criterion'][:80]}",
+              file=sys.stderr)
+        results.append({
+            "criterion": criterion["criterion"],
+            "status": criterion["status"],
+            "verdict": verdict,
+            "reason": reason,
+        })
+
+    if not results:
+        print("Conformance re-check produced no verdicts; nothing to post.",
+              file=sys.stderr)
+        return False
+
+    body = build_conformance_recheck_body(sha, results)
+    if dry_run:
+        print(f"Would post conformance re-check:\n{body}", file=sys.stderr)
+        return False
+    try:
+        if platform == "github":
+            github_backend.github_request(
+                "POST", f"{gh_api}/repos/{gh_repo}/issues/{iid}/comments",
+                gh_token, data={"body": body}, fatal=False)
+        else:
+            gitlab_request(
+                "POST",
+                f"{api_url}/projects/{project_id}/merge_requests/{iid}/notes",
+                token, data={"body": body}, fatal=False)
+        print(f"Posted conformance re-check for {len(results)} criteria.",
+              file=sys.stderr)
+    except Exception as e:
+        print(f"ERROR: conformance re-check post failed: {e}", file=sys.stderr)
+        return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iid", required=True, help="MR internal ID")
@@ -390,7 +629,6 @@ def main():
 
     if not discussions:
         print("No open Forge discussions to verify.", file=sys.stderr)
-        return
 
     addressed = 0
     not_addressed = 0
@@ -484,12 +722,21 @@ def main():
         else:
             not_addressed += 1
 
-    print(f"Verification complete: {addressed} addressed, {not_addressed} still open", file=sys.stderr)
+    if discussions:
+        print(f"Verification complete: {addressed} addressed, {not_addressed} still open", file=sys.stderr)
     if reply_failed:
         print(f"ERROR: {reply_failed} discussion replies could not be posted", file=sys.stderr)
     if resolve_failed:
         print(f"ERROR: {resolve_failed} discussions could not be resolved", file=sys.stderr)
-    if reply_failed or resolve_failed:
+
+    conformance_post_failed = verify_conformance_recheck(
+        platform, api_url, project_id, args.iid, args.sha, diff,
+        gitlab_token, gh_api, gh_repo, gh_token,
+        api_key, model, args.dry_run,
+    )
+    if conformance_post_failed:
+        print("ERROR: conformance re-check could not be posted", file=sys.stderr)
+    if reply_failed or resolve_failed or conformance_post_failed:
         sys.exit(1)
 
 
