@@ -14,14 +14,22 @@ name: Forge Review
 #   jobs:
 #     forge-review:
 #       uses: shippopotamuslabs/forge-reviewer/.github/workflows/forge-review.yml@<tag>
-#       secrets: inherit
+#       with:
+#         forge_app_id: <your Forge app ID>   # default: 5455197
+#       secrets:
+#         OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+#         FORGE_APP_PRIVATE_KEY: ${{ secrets.FORGE_APP_PRIVATE_KEY }}
+#
+# Pass the two secrets explicitly, never `secrets: inherit` - inherit
+# hands this workflow every secret the caller repo holds.
 #
 # Required secrets in the CALLER repo:
 #   OPENROUTER_API_KEY:     Thermos lenses + master dedup + verify.
-#   FORGE_APP_PRIVATE_KEY:  Private key of the Shippopotamus Forge
-#                           GitHub App (ID 5455197). The review posts as
-#                           shippopotamus-forge[bot] via an installation
-#                           token minted in this workflow.
+#   FORGE_APP_PRIVATE_KEY:  Private key of the caller's Forge GitHub
+#                           App (input forge_app_id; the default is the
+#                           Shippopotamus Forge App, ID 5455197). The
+#                           review posts as that app's [bot] identity
+#                           via an installation token minted here.
 #
 # Behavior mirrors the GitLab template: producers are silent and
 # fail-soft (a failed producer never blocks the caller's pipeline),
