@@ -102,6 +102,60 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
         self.assertIn("LINEAR_API_KEY", text)
         self.assertIn("CHECK_PR_ADDITIONAL_CONTENT", text)
 
+    def test_job_level_concurrency_serializes_per_pr(self):
+        # FRG-11: the review job serializes runs per caller-repo PR so
+        # concurrent pushes cannot post duplicate consolidated reviews.
+        # Extract the job block so a stray copy elsewhere cannot pass.
+        text = _read(WORKFLOW)
+        m = re.search(r"(?m)^  review:\n(.*?)(?=^    steps:\n)", text,
+                      re.DOTALL)
+        self.assertIsNotNone(m, "jobs.review block must exist")
+        job_head = m.group(1)
+        conc = re.search(
+            r"(?m)^    concurrency:\n"
+            r"^      group: forge-review-\$\{\{ github\.repository \}\}"
+            r"-\$\{\{ github\.event\.pull_request\.number \}\}\n"
+            r"^      cancel-in-progress: false\n"
+            r"^      queue: max\n",
+            job_head,
+        )
+        self.assertIsNotNone(
+            conc, "jobs.review must carry the per-PR concurrency block")
+
+    def test_marker_recheck_step_order_and_routing(self):
+        # FRG-11: a marker re-check immediately before Master routes the
+        # queued run to verify; producers keep gating on the first check.
+        steps = _steps(_read(WORKFLOW))
+        names = [n for n, _ in steps]
+        self.assertEqual(names.count(
+            "Re-check for an existing consolidated review"), 1,
+            "expected exactly one marker re-check step")
+        idx_recheck = names.index(
+            "Re-check for an existing consolidated review")
+        self.assertEqual(
+            names[idx_recheck - 1], "Thermos structure lens",
+            "re-check must run after the Thermos structure lens")
+        self.assertTrue(
+            names[idx_recheck + 1].startswith("Master"),
+            "re-check must sit immediately before the Master step")
+        recheck_id = [b for n, b in steps
+                      if n == "Re-check for an existing consolidated review"][0]
+        self.assertIn("id: marker_recheck", recheck_id)
+        self.assertIn("forge:consolidated-review", recheck_id)
+        self.assertIn("GITHUB_OUTPUT", recheck_id)
+        self.assertIn('"exists=%s', recheck_id)
+        self.assertIn('"yes" if found else "no"', recheck_id)
+        self.assertNotIn("LINEAR_API_KEY", recheck_id)
+        master_body = [b for n, b in steps if n.startswith("Master")][0]
+        self.assertIn("steps.marker_recheck.outputs.exists", master_body)
+        self.assertNotIn("steps.marker.outputs.exists", master_body)
+        for n, b in steps:
+            if n.startswith(("PR-Agent producer", "Thermos correctness",
+                             "Thermos structure")):
+                self.assertIn("steps.marker.outputs.exists", b,
+                              "%s must still gate on the first marker check"
+                              % n)
+
 
 if __name__ == "__main__":
     unittest.main()

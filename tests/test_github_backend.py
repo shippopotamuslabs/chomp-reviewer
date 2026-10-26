@@ -303,14 +303,17 @@ class PostReviewGithubTest(unittest.TestCase):
 
         orig_issue = master.github_backend.post_issue_comment
         orig_attempt = master.github_backend.post_review_comment_attempt
+        orig_find = master.github_backend.find_marker_comment
         master.github_backend.post_issue_comment = fake_post_issue
         master.github_backend.post_review_comment_attempt = fake_attempt
+        master.github_backend.find_marker_comment = lambda *a, **k: None
         try:
             recorded, failed = master.post_review_github(
                 API, REPO, "7", "TOK", "abc123", "Summary.", findings, DIFF)
         finally:
             master.github_backend.post_issue_comment = orig_issue
             master.github_backend.post_review_comment_attempt = orig_attempt
+            master.github_backend.find_marker_comment = orig_find
 
         self.assertEqual(failed, [])
         self.assertIn(

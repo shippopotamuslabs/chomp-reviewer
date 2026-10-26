@@ -41,6 +41,11 @@ name: Forge Review
 # fail-soft (a failed producer never blocks the caller's pipeline),
 # master posts one consolidated review, and pushes after the first
 # review run verification instead (verdict replies + thread resolution).
+#
+# Since v1.1.5 the reusable workflow serializes runs per PR itself
+# (job concurrency below, plus a marker re-check before Master posts),
+# so callers on a current pin need no concurrency block of their own.
+# Older pins have the double-push race: upgrade both pins together.
 
 on:
   workflow_call:
@@ -74,6 +79,13 @@ jobs:
     name: forge-review
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # One run per caller-repo PR at a time: never cancel a review
+    # mid-post, and queue every push so each still gets its verify pass
+    # in FIFO order instead of the default single-pending replacement.
+    concurrency:
+      group: forge-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+      queue: max
     steps:
       - name: Check required secrets
         env:
@@ -236,6 +248,28 @@ jobs:
             echo "[]" > thermos-structure.json
           fi
 
+      # Re-check the marker right before Master: a queued run waited out
+      # an earlier run that may have posted since the first check.
+      - name: Re-check for an existing consolidated review
+        id: marker_recheck
+        working-directory: forge
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".forge")
+          import github_backend as gh
+          api, repo, token = gh.gh_env()
+          found = gh.find_marker_comment(
+              api, repo, os.environ["PR_NUMBER"], token,
+              "forge:consolidated-review")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("exists=%s\n" % ("yes" if found else "no"))
+          print("Existing consolidated review:", "yes" if found else "no")
+          PY
+
       - name: Master — post the consolidated review (verify on re-push)
         continue-on-error: true
         working-directory: forge
@@ -246,7 +280,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [ "${{ steps.marker.outputs.exists }}" = "yes" ]; then
+          if [ "${{ steps.marker_recheck.outputs.exists }}" = "yes" ]; then
             echo "Consolidated review already exists; running verification."
             python3 .forge/verify.py --iid "$PR_NUMBER" --sha "$HEAD_SHA" \
               --diff mr.diff
