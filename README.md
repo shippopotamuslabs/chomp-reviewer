@@ -4,6 +4,10 @@ Forge posts one code review per pull request. Three reviewers run first, each on
 
 Forge runs as a reusable GitHub Actions workflow inside a project's own repository. A project adds one small caller workflow, sets two secrets, and gets a review on every pull request. Reviews run once per pull request. Pushes after the first review get verification: Forge checks its open review threads against the new code and resolves the ones the push fixed.
 
+## Where Forge is headed
+
+Forge 2.0 is planned, ratified on 2026-10-26, and tracked as tickets in Linear. The full architectural proposal is checked in at [docs/forge-2.0-architectural-proposal.md](docs/forge-2.0-architectural-proposal.md). In short: the reviewer gets the full repository instead of only the diff. A Rust orchestration host built on the agent_core crate runs one agent session per review lens, each session reads the repository's own agent file first and pulls the code and contract documents it needs with read-only tools, and a final session verifies and synthesizes every producer's findings into the single consolidated review. PR-Agent stays in the lineup as an unmodified producer. Everything below this section describes the current released behavior (v1.x), and it stays accurate until the 2.0 work lands.
+
 ## How a review runs
 
 Five stages:
