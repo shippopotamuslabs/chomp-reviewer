@@ -56,6 +56,8 @@ GitHub accepts review comment positions only on lines inside the diff. Master pa
 
 The rollup and every inline comment carry a `forge:consolidated-review` marker. On later runs for the same pull request, `forge:master` checks the pull request comments for that marker. Finding it switches the job to `.forge/verify.py`.
 
+Since v1.1.5 the reusable workflow serializes runs per pull request itself: one job-level concurrency group per repo and PR (`forge-review-<repo>-<PR>`, never cancelled mid-post), so queued pushes each still get their verify pass in turn, and master re-checks the marker immediately before posting (on GitHub and GitLab) as a final guard against double-posting. Callers need no change beyond bumping both pins to the new tag together; pins before v1.1.5 can double-post on a rapid double-push.
+
 Verify collects the open Forge review threads, skipping the rollup comment and threads that already resolved. For each finding it builds the evidence fresh:
 
 - the current pull request diff, scoped to the files the finding cites

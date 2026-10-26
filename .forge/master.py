@@ -32,6 +32,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from openrouter_client import get_model, call_openrouter
 import github_backend
 
+CONSOLIDATED_MARKER = "forge:consolidated-review"
+
+
+class DuplicateReviewPost(Exception):
+    """A consolidated review already exists for this PR/MR.
+
+    Carries the existing comment/note id in existing_id.
+    """
+    def __init__(self, existing_id):
+        super().__init__("consolidated review already exists: %s"
+                         % (existing_id,))
+        self.existing_id = existing_id
+
 def detect_platform():
     """Select the review platform backend from the environment.
 
@@ -386,6 +399,22 @@ def load_ticket_details(ticket_path):
     return details
 
 
+def find_marker_note_gitlab(api_url, project_id, iid, token, marker):
+    """Return the first MR note containing marker, or None.
+
+    Same first-100-notes scope as the template's review-once check at
+    master time; a marker beyond the first page is not seen here.
+    """
+    notes = gitlab_request(
+        "GET",
+        f"{api_url}/projects/{project_id}/merge_requests/{iid}/notes?per_page=100",
+        token)
+    for note in notes or []:
+        if marker in (note.get("body") or ""):
+            return note
+    return None
+
+
 def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, diff,
                        tickets=None, conformance=None, ticket_details=None):
     """Post the consolidated review to GitLab: rollup note + inline
@@ -405,6 +434,10 @@ def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, 
     rollup_body = build_rollup(sha, summary, findings, project_path,
                                tickets=tickets, conformance=conformance,
                                ticket_details=ticket_details)
+    existing = find_marker_note_gitlab(
+        api_url, project_id, iid, token, CONSOLIDATED_MARKER)
+    if existing is not None:
+        raise DuplicateReviewPost(existing.get("id"))
     print("Posting rollup...", file=sys.stderr)
     note = gitlab_request(
         "POST",
@@ -428,6 +461,10 @@ def post_review_github(api_url, repo, number, token, sha, summary, findings, dif
                                blob_base=f"https://github.com/{repo}/blob",
                                tickets=tickets, conformance=conformance,
                                ticket_details=ticket_details)
+    existing = github_backend.find_marker_comment(
+        api_url, repo, number, token, CONSOLIDATED_MARKER)
+    if existing is not None:
+        raise DuplicateReviewPost(existing.get("id"))
     print("Posting rollup...", file=sys.stderr)
     comment = github_backend.post_issue_comment(api_url, repo, number, token, rollup_body)
     print(f"Rollup posted: comment {comment.get('id')}", file=sys.stderr)
@@ -689,6 +726,24 @@ def build_inline(sha, finding, meta=None):
 
 {build_agent_prompt(finding)}"""
 
+def write_recorded_json(iid, sha, platform, recorded, failed, tickets,
+                        conformance, duplicate_suppressed=False):
+    """Write forge-recorded.json for the verify job (write-only context)."""
+    payload = {
+        "iid": iid,
+        "sha": sha,
+        "platform": platform,
+        "discussions": recorded,
+        "failed": failed,
+        "tickets": tickets if tickets is not None else [],
+        "conformance": conformance,
+    }
+    if duplicate_suppressed:
+        payload["duplicate_suppressed"] = True
+    with open("forge-recorded.json", "w") as f:
+        json.dump(payload, f, indent=2)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iid", required=True, help="MR internal ID (GitHub: PR number)")
@@ -797,29 +852,33 @@ def main():
                 print("No linked ticket found.", file=sys.stderr)
         return
 
-    if platform == "github":
-        gh_api, gh_repo, gh_token = github_backend.gh_env()
-        recorded, failed = post_review_github(
-            gh_api, gh_repo, args.iid, gh_token, args.sha, summary, findings, diff,
-            tickets=ticket_keys, conformance=conformance,
-            ticket_details=ticket_details)
-    else:
-        recorded, failed = post_review_gitlab(
-            api_url, project_id, args.iid, gitlab_token, args.sha, summary, findings, diff,
-            tickets=ticket_keys, conformance=conformance,
-            ticket_details=ticket_details)
+    try:
+        if platform == "github":
+            gh_api, gh_repo, gh_token = github_backend.gh_env()
+            recorded, failed = post_review_github(
+                gh_api, gh_repo, args.iid, gh_token, args.sha, summary, findings, diff,
+                tickets=ticket_keys, conformance=conformance,
+                ticket_details=ticket_details)
+        else:
+            recorded, failed = post_review_gitlab(
+                api_url, project_id, args.iid, gitlab_token, args.sha, summary, findings, diff,
+                tickets=ticket_keys, conformance=conformance,
+                ticket_details=ticket_details)
+    except DuplicateReviewPost as e:
+        # No-op, not a verify invocation: a concurrent run posted first.
+        # Verify routing is the workflow re-check's job; just record the
+        # suppression and exit 0 so the queued run stays green.
+        print(f"Duplicate consolidated review suppressed (existing id "
+              f"{e.existing_id}); this run posted nothing, a later run "
+              f"will verify.", file=sys.stderr)
+        write_recorded_json(args.iid, args.sha, platform, [], [], ticket_keys,
+                            conformance, duplicate_suppressed=True)
+        print("Recorded 0 discussions to forge-recorded.json", file=sys.stderr)
+        return
 
     # Write recorded discussions for the verify job
-    with open("forge-recorded.json", "w") as f:
-        json.dump({
-            "iid": args.iid,
-            "sha": args.sha,
-            "platform": platform,
-            "discussions": recorded,
-            "failed": failed,
-            "tickets": ticket_keys if ticket_keys is not None else [],
-            "conformance": conformance,
-        }, f, indent=2)
+    write_recorded_json(args.iid, args.sha, platform, recorded, failed,
+                        ticket_keys, conformance)
     print(f"Recorded {len(recorded)} discussions to forge-recorded.json", file=sys.stderr)
     if failed:
         print(f"ERROR: {len(failed)} findings could not be posted inline: {failed}", file=sys.stderr)
