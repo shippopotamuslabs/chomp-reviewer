@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.1.5 (2026-10-25)
+
+- Fix: serialize Forge reviews per PR so concurrent runs cannot post duplicate consolidated reviews (FRG-11). The reusable workflow carries a per-PR job concurrency group (`forge-review-<repo>-<PR>`, `cancel-in-progress: false`, `queue: max`) so queued pushes each still get their verify pass in FIFO order, and a marker re-check immediately before Master routes a queued run to verify; `master.py` re-checks the marker immediately before posting on GitHub and GitLab alike (GitLab parity: the template already checked at master time, the new guard closes the remaining dedup window; template unchanged) and records the suppression as `duplicate_suppressed` in `forge-recorded.json` instead of posting. Adds `tests/test_master_duplicate_guard.py` and extends `tests/test_forge_review_workflow.py` and `tests/test_github_backend.py`.
+
 ## v1.1.4 (2026-10-25)
 
 - Fix: render finding descriptions and evidence as wrapped markdown instead of `<pre>` blocks (FRG-8). `build_rollup` drops the `<pre>` wrappers and prefixes every line of multi-line description/evidence with the blockquote marker so all paragraphs stay inside the details structure; `build_inline` emits the description as a normal markdown paragraph. The Agent Prompt triple-backtick fence is kept deliberately as a copy-paste artifact. Adds `tests/test_master_wrapped_markdown.py`.
