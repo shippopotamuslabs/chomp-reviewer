@@ -619,3 +619,31 @@ Key source locations behind Section 5, for reviewers who want to re-derive the a
 - **Contract channel:** the host's read path for the base-branch entry file, kept separate from the general repo tools.
 - **Decision log:** the per-finding disposition record emitted by synthesis (kept / merged / downgraded / dropped, with reason).
 - **Shadow mode:** running 2.0 producers and synthesis without posting, for comparison against the posted 1.x review.
+
+## Appendix C — As filed in Linear (2026-10-26)
+
+Parent epic: **FRG-12** (Forge Reviewer 2.0: repo-aware agentic review). All tickets Backlog on the Forge Reviewer team, parented to FRG-12, with blockedBy relations per Section 14.
+
+| Proposal ID | Linear | Short title |
+|---|---|---|
+| AC-1 | FRG-13 | agent_core: feature-gate UniFFI behind default-on `ffi` |
+| AC-2 | FRG-14 | agent_core: parameterize append_blocks / totalBlocks literals |
+| FG-1 | FRG-15 | Scaffold forge-agent crate (CLI, I/O contract, config) |
+| FG-2 | FRG-16 | OpenRouter AgentTransport |
+| FG-3 | FRG-17 | Snapshot and repo map |
+| FG-4 | FRG-18 | Read-only tool executor |
+| FG-5 | FRG-19 | Correctness lens session end to end |
+| FG-6 | FRG-20 | Contract resolution (base-branch entry file) |
+| FG-7 | FRG-21 | Structure lens session |
+| FG-8 | FRG-22 | Contract lens session |
+| FG-9 | FRG-23 | PR-Agent adapter (real PR URL) |
+| FG-10 | FRG-24 | Parallel fan-out orchestration |
+| FG-11 | FRG-25 | Deterministic pre-dedup clustering |
+| FG-12 | FRG-26 | Synthesizer session + decision log |
+| FG-13 | FRG-27 | run_pr_agent follow-up tool (cap 2) |
+| FG-14 | FRG-28 | Workflow integration + shadow mode |
+| FG-15 | FRG-29 | Proof suite + 1.x vs 2.0 evaluation |
+| FG-16 | FRG-30 | Stratum shadow runs + tuning report |
+| FG-17 | FRG-31 | Consumer rollout (Stratum → Bloviate → Enclave) |
+| FG-18 | FRG-32 | Adopter docs + v2.0 release |
+| FG-19 | FRG-33 | Remove retired Python producers |
