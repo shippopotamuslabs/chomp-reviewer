@@ -57,6 +57,25 @@ class ExtractFocusFilesTest(unittest.TestCase):
     def test_empty_when_nothing_cited(self):
         self.assertEqual(verify.extract_focus_files("No files here, just prose."), [])
 
+    def test_parses_single_directory_paths(self):
+        # FRG-48: the pattern used to require two directory components, so
+        # a citation like scripts/play-upload-internal.py[96-130] extracted
+        # nothing and the finding verified against a head-truncated diff.
+        body = (
+            "## Fix Focus Areas - scripts/play-upload-internal.py[96-130] ##\n"
+            "Code [scripts/play-upload-internal.py[L96-L134]](https://example.com/blob/x#L96-L134)"
+        )
+        self.assertEqual(
+            verify.extract_focus_files(body), ["scripts/play-upload-internal.py"])
+
+    def test_parses_one_slash_and_root_level_paths(self):
+        body = (
+            "Fix Focus Areas - app/build.gradle.kts[175-200] - README.md[1-5]"
+        )
+        self.assertEqual(
+            verify.extract_focus_files(body),
+            ["app/build.gradle.kts", "README.md"])
+
 
 class SplitDiffSectionsTest(unittest.TestCase):
     def test_splits_on_headers_keyed_by_new_path(self):
@@ -86,6 +105,23 @@ class SelectDiffForFindingTest(unittest.TestCase):
         self.assertIn("diff --git a/" + FORK, scoped)
         # Unrelated files stay out.
         self.assertNotIn("unrelated", scoped)
+        self.assertNotIn(VM, scoped)
+
+    def test_single_directory_cited_file_past_truncation_is_included(self):
+        # FRG-48 regression (Stratum PR #33): the upload-script finding
+        # cited scripts/play-upload-internal.py, extracted no focus files,
+        # and got the 8000-char head fallback, so its fix read as absent.
+        filler = _section(VM, "@@ -1 +1 @@\n" + " context line\n" * 600)
+        target = _section(
+            "scripts/play-upload-internal.py",
+            "@@ -60,10 +60,20 @@\n+def verify_internal_release(edits, version_code, notes):")
+        diff = "\n".join([filler, target])
+        self.assertGreater(len(diff), 8000)
+        self.assertNotIn("verify_internal_release", diff[:8000])
+        body = "Medium finding. Fix Focus Areas - scripts/play-upload-internal.py[96-130]"
+        scoped = verify.select_diff_for_finding(diff, body)
+        self.assertIn("verify_internal_release", scoped)
+        self.assertIn("diff --git a/scripts/play-upload-internal.py", scoped)
         self.assertNotIn(VM, scoped)
 
     def test_missing_cited_file_falls_back_to_head(self):

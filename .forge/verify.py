@@ -168,7 +168,7 @@ def post_discussion_reply(api_url, project_id, iid, disc_id, token, body):
     )
 
 
-FOCUS_FILES_RE = re.compile(r"([\w\-.]+/[\w\-.]+/\S+?\.\w+)\[L?\d+(?:-\d+)?\]")
+FOCUS_FILES_RE = re.compile(r"((?:[\w\-.]+/)*[\w\-.]+?\.\w+)\[L?\d+(?:-\d+)?\]")
 DIFF_BUDGET_CHARS = 30000
 
 
