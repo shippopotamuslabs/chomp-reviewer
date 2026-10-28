@@ -1,0 +1,19 @@
+[package]
+name = "chomp"
+version = "0.1.0"
+edition = "2021"
+description = "Chomp repo-aware agentic code review host"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "chomp"
+path = "src/main.rs"
+
+[dependencies]
+agent_core = { git = "https://github.com/shippopotamuslabs/agent_core", rev = "05eafa8f218410d8742ca8f3c2a3e88184deca5e", default-features = false }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+ureq = "3"
