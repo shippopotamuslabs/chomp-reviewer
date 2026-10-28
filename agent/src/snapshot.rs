@@ -22,7 +22,11 @@
 //!
 //! Failures are typed [`SnapshotError`]s — never panics, never silent
 //! skips. An unreadable entry mid-walk is an error, not an omission: a
-//! partial map presented as complete would mislead the lenses.
+//! partial map presented as complete would mislead the lenses. The one
+//! deliberate exception is a dangling symlink: the link itself is tree
+//! content, so it is recorded at its own link size instead of aborting
+//! the capture over a target that may legitimately live outside the
+//! checkout.
 
 use std::fmt;
 use std::fs;
@@ -238,7 +242,8 @@ fn head_sha(root: &Path) -> Result<String, SnapshotError> {
 /// surviving entries are the first `limit` in sorted order and
 /// `total_files` stays exact. Pruned directories are never descended
 /// and lockfiles are never counted; symlinked directories are not
-/// followed (a symlinked *file* is content, sized by its target).
+/// followed (a symlinked *file* is content, sized by its target; a
+/// dangling symlink is recorded at its own link size).
 fn build_repo_map(root: &Path, head_sha: &str, limit: usize) -> Result<RepoMap, SnapshotError> {
     let mut collected: Vec<RepoEntry> = Vec::new();
     let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
@@ -263,14 +268,37 @@ fn build_repo_map(root: &Path, head_sha: &str, limit: usize) -> Result<RepoMap, 
                 // Followed once, here, for classification only: a
                 // symlinked directory is not descended (and is not a
                 // file); a symlinked file is content sized by target.
-                let metadata = fs::metadata(&path).map_err(|error| io_error(&path, error))?;
-                if metadata.is_dir() || LOCKFILES.contains(&name.as_str()) {
-                    continue;
+                match fs::metadata(&path) {
+                    Ok(metadata) => {
+                        if metadata.is_dir() || LOCKFILES.contains(&name.as_str()) {
+                            continue;
+                        }
+                        collected.push(RepoEntry {
+                            path: rel_path,
+                            size: metadata.len(),
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // Dangling symlink: the target does not exist,
+                        // but the link itself is in the tree — record
+                        // the entry at the link's own size rather than
+                        // aborting the whole capture. The target may
+                        // legitimately live outside the checkout.
+                        if LOCKFILES.contains(&name.as_str()) {
+                            continue;
+                        }
+                        let metadata =
+                            fs::symlink_metadata(&path).map_err(|error| io_error(&path, error))?;
+                        collected.push(RepoEntry {
+                            path: rel_path,
+                            size: metadata.len(),
+                        });
+                    }
+                    // Anything else (permission denied, a link loop,
+                    // ...) is genuinely unreadable: a typed error, not
+                    // a silent omission.
+                    Err(error) => return Err(io_error(&path, error)),
                 }
-                collected.push(RepoEntry {
-                    path: rel_path,
-                    size: metadata.len(),
-                });
             } else if file_type.is_dir() {
                 if PRUNED_DIRS.contains(&name.as_str()) {
                     continue;
@@ -370,7 +398,7 @@ fn parse_changed_files(text: &str) -> Result<Vec<ChangedFile>, SnapshotError> {
             }
             in_hunks = false;
             let (a_path, b_path) =
-                parse_diff_git_paths(rest).ok_or_else(|| SnapshotError::DiffParse {
+                parse_diff_git_paths(rest)?.ok_or_else(|| SnapshotError::DiffParse {
                     message: format!("cannot parse paths from diff header: {line}"),
                 })?;
             pending = Some(Pending {
@@ -397,9 +425,9 @@ fn parse_changed_files(text: &str) -> Result<Vec<ChangedFile>, SnapshotError> {
         } else if line == "+++ /dev/null" {
             section.deleted = true;
         } else if let Some(from) = line.strip_prefix("rename from ") {
-            section.rename_from = Some(unquote_path(from.trim()));
+            section.rename_from = Some(unquote_path(from.trim())?);
         } else if let Some(to) = line.strip_prefix("rename to ") {
-            section.rename_to = Some(unquote_path(to.trim()));
+            section.rename_to = Some(unquote_path(to.trim())?);
         }
     }
     if let Some(section) = pending.take() {
@@ -412,73 +440,116 @@ fn parse_changed_files(text: &str) -> Result<Vec<ChangedFile>, SnapshotError> {
 /// a `diff --git` line after the prefix, stripping the `a/` / `b/`
 /// markers. Handles git's C-style quoting on either side (used for
 /// paths with spaces or special characters).
-fn parse_diff_git_paths(rest: &str) -> Option<(String, String)> {
-    let (a_raw, b_raw) = split_diff_git_paths(rest)?;
+fn parse_diff_git_paths(rest: &str) -> Result<Option<(String, String)>, SnapshotError> {
+    let Some((a_raw, b_raw)) = split_diff_git_paths(rest)? else {
+        return Ok(None);
+    };
     let a = a_raw.strip_prefix("a/").unwrap_or(&a_raw);
     let b = b_raw.strip_prefix("b/").unwrap_or(&b_raw);
     if a.is_empty() || b.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some((a.to_string(), b.to_string()))
+    Ok(Some((a.to_string(), b.to_string())))
 }
 
 /// Split `a/<path> b/<path>` (either side possibly quoted) into its two
 /// raw sides. The unquoted split is the first ` b/` — sound unless a
 /// path itself contains ` b/`, which git's own tooling also assumes
-/// away.
-fn split_diff_git_paths(rest: &str) -> Option<(String, String)> {
+/// away. `Ok(None)` means the shape is not a path pair at all; a quoted
+/// side that fails to decode is a typed error, not a non-match.
+fn split_diff_git_paths(rest: &str) -> Result<Option<(String, String)>, SnapshotError> {
     if rest.starts_with('"') {
         let (a, after) = take_quoted(rest)?;
-        let after = after.strip_prefix(' ')?;
+        let Some(after) = after.strip_prefix(' ') else {
+            return Ok(None);
+        };
         let b = if after.starts_with('"') {
             take_quoted(after)?.0
         } else {
             after.to_string()
         };
-        Some((a, b))
+        Ok(Some((a, b)))
     } else if let Some(index) = rest.find(" \"b/") {
         let b = take_quoted(&rest[index + 1..])?.0;
-        Some((rest[..index].to_string(), b))
+        Ok(Some((rest[..index].to_string(), b)))
     } else {
-        let index = rest.find(" b/")?;
-        Some((rest[..index].to_string(), rest[index + 1..].to_string()))
+        let Some(index) = rest.find(" b/") else {
+            return Ok(None);
+        };
+        Ok(Some((
+            rest[..index].to_string(),
+            rest[index + 1..].to_string(),
+        )))
     }
 }
 
 /// Unquote a possibly C-style-quoted path (the `rename from` / `rename
-/// to` form); unquoted paths pass through unchanged.
-fn unquote_path(raw: &str) -> String {
+/// to` form); unquoted paths pass through unchanged. A quoted path
+/// that cannot be decoded is a typed error — falling back to the raw
+/// quoted text would record a path that does not exist in the tree.
+fn unquote_path(raw: &str) -> Result<String, SnapshotError> {
     if raw.starts_with('"') {
-        take_quoted(raw)
-            .map(|(content, _)| content)
-            .unwrap_or_else(|| raw.to_string())
+        Ok(take_quoted(raw)?.0)
     } else {
-        raw.to_string()
+        Ok(raw.to_string())
     }
 }
 
 /// Take a C-style quoted string at the start of `s` (`s` begins with
 /// `"`); returns the unquoted contents and the remainder after the
-/// closing quote. A backslash escape collapses to the escaped byte —
-/// exact for `\"` and `\\`, the cases that matter for path splitting;
-/// git's octal escapes for non-ASCII bytes are not decoded. Non-ASCII
-/// UTF-8 sequences pass through byte-for-byte (their bytes never equal
-/// `"` or `\`).
-fn take_quoted(s: &str) -> Option<(String, &str)> {
+/// closing quote.
+///
+/// Git quotes paths whose bytes fall outside the safe ASCII set
+/// (default `core.quotepath`), escaping the offending bytes as `\NNN`
+/// octal — café.md arrives as `"a/caf\303\251.md"`. Decoding is real,
+/// not cosmetic: a `\NNN` escape (exactly three octal digits forming a
+/// byte, so the first digit is 0–3) yields that byte; `\t` and `\n`
+/// yield their control characters; any other `\<char>` collapses to
+/// that char, covering `\"` and `\\`. The decoded bytes are then read
+/// as UTF-8, because paths in this module are `String`s: an invalid
+/// sequence is a [`SnapshotError::DiffParse`], never a lossy
+/// replacement that would record a path the tree does not contain.
+fn take_quoted(s: &str) -> Result<(String, &str), SnapshotError> {
     let bytes = s.as_bytes();
     if bytes.first() != Some(&b'"') {
-        return None;
+        return Err(SnapshotError::DiffParse {
+            message: format!("expected a quoted path: {s}"),
+        });
     }
     let mut out: Vec<u8> = Vec::new();
     let mut index = 1;
     while index < bytes.len() {
         match bytes[index] {
             b'\\' => {
-                out.push(*bytes.get(index + 1)?);
-                index += 2;
+                let rest = &bytes[index + 1..];
+                if rest.len() >= 3
+                    && (b'0'..=b'3').contains(&rest[0])
+                    && (b'0'..=b'7').contains(&rest[1])
+                    && (b'0'..=b'7').contains(&rest[2])
+                {
+                    let value = rest[..3]
+                        .iter()
+                        .fold(0u16, |acc, digit| acc * 8 + u16::from(digit - b'0'));
+                    out.push(value as u8);
+                    index += 4;
+                } else if let Some(&escaped) = rest.first() {
+                    out.push(match escaped {
+                        b't' => b'\t',
+                        b'n' => b'\n',
+                        other => other,
+                    });
+                    index += 2;
+                } else {
+                    return Err(SnapshotError::DiffParse {
+                        message: format!("quoted path ends in a lone backslash: {s}"),
+                    });
+                }
             }
             b'"' => {
-                return Some((String::from_utf8_lossy(&out).into_owned(), &s[index + 1..]));
+                let content = String::from_utf8(out).map_err(|error| SnapshotError::DiffParse {
+                    message: format!("quoted path is not valid UTF-8: {error}"),
+                })?;
+                return Ok((content, &s[index + 1..]));
             }
             byte => {
                 out.push(byte);
@@ -486,7 +557,9 @@ fn take_quoted(s: &str) -> Option<(String, &str)> {
             }
         }
     }
-    None
+    Err(SnapshotError::DiffParse {
+        message: format!("unterminated quoted path: {s}"),
+    })
 }
 
 #[cfg(test)]
@@ -589,6 +662,25 @@ mod tests {
         fs::remove_dir_all(&root).expect("clean temp dir");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlinks_are_recorded_at_link_size() {
+        use std::os::unix::fs::symlink;
+        let root = temp_dir("dangling");
+        write_file(&root, "real.txt", "data");
+        // The target does not exist — the link dangles. Capture must
+        // not abort: the entry is recorded at its own link size (the
+        // length of the target path text).
+        symlink("missing-target.txt", root.join("dangling.txt")).expect("dangle link");
+
+        let map = build_repo_map(&root, "sha", MAX_REPO_MAP_ENTRIES).expect("build map");
+        assert_eq!(paths(&map), vec!["dangling.txt", "real.txt"]);
+        assert_eq!(map.entries[0].size, "missing-target.txt".len() as u64);
+        assert_eq!(map.entries[1].size, 4);
+        assert_eq!(map.total_files, 2);
+        fs::remove_dir_all(&root).expect("clean temp dir");
+    }
+
     // -- diff parsing -------------------------------------------------------
 
     const DIFF_FIXTURE: &str = "\
@@ -596,9 +688,11 @@ diff --git a/src/main.rs b/src/main.rs
 index 1111111..2222222 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -1 +1 @@
+@@ -1,3 +1,3 @@
 -old
+--- /dev/null
 +new
+++new file mode 100644
 diff --git a/src/new.rs b/src/new.rs
 new file mode 100644
 index 0000000..3333333
@@ -624,6 +718,11 @@ Binary files a/assets/logo.png and b/assets/logo.png differ
 
     #[test]
     fn diff_fixture_parses_to_the_exact_changed_list() {
+        // The first section's hunk deliberately contains content lines
+        // that mimic header markers (a removed `-- /dev/null`, an
+        // added `+new file mode 100644`): src/main.rs must still
+        // classify as Modified, proving markers are read only from the
+        // header block before the first `@@`.
         let changed = parse_changed_files(DIFF_FIXTURE).expect("parse diff");
         assert_eq!(
             changed,
@@ -657,14 +756,95 @@ Binary files a/assets/logo.png and b/assets/logo.png differ
     #[test]
     fn diff_paths_handle_renames_and_quoting() {
         assert_eq!(
-            parse_diff_git_paths("a/src/x.rs b/src/y.rs"),
+            parse_diff_git_paths("a/src/x.rs b/src/y.rs").expect("parse paths"),
             Some(("src/x.rs".to_string(), "src/y.rs".to_string()))
         );
         assert_eq!(
-            parse_diff_git_paths("\"a/my file.rs\" \"b/my file.rs\""),
+            parse_diff_git_paths("\"a/my file.rs\" \"b/my file.rs\"").expect("parse paths"),
             Some(("my file.rs".to_string(), "my file.rs".to_string()))
         );
-        assert_eq!(parse_diff_git_paths("a/only.rs"), None);
+        assert_eq!(
+            parse_diff_git_paths("a/only.rs").expect("parse paths"),
+            None
+        );
+    }
+
+    #[test]
+    fn quoted_escapes_decode_to_their_characters() {
+        assert_eq!(
+            unquote_path("\"tab\\there\"").expect("unquote"),
+            "tab\there"
+        );
+        assert_eq!(unquote_path("\"nl\\nhere\"").expect("unquote"), "nl\nhere");
+        assert_eq!(unquote_path("\"q\\\"here\"").expect("unquote"), "q\"here");
+        assert_eq!(unquote_path("\"bs\\\\here\"").expect("unquote"), "bs\\here");
+        // An unlisted escape collapses to the escaped char itself.
+        assert_eq!(unquote_path("\"a\\qb\"").expect("unquote"), "aqb");
+        // Unquoted paths pass through untouched.
+        assert_eq!(unquote_path("plain.rs").expect("unquote"), "plain.rs");
+    }
+
+    #[test]
+    fn octal_quoted_non_ascii_paths_decode_to_utf8() {
+        // What git emits for café.md under default core.quotepath:
+        // the é (U+00E9, UTF-8 0xC3 0xA9) arrives as \303\251 — on the
+        // diff --git side here, and on the rename from/to side below.
+        let diff = "\
+diff --git \"a/caf\\303\\251.md\" \"b/caf\\303\\251.md\"
+index 1111111..2222222 100644
+--- \"a/caf\\303\\251.md\"
++++ \"b/caf\\303\\251.md\"
+@@ -1 +1 @@
+-old
++new
+diff --git \"a/old caf\\303\\251.md\" \"b/new caf\\303\\251.md\"
+similarity index 90%
+rename from \"old caf\\303\\251.md\"
+rename to \"new caf\\303\\251.md\"
+";
+        let changed = parse_changed_files(diff).expect("parse diff");
+        assert_eq!(
+            changed,
+            vec![
+                ChangedFile {
+                    path: "café.md".to_string(),
+                    change: ChangeKind::Modified,
+                },
+                ChangedFile {
+                    path: "new café.md".to_string(),
+                    change: ChangeKind::Renamed {
+                        from: "old café.md".to_string(),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn quoted_path_with_invalid_utf8_is_a_typed_error() {
+        // \377 is byte 0xFF, never valid UTF-8: on the diff --git
+        // side...
+        let diff = "\
+diff --git \"a/bad\\377.md\" \"b/bad\\377.md\"
+index 1111111..2222222 100644
+";
+        let error = parse_changed_files(diff).expect_err("must fail");
+        assert!(
+            matches!(error, SnapshotError::DiffParse { .. }),
+            "{error:?}"
+        );
+        // ...and on a rename from side.
+        let diff = "\
+diff --git a/x.md b/x.md
+similarity index 90%
+rename from \"bad\\377.md\"
+rename to x.md
+";
+        let error = parse_changed_files(diff).expect_err("must fail");
+        assert!(
+            matches!(error, SnapshotError::DiffParse { .. }),
+            "{error:?}"
+        );
     }
 
     #[test]
