@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.1.6 (2026-10-27)
+
+- Fix: verification focus-file extraction now matches cited paths with fewer than two directory components (FRG-48). The pattern behind `extract_focus_files` required `dir/dir/file`, so a finding citing `scripts/play-upload-internal.py` or `app/build.gradle.kts` extracted no focus files at all; its evidence silently degraded to the 8000-char head-truncated whole-PR diff — the cited file's hunks past the cut — and the final-state ground-truth fetch never ran, yielding a false NOT_ADDRESSED verdict for a fix that was present (observed on Stratum PR #33, where the sibling `.github/workflows/ci.yml` finding on the very same commit verified ADDRESSED). The pattern now accepts any number of leading directory segments, including none. Adds regression tests to `tests/test_verify_diff_scoping.py` covering single-directory, one-slash, and root-level citations plus a shallow-file scoping case.
+
 ## v1.1.5 (2026-10-25)
 
 - Fix: serialize Forge reviews per PR so concurrent runs cannot post duplicate consolidated reviews (FRG-11). The reusable workflow carries a per-PR job concurrency group (`forge-review-<repo>-<PR>`, `cancel-in-progress: false`, `queue: max`) so queued pushes each still get their verify pass in FIFO order, and a marker re-check immediately before Master routes a queued run to verify; `master.py` re-checks the marker immediately before posting on GitHub and GitLab alike (GitLab parity: the template already checked at master time, the new guard closes the remaining dedup window; template unchanged) and records the suppression as `duplicate_suppressed` in `forge-recorded.json` instead of posting. Adds `tests/test_master_duplicate_guard.py` and extends `tests/test_forge_review_workflow.py` and `tests/test_github_backend.py`.
