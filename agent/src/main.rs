@@ -12,7 +12,6 @@ mod sessions;
 mod snapshot;
 mod synthesis;
 mod tools;
-mod transport;
 
 use std::env;
 use std::ffi::OsString;
