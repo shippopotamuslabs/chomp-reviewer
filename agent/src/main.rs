@@ -39,7 +39,7 @@ struct ReviewArgs {
 #[derive(Debug, PartialEq, Eq)]
 enum CliRequest {
     Help,
-    Review(ReviewArgs),
+    Review(Box<ReviewArgs>),
 }
 
 fn usage() -> &'static str {
@@ -170,7 +170,7 @@ where
     let out_decisions = values.next().expect("required argument count checked");
     let out_pr_agent = values.next().expect("required argument count checked");
 
-    Ok(CliRequest::Review(ReviewArgs {
+    Ok(CliRequest::Review(Box::new(ReviewArgs {
         repo: PathBuf::from(repo),
         diff: PathBuf::from(diff),
         base_ref: base_ref.to_string_lossy().into_owned(),
@@ -180,7 +180,7 @@ where
         out_findings: PathBuf::from(out_findings),
         out_decisions: PathBuf::from(out_decisions),
         out_pr_agent: PathBuf::from(out_pr_agent),
-    }))
+    })))
 }
 
 fn ensure_readable_file(path: &Path, label: &str) -> Result<(), String> {
