@@ -18,18 +18,21 @@ Interface-layer names stay until FRG-52's deferred layer: repo name, the
 2. **agent_core dependency**: public repo; pin by git rev to main 05eafa8
    (FRG-51 merge) with `default-features = false`. Acceptance check is real:
    `cargo tree` must show no uniffi crates.
-3. **TOML parsing**: §8.1's dependency list (serde, serde_json, ureq, regex)
-   has no TOML parser and additions need ticket-level justification. The
-   [forge] surface is two keys. Decision: a strict, section-scoped,
-   hand-rolled parser for exactly that table (quoted string; array of quoted
-   strings; comments; unknown keys in [forge] are an error so adopter typos
-   fail loud; other tables skipped line-wise). Pinned by fixture tests.
-   If Sean prefers the `toml` crate, that is a one-line plan change.
+3. **TOML parsing — DECIDED 2026-10-28 (Sean)**: use the `toml` crate.
+   Sean's standing rule, stated this session: the tickets are our own working
+   notes, not immutable law — do what is best. Justification on the merits:
+   the §11 config surface is specified to grow (numbers, booleans, nested
+   per-lens tables in FRG-20/FRG-30), so a hand-rolled parser would accrete
+   into a worse copy of the crate; `toml` is spec-complete, serde-driven,
+   and maintained in the Cargo ecosystem. Deps are therefore: agent_core,
+   serde (derive), serde_json, toml, ureq, regex. Config errors from the
+   parser surface as exit 2 with the parser's span message.
 
 ## Build chunks
 
 - **C1 crate skeleton**: agent/Cargo.toml (package chomp, bin chomp; deps
-  agent_core git-pinned no-default-features, serde, serde_json, ureq, regex),
+  agent_core git-pinned no-default-features, serde+derive, serde_json,
+  toml, ureq, regex),
   src/ modules per §8.1 (main, host, transport, tools, snapshot, contract,
   sessions, pr_agent, synthesis, outputs) — non-owned modules are doc-comment
   skeletons naming their landing ticket; prompts/ populated: correctness.md
