@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -55,6 +55,16 @@ impl Fixture {
             "--out-pr-agent".to_string(),
             self.pr_agent.display().to_string(),
         ]
+    }
+
+    fn run_with_diff_path(&self, diff: &Path) -> Output {
+        let mut args = self.review_args();
+        let position = args
+            .iter()
+            .position(|arg| arg == "--diff")
+            .expect("diff flag present");
+        args[position + 1] = diff.display().to_string();
+        run(&args)
     }
 }
 
@@ -122,6 +132,18 @@ fn fixture_review_exits_zero_and_writes_all_outputs() {
         fs::read(&fixture.pr_agent).expect("pr-agent guide written"),
         Vec::<u8>::new()
     );
+}
+
+#[test]
+fn directory_as_diff_exits_two_and_writes_no_outputs() {
+    let fixture = Fixture::new("directory-diff");
+    // The diff path points at the repo directory itself: a directory is
+    // openable on Linux but is not a readable diff file.
+    let output = fixture.run_with_diff_path(&fixture.repo);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!fixture.findings.exists());
+    assert!(!fixture.decisions.exists());
+    assert!(!fixture.pr_agent.exists());
 }
 
 #[test]

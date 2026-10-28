@@ -184,6 +184,12 @@ where
 }
 
 fn ensure_readable_file(path: &Path, label: &str) -> Result<(), String> {
+    // File::open succeeds on directories under Linux; require a regular file.
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("cannot read {label} {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{label} {} is not a file", path.display()));
+    }
     File::open(path)
         .map(|_| ())
         .map_err(|error| format!("cannot read {label} {}: {error}", path.display()))
