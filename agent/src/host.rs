@@ -8,4 +8,6 @@
 //!
 //! This module is a scaffold only. The pull-loop driver lands incrementally
 //! with the transport (FRG-16), tool executor (FRG-18), and lens sessions
-//! (FRG-19).
+//! (FRG-19). For model calls the driver depends on the application port
+//! ([`crate::model_transport::ModelTransport`]), never on a concrete
+//! transport implementation.

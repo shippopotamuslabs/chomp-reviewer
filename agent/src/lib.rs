@@ -6,4 +6,5 @@
 //! FRG-16 transport loop tests). The FRG-19 host driver will consume it
 //! from the binary through this surface.
 
+pub mod model_transport;
 pub mod transport;

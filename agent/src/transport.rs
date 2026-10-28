@@ -4,7 +4,7 @@
 //! `AgentAction::CallModel(ModelRequest)` and answers with either
 //! `Engine::submit_model_response` or `Engine::submit_model_turn_failure`.
 //! This module is the host component between those two calls:
-//! [`OpenRouterTransport::complete_model_turn`] renders a `ModelRequest`
+//! [`ModelTransport::complete_model_turn`] renders a `ModelRequest`
 //! into an OpenRouter (OpenAI-shaped) chat-completions body, performs the
 //! HTTP round-trip, and maps the response back into a `ModelResponse`.
 //! Failures are typed [`TransportError`]s — never panics, never silent
@@ -15,16 +15,20 @@
 //! Rendering and response mapping are pure functions
 //! ([`render_request_body`], [`map_response`]) so they are unit-tested
 //! without any HTTP.
+//!
+//! This module is the infrastructure adapter behind the application
+//! port: it implements [`crate::model_transport::ModelTransport`], which
+//! is the only surface the host driver (FRG-19) will depend on.
 
 use std::env;
-use std::fmt;
 use std::time::Duration;
 
 use agent_core::message::{AgentMessage, AgentRole};
-use agent_core::model_api_retry::{ModelApiErrorClass, ModelTurnFailureReport};
 use agent_core::tool_schema::SchemaEntry;
 use agent_core::turn_io::{FinishReason, ModelRequest, ModelResponse, RawToolCall};
 use serde_json::{json, Map, Value};
+
+use crate::model_transport::{ModelTransport, TransportError};
 
 /// Model used when `FORGE_MODEL` is unset (the 1.x convention from
 /// `.forge/openrouter_client.py`, with the `openrouter/` prefix stripped).
@@ -45,90 +49,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// OpenRouter attribution headers.
 const HTTP_REFERER: &str = "https://github.com/shippopotamuslabs/forge-reviewer";
 const X_TITLE: &str = "Chomp";
-
-/// Typed transport failures. Every malformed-input and provider-failure
-/// path lands in one of these variants.
-#[derive(Debug)]
-pub enum TransportError {
-    /// `OPENROUTER_API_KEY` was not set (or was blank) in `from_env`.
-    MissingApiKey,
-    /// The rendered request body could not be serialized for the wire.
-    Render(String),
-    /// The provider answered with a non-2xx status; the body is kept for
-    /// the failure-report message.
-    Http {
-        status: u16,
-        body: String,
-        retry_after_ms: Option<u64>,
-    },
-    /// The HTTP round-trip itself failed (DNS, connect, read, ...).
-    Network(String),
-    /// A 2xx response whose body could not be mapped onto a
-    /// `ModelResponse` (not JSON, no choices, an `error` object, ...).
-    MalformedResponse(String),
-}
-
-impl fmt::Display for TransportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TransportError::MissingApiKey => {
-                write!(f, "OPENROUTER_API_KEY is not set")
-            }
-            TransportError::Render(detail) => {
-                write!(f, "cannot render model request: {detail}")
-            }
-            TransportError::Http { status, body, .. } => {
-                write!(f, "OpenRouter returned HTTP {status}: {body}")
-            }
-            TransportError::Network(detail) => {
-                write!(f, "OpenRouter request failed: {detail}")
-            }
-            TransportError::MalformedResponse(detail) => {
-                write!(f, "malformed OpenRouter response: {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TransportError {}
-
-impl TransportError {
-    /// Map onto the engine's failure report. Transient (the engine may
-    /// retry the turn): 429, 5xx, network failures, and malformed
-    /// responses. Permanent: other 4xx statuses, a missing API key, and
-    /// unrenderable requests — retrying those cannot help.
-    pub fn to_failure_report(&self) -> ModelTurnFailureReport {
-        let (error_class, http_status, retry_after_ms) = match self {
-            TransportError::Http {
-                status,
-                retry_after_ms,
-                ..
-            } => {
-                let class = if *status == 429 || *status >= 500 {
-                    ModelApiErrorClass::Transient
-                } else {
-                    ModelApiErrorClass::Permanent
-                };
-                (class, Some(*status), *retry_after_ms)
-            }
-            TransportError::Network(_) | TransportError::MalformedResponse(_) => {
-                (ModelApiErrorClass::Transient, None, None)
-            }
-            TransportError::MissingApiKey | TransportError::Render(_) => {
-                (ModelApiErrorClass::Permanent, None, None)
-            }
-        };
-        ModelTurnFailureReport {
-            error_class,
-            http_status,
-            provider_code: http_status.map(|status| status.to_string()),
-            message: self.to_string(),
-            had_partial_output: false,
-            partial_output_chars: 0,
-            retry_after_ms,
-        }
-    }
-}
 
 /// The OpenRouter transport: one configured client, one job.
 pub struct OpenRouterTransport {
@@ -185,10 +105,7 @@ impl OpenRouterTransport {
     }
 
     /// Service one `CallModel` request: render, POST, map.
-    pub fn complete_model_turn(
-        &self,
-        request: &ModelRequest,
-    ) -> Result<ModelResponse, TransportError> {
+    fn complete_turn(&self, request: &ModelRequest) -> Result<ModelResponse, TransportError> {
         let body = render_request_body(request, &self.model)?;
         // Serialized by hand: ureq's `json` feature (send_json) is not
         // enabled in this crate, and serde_json is already a dependency.
@@ -241,6 +158,12 @@ impl OpenRouterTransport {
             TransportError::MalformedResponse(format!("body is not valid JSON: {error}"))
         })?;
         map_response(&value)
+    }
+}
+
+impl ModelTransport for OpenRouterTransport {
+    fn complete_model_turn(&self, request: &ModelRequest) -> Result<ModelResponse, TransportError> {
+        self.complete_turn(request)
     }
 }
 
@@ -519,6 +442,7 @@ pub fn map_response(value: &Value) -> Result<ModelResponse, TransportError> {
 mod tests {
     use super::*;
     use agent_core::message::MessageMeta;
+    use agent_core::model_api_retry::ModelApiErrorClass;
 
     fn message(id: &str, role: AgentRole, content: &str) -> AgentMessage {
         AgentMessage {

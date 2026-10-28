@@ -1,5 +1,5 @@
 //! FRG-16 end-to-end: a real `agent_core` engine + session driven
-//! through the real `OpenRouterTransport` against a stub HTTP server.
+//! through the `ModelTransport` port, backed by the real `OpenRouterTransport`, against a stub HTTP server.
 //!
 //! Modeled on agent_core's `examples/mock_desktop_loop.rs`: the test
 //! plays the host pull loop — `CallModel` goes through the transport,
@@ -23,6 +23,7 @@ use agent_core::session::{AgentConfig, SessionCapabilities};
 use agent_core::tool_call_format::ToolCallFormat;
 use agent_core::tool_name::ToolName;
 use agent_core::tool_semantics::{ToolCatalogConfig, ToolSemanticsConfig};
+use chomp::model_transport::ModelTransport;
 use chomp::transport::OpenRouterTransport;
 use serde_json::Value;
 
@@ -242,7 +243,7 @@ enum LoopOutcome {
 fn drive(
     engine: &AgentEngine,
     handle: &SessionHandle,
-    transport: &OpenRouterTransport,
+    transport: &dyn ModelTransport,
 ) -> LoopOutcome {
     for _ in 0..32 {
         match engine.next_action(handle) {
