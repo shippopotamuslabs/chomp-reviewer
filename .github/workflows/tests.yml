@@ -1,0 +1,53 @@
+name: Tests
+
+# The repo's own suites, run on every pull request (FRG-4): the Python
+# unittest suite for .forge/ and the checks for the agent/ Rust crate.
+# Both jobs are required status checks on main.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    name: python-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the PR head
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Run the Python test suite
+        run: python3 -m unittest discover -s tests -v
+
+  rust-tests:
+    name: rust-tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - name: Check out the PR head
+        uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run the Rust test suite
+        run: cargo test --locked
+      - name: Build the release binary
+        run: cargo build --release --locked
+      - name: Verify no UniFFI crates in the dependency tree
+        run: |
+          if cargo tree | grep -i uniffi; then
+            echo "::error::UniFFI crates present in the agent dependency tree"
+            exit 1
+          fi
+          echo "Dependency tree is UniFFI-free"
