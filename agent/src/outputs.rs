@@ -31,9 +31,8 @@ pub fn write_outputs(
         version: 1,
         entries: Vec::new(),
     };
-    let mut decisions = serde_json::to_string_pretty(&decision_log).map_err(|error| {
-        format!("failed to serialize Chomp decision log: {error}")
-    })?;
+    let mut decisions = serde_json::to_string_pretty(&decision_log)
+        .map_err(|error| format!("failed to serialize Chomp decision log: {error}"))?;
     decisions.push('\n');
     write_file(decisions_path, decisions.as_bytes(), "decision log")?;
     write_file(pr_agent_path, b"", "PR-Agent guide")
@@ -42,4 +41,42 @@ pub fn write_outputs(
 fn write_file(path: &Path, contents: &[u8], label: &str) -> Result<(), String> {
     fs::write(path, contents)
         .map_err(|error| format!("failed to write {label} {}: {error}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn writes_the_scaffold_output_shapes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("chomp-outputs-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let findings = dir.join("findings.json");
+        let decisions = dir.join("decisions.json");
+        let pr_agent = dir.join("pr-agent.md");
+
+        write_outputs(&findings, &decisions, &pr_agent).expect("write outputs");
+
+        assert_eq!(
+            fs::read_to_string(&findings).expect("read findings"),
+            "[]\n"
+        );
+        let decisions: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&decisions).expect("read decisions"))
+                .expect("decisions are JSON");
+        assert_eq!(decisions["version"], 1);
+        assert_eq!(decisions["entries"], serde_json::json!([]));
+        assert_eq!(
+            fs::read(&pr_agent).expect("read pr-agent guide"),
+            Vec::<u8>::new()
+        );
+        fs::remove_dir_all(dir).expect("clean temp dir");
+    }
 }

@@ -221,11 +221,7 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
     // producer stages consume it yet; later stages inherit this exact flow.
     let _config = contract::load_config(args.config.as_deref(), &args.repo)?;
     validate_inputs(args)?;
-    outputs::write_outputs(
-        &args.out_findings,
-        &args.out_decisions,
-        &args.out_pr_agent,
-    )
+    outputs::write_outputs(&args.out_findings, &args.out_decisions, &args.out_pr_agent)
 }
 
 fn run() -> i32 {
@@ -250,4 +246,87 @@ fn run() -> i32 {
 
 fn main() {
     process::exit(run());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn full_review_args() -> Vec<OsString> {
+        os(&[
+            "review",
+            "--repo",
+            "/repo",
+            "--diff",
+            "/tmp/mr.diff",
+            "--base-ref",
+            "main",
+            "--pr-url",
+            "https://github.com/example/project/pull/1",
+            "--out-findings",
+            "/tmp/findings.json",
+            "--out-decisions",
+            "/tmp/decisions.json",
+            "--out-pr-agent",
+            "/tmp/pr-agent.md",
+        ])
+    }
+
+    #[test]
+    fn help_is_a_request() {
+        assert_eq!(parse_cli(os(&["--help"])), Ok(CliRequest::Help));
+        assert_eq!(parse_cli(os(&["review", "--help"])), Ok(CliRequest::Help));
+    }
+
+    #[test]
+    fn parses_a_full_review_command() {
+        let Ok(CliRequest::Review(args)) = parse_cli(full_review_args()) else {
+            panic!("expected a review request");
+        };
+        assert_eq!(args.repo, PathBuf::from("/repo"));
+        assert_eq!(args.diff, PathBuf::from("/tmp/mr.diff"));
+        assert_eq!(args.base_ref, "main");
+        assert_eq!(args.pr_url, "https://github.com/example/project/pull/1");
+        assert_eq!(args.config, None);
+        assert_eq!(args.ticket_file, None);
+        assert_eq!(args.out_findings, PathBuf::from("/tmp/findings.json"));
+        assert_eq!(args.out_decisions, PathBuf::from("/tmp/decisions.json"));
+        assert_eq!(args.out_pr_agent, PathBuf::from("/tmp/pr-agent.md"));
+    }
+
+    #[test]
+    fn missing_required_flag_is_an_error() {
+        let mut args = full_review_args();
+        let position = args
+            .iter()
+            .position(|arg| arg == "--diff")
+            .expect("fixture has --diff");
+        args.drain(position..position + 2);
+        let error = parse_cli(args).expect_err("missing --diff must fail");
+        assert!(
+            error.contains("missing required argument `--diff`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unknown_and_duplicate_flags_are_errors() {
+        let mut unknown = full_review_args();
+        unknown.push(OsString::from("--bogus"));
+        unknown.push(OsString::from("x"));
+        assert!(parse_cli(unknown)
+            .expect_err("unknown flag must fail")
+            .contains("unknown argument `--bogus`"));
+
+        let mut duplicate = full_review_args();
+        duplicate.push(OsString::from("--repo"));
+        duplicate.push(OsString::from("/other"));
+        assert!(parse_cli(duplicate)
+            .expect_err("duplicate flag must fail")
+            .contains("duplicate argument `--repo`"));
+    }
 }
