@@ -7,4 +7,5 @@
 //! from the binary through this surface.
 
 pub mod model_transport;
+pub mod snapshot;
 pub mod transport;

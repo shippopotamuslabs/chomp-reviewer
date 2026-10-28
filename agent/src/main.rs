@@ -9,7 +9,6 @@ mod host;
 mod outputs;
 mod pr_agent;
 mod sessions;
-mod snapshot;
 mod synthesis;
 mod tools;
 
