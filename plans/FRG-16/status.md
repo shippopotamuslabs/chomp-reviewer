@@ -156,3 +156,21 @@ Applied from a fresh-context review; still uncommitted in the worktree.
 - `cargo tree | grep -i uniffi`: empty.
 - Repo Python suite (`python3 -m unittest discover -s tests`): 159
   tests, OK (4 skipped) — unchanged.
+
+## Port follow-up (2026-10-28, Sean's direction)
+
+Sean's review of the shipped FRG-16: the OpenRouter code is infrastructure,
+so it must sit behind an application port — and the "end-to-end" test should
+orchestrate through that port, not call the concrete struct. Correct on both
+counts (the loop test's driver called OpenRouterTransport directly).
+
+- New `agent/src/model_transport.rs`: the application port
+  (`trait ModelTransport`) plus `TransportError` + `to_failure_report()`
+  moved there — the error vocabulary is part of the port contract.
+- `OpenRouterTransport` now implements the port; its inherent
+  `complete_model_turn` is a private helper behind the trait impl, so the
+  trait method is the only public door.
+- The loop test's driver takes `&dyn ModelTransport`; the remaining direct
+  call sites resolve through the trait (no inherent public method exists).
+- Gates after the change: cargo 41/0 (unchanged counts), fmt + clippy
+  clean, Python 159 OK.
