@@ -2,7 +2,8 @@
 //!
 //! This binary is a host for `agent_core`, an owner of repository tools, and
 //! nothing else. FRG-15 scaffolded the CLI, configuration loading, and
-//! output contract; FRG-19 runs the correctness lens end to end. Fan-out,
+//! output contract; FRG-19 runs the correctness lens end to end; FRG-20
+//! resolves the contract entry file from the base branch. Fan-out,
 //! synthesis, and the remaining lenses land in their own tickets.
 
 mod contract;
@@ -232,6 +233,17 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
         .map_err(|error| format!("cannot read diff file {}: {error}", args.diff.display()))?;
     let snapshot = chomp::snapshot::Snapshot::capture(&args.repo, &args.diff)
         .map_err(|error| error.to_string())?;
+    // Contract resolution (FRG-20): the governing entry copy comes
+    // from the base branch, behind its own channel. A bad base ref
+    // is an orchestration failure; an absent entry file is not — it
+    // resolves to a recorded stand-down and the review proceeds.
+    let resolution = contract::resolve_contract(&args.repo, &args.base_ref, &config)
+        .map_err(|error| error.to_string())?;
+    let decision_entries: Vec<serde_json::Value> = resolution
+        .recorded_event()
+        .map(|(event, detail)| outputs::host_event("contract", event, &detail))
+        .into_iter()
+        .collect();
     let executor: Arc<dyn chomp::tools::ToolExecutor + Send + Sync> = Arc::new(
         chomp::tools::RepoToolExecutor::new(snapshot.root.clone(), snapshot.head_sha.clone())
             .map_err(|error| {
@@ -246,13 +258,14 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
     match sessions::run_correctness_session(
         &snapshot,
         &diff_text,
-        &config.entry_file,
+        &resolution,
         &transport,
         &executor,
         agent_core::session::AgentConfig::default(),
     ) {
         sessions::LensOutcome::Completed(findings) => outputs::write_outputs(
             &findings,
+            &decision_entries,
             &args.out_findings,
             &args.out_decisions,
             &args.out_pr_agent,
