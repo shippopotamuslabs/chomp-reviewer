@@ -1,10 +1,9 @@
 //! Lens session construction: prompts, budgets, and catalog/schema
 //! JSON for each review lens.
 //!
-//! The correctness and structure lenses land here (FRG-19 and
-//! FRG-21); the contract lens follows in FRG-22 on the same
-//! construction: one `agent_core` session per lens, built by
-//! [`run_correctness_session`]'s shape — system prompt from
+//! All three lenses land here (FRG-19, FRG-21, FRG-22); FRG-24
+//! wires them into main. One `agent_core` session per lens, built
+//! by [`run_correctness_session`]'s shape — system prompt from
 //! `agent/prompts/`, opening context assembled from the snapshot,
 //! the FRG-18 tool catalog in both channels (schema JSON and typed
 //! semantics), summarization disabled.
@@ -45,6 +44,11 @@ const CORRECTNESS_PROMPT: &str = include_str!("../prompts/correctness.md");
 /// `agent/prompts/structure.md` and embedded at build time (a
 /// shipped binary cannot rely on a source-tree-relative path).
 const STRUCTURE_PROMPT: &str = include_str!("../prompts/structure.md");
+
+/// The contract system prompt, authored at
+/// `agent/prompts/contract.md` and embedded at build time (a
+/// shipped binary cannot rely on a source-tree-relative path).
+const CONTRACT_PROMPT: &str = include_str!("../prompts/contract.md");
 
 /// Provider label and context window the sessions are constructed
 /// with, per the ticket's construction sketch.
@@ -105,6 +109,43 @@ pub fn run_structure_session(
 ) -> LensOutcome {
     run_lens_session(
         STRUCTURE_PROMPT,
+        snapshot,
+        diff_text,
+        contract,
+        transport,
+        executor,
+        agent_config,
+    )
+}
+
+/// Run the contract lens over one snapshot and diff.
+///
+/// If the contract is [`ContractResolution::Absent`] there is
+/// nothing to enforce, so this returns
+/// [`LensOutcome::Completed`] with no findings without driving a
+/// session (no transport calls) — the recorded stand-down note is
+/// FRG-20's entry_absent decision-log event, already emitted
+/// host-side. Otherwise the session is driven over
+/// [`CONTRACT_PROMPT`] like the other lenses.
+///
+/// `agent_config` carries the caller's budgets (the engine's turn
+/// and retry guardrails); the tool semantics are filled in here from
+/// the FRG-18 catalog.
+// Wired into main by FRG-24 fan-out (plan D2: main stays correctness-only in this ticket).
+#[allow(dead_code)]
+pub fn run_contract_session(
+    snapshot: &Snapshot,
+    diff_text: &str,
+    contract: &ContractResolution,
+    transport: &dyn ModelTransport,
+    executor: &Arc<dyn ToolExecutor + Send + Sync>,
+    agent_config: AgentConfig,
+) -> LensOutcome {
+    if matches!(contract, ContractResolution::Absent { .. }) {
+        return LensOutcome::Completed(Vec::new());
+    }
+    run_lens_session(
+        CONTRACT_PROMPT,
         snapshot,
         diff_text,
         contract,
@@ -1068,5 +1109,375 @@ mod tests {
             assert!(prompt.contains(token), "prompt names {token}");
         }
         assert!(prompt.contains("structure"));
+    }
+
+    // -- contract lens (FRG-22) ---------------------------------------------------
+
+    /// The stated rule every contract fixture enforces (generically
+    /// fine to break): env access belongs in `src/config.rs`.
+    const CONTRACT_RULE: &str = "Never call std::env::var outside src/config.rs.";
+
+    /// Violating head code; the `std::env::var` call sits on line 2.
+    const CONTRACT_ENV_BODY: &str =
+        "pub fn db_url() -> String {\n    std::env::var(\"DATABASE_URL\").unwrap_or_default()\n}\n";
+
+    /// Base commit for contract fixtures: an entry file plus the one
+    /// blessed env module. Each test adds its head writes, then a
+    /// single `write_diff`.
+    fn contract_base_fixture(label: &str, entry: &str) -> RepoFixture {
+        let fixture = RepoFixture::new(label);
+        fixture.write("AGENTS.md", entry);
+        fixture.write(
+            "src/config.rs",
+            "pub fn app_name() -> &'static str {\n    \"fixture\"\n}\n",
+        );
+        fixture.commit_all("base");
+        fixture
+    }
+
+    fn governing_entry(content: &str) -> ContractResolution {
+        ContractResolution::Governing {
+            entry_file: "AGENTS.md".to_string(),
+            content: content.to_string(),
+            truncated_from_lines: None,
+        }
+    }
+
+    const CONTRACT_VIOLATION_FINDING: &str = r#"[{
+        "file": "src/feature.rs",
+        "line_start": 2,
+        "line_end": 2,
+        "severity": "High",
+        "category": "Contract violation",
+        "title": "Environment read outside the config module",
+        "description": "The stated rule is: 'Never call std::env::var outside src/config.rs.' src/feature.rs reads the environment directly at line 2, outside src/config.rs, breaching that rule.",
+        "evidence": "The violating call sits at src/feature.rs:2, which calls std::env::var outside the one permitted module; the governing entry states the prohibition quoted above.",
+        "fix_focus_areas": ["src/feature.rs[2-2]"],
+        "recommended_fix": "Route the lookup through src/config.rs: add an accessor there and call it from src/feature.rs instead of calling std::env::var directly.",
+        "citations": ["src/feature.rs:2"]
+    }]"#;
+
+    #[test]
+    fn contract_stated_rule_caught() {
+        let fixture = contract_base_fixture("contract-stated", "# Fixture repo notes\n");
+        fixture.write("src/feature.rs", CONTRACT_ENV_BODY);
+        fixture.write_diff();
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        let transport = ScriptedTransport::new(
+            vec![text_response(CONTRACT_VIOLATION_FINDING)],
+            text_response("[]"),
+        );
+        let entry = "# Fixture repo notes\n\nNever call std::env::var outside src/config.rs.\n";
+
+        let outcome = run_contract_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &governing_entry(entry),
+            &transport,
+            &executor,
+            AgentConfig::default(),
+        );
+
+        let LensOutcome::Completed(findings) = outcome else {
+            panic!("expected completed findings, got {outcome:?}");
+        };
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].description.contains(CONTRACT_RULE)
+                || findings[0].evidence.contains(CONTRACT_RULE),
+            "finding quotes the stated rule"
+        );
+        assert_eq!(
+            findings[0].citations.as_deref(),
+            Some(&["src/feature.rs:2".to_string()][..])
+        );
+
+        // The opening request carried the governing rule text.
+        assert!(transport.request_text(0).contains(CONTRACT_RULE));
+    }
+
+    /// The routed rule lives ONLY in `docs/rules.md` (line 3); the
+    /// entry merely routes to it.
+    const ROUTED_RULES_BODY: &str =
+        "# Widget rules\n\nEvery widget name must end with `-widget` (routed widget rule 7QZ).\n";
+
+    const ROUTED_FINDING: &str = r#"[{
+        "file": "src/feature.rs",
+        "line_start": 2,
+        "line_end": 2,
+        "severity": "Medium",
+        "category": "Contract violation",
+        "title": "Widget registered under a bare name",
+        "description": "The routed rule states: 'Every widget name must end with `-widget` (routed widget rule 7QZ).' Registering the bare name at src/feature.rs line 2 violates that stated rule.",
+        "evidence": "src/feature.rs:2 registers the bare name; the rule pulled from docs/rules.md:3 requires the -widget suffix.",
+        "fix_focus_areas": ["src/feature.rs[2-2]"],
+        "recommended_fix": "Register the widget under a name ending with -widget instead of the bare name.",
+        "citations": ["src/feature.rs:2", "docs/rules.md:3"]
+    }]"#;
+
+    #[test]
+    fn contract_routed_rule_pulled_at_head() {
+        let fixture = RepoFixture::new("contract-routed");
+        fixture.write(
+            "AGENTS.md",
+            "# Fixture repo notes\n\nSee docs/rules.md for the widget rules.\n",
+        );
+        fixture.write("docs/rules.md", ROUTED_RULES_BODY);
+        fixture.write(
+            "src/config.rs",
+            "pub fn app_name() -> &'static str {\n    \"fixture\"\n}\n",
+        );
+        fixture.commit_all("base");
+        fixture.write(
+            "src/feature.rs",
+            "pub fn setup() {\n    register_widget('bare');\n}\n",
+        );
+        fixture.write_diff();
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        let transport = ScriptedTransport::new(
+            vec![
+                tool_call_response("read_file", "{\"path\": \"docs/rules.md\"}"),
+                text_response(ROUTED_FINDING),
+            ],
+            text_response("[]"),
+        );
+        let entry = "# Fixture repo notes\n\nSee docs/rules.md for the widget rules.\n";
+
+        let outcome = run_contract_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &governing_entry(entry),
+            &transport,
+            &executor,
+            AgentConfig::default(),
+        );
+
+        let LensOutcome::Completed(findings) = outcome else {
+            panic!("expected completed findings, got {outcome:?}");
+        };
+        assert_eq!(findings.len(), 1);
+        let citations = findings[0].citations.clone().expect("citations");
+        assert!(
+            citations.contains(&"src/feature.rs:2".to_string()),
+            "cites the violating code: {citations:?}"
+        );
+        assert!(
+            citations.contains(&"docs/rules.md:3".to_string()),
+            "cites the routed rule location: {citations:?}"
+        );
+
+        // The unique routed string was NOT in the opening context
+        // (docs/rules.md is unchanged, so only the repo map names
+        // it); it arrived via the tool pull on a later turn.
+        assert!(
+            !transport.request_text(0).contains("7QZ"),
+            "routed rule was not in the opening context"
+        );
+        assert!(
+            transport.request_text(1).contains("7QZ"),
+            "tool result carried the routed rule"
+        );
+    }
+
+    const CONTRACT_EDIT_FINDINGS: &str = r#"[{
+        "file": "AGENTS.md",
+        "line_start": 1,
+        "line_end": 3,
+        "severity": "Critical",
+        "category": "Contract edit",
+        "title": "Stated env rule loosened to excuse the violation",
+        "description": "The governing rule stated: 'Never call std::env::var outside src/config.rs.' The PR rewrites AGENTS.md to say env access is fine anywhere while itself calling std::env::var outside src/config.rs — editing the rule to match the violation is not a defense.",
+        "evidence": "Head AGENTS.md:3 permits env access anywhere, where the base copy prohibited it; the same diff adds the violating call at src/feature.rs:2.",
+        "fix_focus_areas": ["AGENTS.md[1-3]"],
+        "recommended_fix": "Restore the stated prohibition in AGENTS.md and route the lookup through src/config.rs instead of loosening the rule.",
+        "citations": ["AGENTS.md:3", "src/feature.rs:2"]
+    }, {
+        "file": "src/feature.rs",
+        "line_start": 2,
+        "line_end": 2,
+        "severity": "High",
+        "category": "Contract violation",
+        "title": "Environment read outside the config module",
+        "description": "The stated rule is: 'Never call std::env::var outside src/config.rs.' src/feature.rs reads the environment directly at line 2, outside src/config.rs, breaching that rule.",
+        "evidence": "The violating call sits at src/feature.rs:2, which calls std::env::var outside the one permitted module; the governing entry states the prohibition quoted above.",
+        "fix_focus_areas": ["src/feature.rs[2-2]"],
+        "recommended_fix": "Route the lookup through src/config.rs: add an accessor there and call it from src/feature.rs instead of calling std::env::var directly.",
+        "citations": ["src/feature.rs:2"]
+    }]"#;
+
+    #[test]
+    fn contract_self_excusing_edit_flags_both() {
+        let base_entry =
+            "# Fixture repo notes\n\nNever call std::env::var outside src/config.rs.\n";
+        let fixture = contract_base_fixture("contract-edit", base_entry);
+        fixture.write(
+            "AGENTS.md",
+            "# Fixture repo notes\n\nEnv access is fine anywhere in the codebase.\n",
+        );
+        fixture.write("src/feature.rs", CONTRACT_ENV_BODY);
+        fixture.write_diff();
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        let transport = ScriptedTransport::new(
+            vec![text_response(CONTRACT_EDIT_FINDINGS)],
+            text_response("[]"),
+        );
+
+        let outcome = run_contract_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &governing_entry(base_entry),
+            &transport,
+            &executor,
+            AgentConfig::default(),
+        );
+
+        let LensOutcome::Completed(findings) = outcome else {
+            panic!("expected completed findings, got {outcome:?}");
+        };
+        assert_eq!(findings.len(), 2);
+        let mut categories: Vec<&str> = findings
+            .iter()
+            .map(|finding| finding.category.as_str())
+            .collect();
+        categories.sort_unstable();
+        assert_eq!(categories, ["Contract edit", "Contract violation"]);
+    }
+
+    #[test]
+    fn contract_unstated_rule_returns_empty_findings() {
+        let fixture = contract_base_fixture(
+            "contract-unstated",
+            "# Fixture repo notes\n\nAll log lines must carry a request id.\n",
+        );
+        fixture.write(
+            "src/feature.rs",
+            "pub fn parse_count(raw: &str) -> usize {\n    raw.parse().unwrap()\n}\n",
+        );
+        fixture.write_diff();
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        let transport = ScriptedTransport::new(vec![text_response("[]")], text_response("[]"));
+
+        let outcome = run_contract_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &governing_entry("# Fixture repo notes\n\nAll log lines must carry a request id.\n"),
+            &transport,
+            &executor,
+            AgentConfig::default(),
+        );
+
+        // No stated rule covers `.unwrap()`; the lens must not stretch
+        // an unrelated rule to flag it.
+        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+    }
+
+    #[test]
+    fn contract_absent_stands_down_without_a_session() {
+        let fixture = class1_fixture();
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        // The script is empty: the fallback finding would surface as a
+        // completed finding if any model turn ran, so Completed([])
+        // plus zero recorded requests proves the host-side
+        // short-circuit.
+        let transport = ScriptedTransport::new(Vec::new(), text_response(CLASS1_FINDING));
+
+        let outcome = run_contract_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &absent_contract(),
+            &transport,
+            &executor,
+            AgentConfig::default(),
+        );
+
+        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+        assert_eq!(
+            transport.requests.lock().expect("requests lock").len(),
+            0,
+            "absent contract drives zero model turns"
+        );
+    }
+
+    #[test]
+    fn contract_uncheckable_governing_returns_empty_findings() {
+        let fixture = class1_fixture();
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        let transport = ScriptedTransport::new(vec![text_response("[]")], text_response("[]"));
+
+        let outcome = run_contract_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &governing_entry("# Fixture repo notes\n\nWe value clean code style.\n"),
+            &transport,
+            &executor,
+            AgentConfig::default(),
+        );
+
+        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+        // The session ran (contrast with the absent short-circuit):
+        // exactly the opening turn, no tool pulls needed.
+        assert_eq!(
+            transport.requests.lock().expect("requests lock").len(),
+            1,
+            "uncheckable governing still drives one session turn"
+        );
+    }
+
+    #[test]
+    fn contract_tiny_turn_budget_is_a_budget_outcome() {
+        let entry = "# Fixture repo notes\n\nNever call std::env::var outside src/config.rs.\n";
+        let fixture = contract_base_fixture("contract-budget", entry);
+        fixture.write("src/feature.rs", CONTRACT_ENV_BODY);
+        fixture.write_diff();
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        // The fallback answers every turn with another tool call; the
+        // engine's turn budget must end the session as a recorded
+        // budget outcome, not a hang.
+        let transport = ScriptedTransport::new(
+            Vec::new(),
+            tool_call_response("read_file", "{\"path\": \"src/feature.rs\"}"),
+        );
+
+        let outcome = run_contract_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &governing_entry(entry),
+            &transport,
+            &executor,
+            AgentConfig {
+                max_turns: 1,
+                ..AgentConfig::default()
+            },
+        );
+
+        assert!(
+            matches!(outcome, LensOutcome::BudgetExhausted { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn contract_system_prompt_shape() {
+        let prompt = system_prompt(CONTRACT_PROMPT);
+        assert!(!prompt.contains("Provenance"));
+        for token in ["{diff}", "{file_contents}", "{ticket}"] {
+            assert!(!prompt.contains(token), "prompt leaks {token}");
+        }
+        for token in ["citations", "grep", "read_file", "list_dir", "read_symbol"] {
+            assert!(prompt.contains(token), "prompt names {token}");
+        }
+        assert!(
+            prompt.contains("Invented rules are this lens's worst failure mode"),
+            "prompt pins the invented-rules hard rule"
+        );
+        assert!(prompt.contains("Contract edit"));
+        assert!(prompt.contains("governing"));
     }
 }
