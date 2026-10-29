@@ -42,7 +42,7 @@ pub const MAX_REPO_MAP_ENTRIES: usize = 10_000;
 
 /// Directories the walk never descends, by name, at any depth: VCS
 /// internals and build/dependency output are not review content.
-const PRUNED_DIRS: [&str; 7] = [
+pub(crate) const PRUNED_DIRS: [&str; 7] = [
     ".git",
     "target",
     "build",
@@ -54,7 +54,7 @@ const PRUNED_DIRS: [&str; 7] = [
 
 /// Lockfiles excluded from the map, by file name, at any depth: they are
 /// generated manifests, not reviewable source.
-const LOCKFILES: [&str; 9] = [
+pub(crate) const LOCKFILES: [&str; 9] = [
     "Cargo.lock",
     "package-lock.json",
     "yarn.lock",
