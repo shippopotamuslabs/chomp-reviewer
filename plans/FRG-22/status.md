@@ -5,7 +5,7 @@
 - [x] Plan
 - [x] Implementation
 - [x] Review — rounds: 2/3, result: clean (round 1: one MINOR, fixed; round 2: verified)
-- [ ] Ship — PR: pending creation
+- [ ] Ship — PR: https://github.com/shippopotamuslabs/forge-reviewer/pull/27 (open, awaiting external review/merge)
 
 ## Current Gate
 none
@@ -51,3 +51,6 @@ Ship
   verified. No architecture questions. Residual: unwired until
   FRG-24 (D1); uncheckable stand-down note deferred to FRG-24
   (D2, human-approved); live judgment unproven (FRG-29).
+- 2026-10-29: Shipped as PR #27
+  (https://github.com/shippopotamuslabs/forge-reviewer/pull/27),
+  commit `7e6beb7`. No changelog/tag (agent/ precedent).
