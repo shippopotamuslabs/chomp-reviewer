@@ -1,14 +1,23 @@
-//! Forge configuration loading and, later, contract entry-file resolution.
+//! Forge configuration loading and contract entry-file resolution.
 //!
-//! Resolution of the entry file from the base branch, including its size
-//! guard and absence behavior, lands in FRG-20.
+//! The configuration surface is the `[forge]` table of the caller's
+//! `.pr_agent.toml` (FRG-15). Resolution (FRG-20, proposal §8.7)
+//! reads the entry file from the **base branch** of the pull request,
+//! never the head: the rules a PR is judged against must not be
+//! rewritable by the PR itself. The resolved content reaches lens
+//! sessions through this module's channel only — the FRG-18 general
+//! tools are rooted at the head snapshot and cannot read the base
+//! tree, so a session can never confuse head code with base rules.
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 use serde::Deserialize;
 
 const DEFAULT_ENTRY_FILE: &str = "AGENTS.md";
+const DEFAULT_ENTRY_MAX_LINES: usize = 2_000;
 
 /// The `[forge]` section of a repository's `.pr_agent.toml` file.
 ///
@@ -20,6 +29,10 @@ pub struct ForgeConfig {
     pub entry_file: String,
     /// Additional context files handed to PR-Agent's static context channel.
     pub pr_agent_context_files: Vec<String>,
+    /// Size-guard ceiling for the entry file, in lines (proposal §17
+    /// decision D3). An entry file past the ceiling is truncated at
+    /// resolution, with the truncation recorded.
+    pub entry_max_lines: usize,
 }
 
 impl Default for ForgeConfig {
@@ -28,6 +41,7 @@ impl Default for ForgeConfig {
         Self {
             pr_agent_context_files: vec![entry_file.clone()],
             entry_file,
+            entry_max_lines: DEFAULT_ENTRY_MAX_LINES,
         }
     }
 }
@@ -41,6 +55,7 @@ struct ConfigFile {
 struct ForgeSection {
     entry_file: Option<String>,
     pr_agent_context_files: Option<Vec<String>>,
+    entry_max_lines: Option<usize>,
 }
 
 impl From<ForgeSection> for ForgeConfig {
@@ -54,6 +69,7 @@ impl From<ForgeSection> for ForgeConfig {
         Self {
             entry_file,
             pr_agent_context_files,
+            entry_max_lines: section.entry_max_lines.unwrap_or(DEFAULT_ENTRY_MAX_LINES),
         }
     }
 }
@@ -95,6 +111,200 @@ pub fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<ForgeCon
     parse_config_str(&contents, &source)
 }
 
+/// Why the entry file is absent from the base branch. Both cases
+/// degrade the same way (the contract channel is empty); the reason
+/// is carried for the recorded stand-down note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsentReason {
+    /// No file exists at the configured path on the base ref.
+    Missing,
+    /// A file exists there but is not UTF-8 text, so it cannot serve
+    /// as a governing document.
+    NotText,
+}
+
+/// The outcome of resolving the contract entry file against the base
+/// branch — the contract channel's payload for lens sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractResolution {
+    /// The governing copy, read from the base branch. Content past
+    /// the size-guard ceiling is truncated, with
+    /// `truncated_from_lines` recording the original line total.
+    Governing {
+        entry_file: String,
+        content: String,
+        truncated_from_lines: Option<usize>,
+    },
+    /// No governing copy: the contract lens stands down and the
+    /// other lenses proceed without contract context (§8.7 rule 4).
+    Absent {
+        entry_file: String,
+        reason: AbsentReason,
+    },
+}
+
+impl ContractResolution {
+    /// The context files PR-Agent's static channel should receive
+    /// (§8.7 rule 4): the configured list when a governing copy
+    /// exists, empty when the contract channel stands down. The
+    /// resolution rule and its tests land here; the consumer is
+    /// FRG-23's adapter, so production code does not call this yet.
+    #[allow(dead_code)]
+    pub fn pr_agent_context_files(&self, config: &ForgeConfig) -> Vec<String> {
+        match self {
+            ContractResolution::Governing { .. } => config.pr_agent_context_files.clone(),
+            ContractResolution::Absent { .. } => Vec::new(),
+        }
+    }
+
+    /// The host event this resolution records in the decision log,
+    /// as `(event, detail)`: a truncation and a stand-down are
+    /// recorded; a clean governing copy is the unremarkable case and
+    /// records nothing.
+    pub fn recorded_event(&self) -> Option<(&'static str, String)> {
+        match self {
+            ContractResolution::Governing {
+                entry_file,
+                content,
+                truncated_from_lines: Some(total),
+            } => Some((
+                "entry_truncated",
+                format!(
+                    "{entry_file} truncated to its first {} of {total} lines by the size guard",
+                    content.lines().count()
+                ),
+            )),
+            ContractResolution::Absent {
+                entry_file,
+                reason,
+            } => Some((
+                "entry_absent",
+                match reason {
+                    AbsentReason::Missing => format!(
+                        "no entry file at {entry_file} on the base ref; contract channel empty"
+                    ),
+                    AbsentReason::NotText => format!(
+                        "entry file at {entry_file} on the base ref is not UTF-8 text; contract channel empty"
+                    ),
+                },
+            )),
+            ContractResolution::Governing { .. } => None,
+        }
+    }
+}
+
+/// Resolution failures. Absence of the entry file is NOT a failure
+/// (it is [`ContractResolution::Absent`]); a failure means the
+/// caller's own inputs are wrong — the base ref does not resolve, or
+/// git itself cannot run against the checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractError {
+    BadBaseRef { base_ref: String, detail: String },
+    Git { detail: String },
+}
+
+impl fmt::Display for ContractError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContractError::BadBaseRef { base_ref, detail } => {
+                write!(f, "base ref `{base_ref}` does not resolve: {detail}")
+            }
+            ContractError::Git { detail } => {
+                write!(f, "git failed during contract resolution: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ContractError {}
+
+fn git(repo: &Path, args: &[&str]) -> Result<Output, ContractError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|error| ContractError::Git {
+            detail: error.to_string(),
+        })
+}
+
+fn stderr_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).trim().to_string()
+}
+
+/// Resolve the contract entry file from the base branch.
+///
+/// Read-only git against the caller's checkout. The configured entry
+/// path is only ever an argument to `git show <ref>:<path>` — never
+/// opened on the filesystem — so an odd or hostile `entry_file`
+/// cannot escape the tree: git rejects it, which lands on
+/// [`AbsentReason::Missing`].
+pub fn resolve_contract(
+    repo: &Path,
+    base_ref: &str,
+    config: &ForgeConfig,
+) -> Result<ContractResolution, ContractError> {
+    let verify = git(
+        repo,
+        &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+    )?;
+    if !verify.status.success() {
+        return Err(ContractError::BadBaseRef {
+            base_ref: base_ref.to_string(),
+            detail: stderr_text(&verify),
+        });
+    }
+
+    let entry_file = config.entry_file.clone();
+    let spec = format!("{base_ref}:{entry_file}");
+    let exists = git(repo, &["cat-file", "-e", &spec])?;
+    if !exists.status.success() {
+        return Ok(ContractResolution::Absent {
+            entry_file,
+            reason: AbsentReason::Missing,
+        });
+    }
+    let shown = git(repo, &["show", &spec])?;
+    if !shown.status.success() {
+        // Present at the existence check, gone or unreadable at the
+        // read: degrade to absence rather than fail the review.
+        return Ok(ContractResolution::Absent {
+            entry_file,
+            reason: AbsentReason::Missing,
+        });
+    }
+    let text = match String::from_utf8(shown.stdout) {
+        Ok(text) => text,
+        Err(_) => {
+            return Ok(ContractResolution::Absent {
+                entry_file,
+                reason: AbsentReason::NotText,
+            });
+        }
+    };
+
+    let total_lines = text.lines().count();
+    if total_lines > config.entry_max_lines {
+        let mut content: String = text
+            .lines()
+            .take(config.entry_max_lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+        content.push('\n');
+        return Ok(ContractResolution::Governing {
+            entry_file,
+            content,
+            truncated_from_lines: Some(total_lines),
+        });
+    }
+    Ok(ContractResolution::Governing {
+        entry_file,
+        content: text,
+        truncated_from_lines: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +330,7 @@ mod tests {
         assert_eq!(config, ForgeConfig::default());
         assert_eq!(config.entry_file, "AGENTS.md");
         assert_eq!(config.pr_agent_context_files, vec!["AGENTS.md".to_string()]);
+        assert_eq!(config.entry_max_lines, 2_000);
         fs::remove_dir_all(repo).expect("clean temp dir");
     }
 
@@ -132,7 +343,7 @@ mod tests {
     #[test]
     fn forge_values_are_honored() {
         let config = parse_config_str(
-            "[forge]\nentry_file = \"CLAUDE.md\"\npr_agent_context_files = [\"CLAUDE.md\", \"docs/contract.md\"]\n",
+            "[forge]\nentry_file = \"CLAUDE.md\"\npr_agent_context_files = [\"CLAUDE.md\", \"docs/contract.md\"]\nentry_max_lines = 42\n",
             Path::new("fixture.toml"),
         )
         .expect("parse forge values");
@@ -141,6 +352,7 @@ mod tests {
             config.pr_agent_context_files,
             vec!["CLAUDE.md".to_string(), "docs/contract.md".to_string()]
         );
+        assert_eq!(config.entry_max_lines, 42);
     }
 
     #[test]
@@ -192,5 +404,168 @@ mod tests {
         .expect("foreign content ignored");
         assert_eq!(config.entry_file, "GUIDE.md");
         assert_eq!(config.pr_agent_context_files, vec!["GUIDE.md".to_string()]);
+    }
+
+    /// A git repo on branch `main` with one base commit; tests stage
+    /// head states on a `feature` branch on top.
+    struct GitFixture {
+        repo: PathBuf,
+    }
+
+    impl GitFixture {
+        fn new(label: &str) -> Self {
+            let repo = temp_dir(label);
+            let fixture = Self { repo };
+            fixture.git(&["init", "-q", "-b", "main"]);
+            fixture
+        }
+
+        fn git(&self, args: &[&str]) {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args([
+                    "-c",
+                    "user.email=fixture@example.com",
+                    "-c",
+                    "user.name=Fixture",
+                ])
+                .args(args)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?} failed");
+        }
+
+        fn write(&self, rel: &str, contents: &[u8]) {
+            let path = self.repo.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create parent dir");
+            }
+            fs::write(path, contents).expect("write fixture file");
+        }
+
+        fn commit_all(&self, message: &str) {
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-q", "-m", message]);
+        }
+    }
+
+    impl Drop for GitFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.repo);
+        }
+    }
+
+    #[test]
+    fn governing_copy_comes_from_the_base_branch_not_the_head() {
+        let fixture = GitFixture::new("base-wins");
+        fixture.write("AGENTS.md", b"BASE RULE: judge by this.\n");
+        fixture.commit_all("base");
+        fixture.git(&["checkout", "-q", "-b", "feature"]);
+        fixture.write("AGENTS.md", b"HEAD RULE: excuse everything.\n");
+        fixture.commit_all("head edit");
+
+        let resolution =
+            resolve_contract(&fixture.repo, "main", &ForgeConfig::default()).expect("resolve");
+        let ContractResolution::Governing {
+            content,
+            truncated_from_lines,
+            ..
+        } = &resolution
+        else {
+            panic!("expected a governing copy, got {resolution:?}");
+        };
+        assert_eq!(content, "BASE RULE: judge by this.\n");
+        assert_eq!(*truncated_from_lines, None);
+        assert_eq!(resolution.recorded_event(), None);
+        assert_eq!(
+            resolution.pr_agent_context_files(&ForgeConfig::default()),
+            vec!["AGENTS.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_entry_file_is_absence_not_an_error() {
+        let fixture = GitFixture::new("absent");
+        fixture.write("src/lib.rs", b"pub fn f() {}\n");
+        fixture.commit_all("base");
+
+        let resolution =
+            resolve_contract(&fixture.repo, "main", &ForgeConfig::default()).expect("resolve");
+        assert_eq!(
+            resolution,
+            ContractResolution::Absent {
+                entry_file: "AGENTS.md".to_string(),
+                reason: AbsentReason::Missing,
+            }
+        );
+        let (event, detail) = resolution.recorded_event().expect("absence is recorded");
+        assert_eq!(event, "entry_absent");
+        assert!(detail.contains("AGENTS.md"), "{detail}");
+        assert!(resolution
+            .pr_agent_context_files(&ForgeConfig::default())
+            .is_empty());
+    }
+
+    #[test]
+    fn non_text_entry_file_degrades_to_absence() {
+        let fixture = GitFixture::new("binary");
+        fixture.write("AGENTS.md", &[0xff, 0xfe, 0x00, 0x01]);
+        fixture.commit_all("base");
+
+        let resolution =
+            resolve_contract(&fixture.repo, "main", &ForgeConfig::default()).expect("resolve");
+        assert_eq!(
+            resolution,
+            ContractResolution::Absent {
+                entry_file: "AGENTS.md".to_string(),
+                reason: AbsentReason::NotText,
+            }
+        );
+    }
+
+    #[test]
+    fn oversized_entry_file_is_truncated_at_the_ceiling_and_recorded() {
+        let fixture = GitFixture::new("truncated");
+        let mut text = String::new();
+        for line in 1..=10 {
+            text.push_str(&format!("rule line {line}\n"));
+        }
+        fixture.write("AGENTS.md", text.as_bytes());
+        fixture.commit_all("base");
+
+        let config = ForgeConfig {
+            entry_max_lines: 3,
+            ..ForgeConfig::default()
+        };
+        let resolution = resolve_contract(&fixture.repo, "main", &config).expect("resolve");
+        let ContractResolution::Governing {
+            content,
+            truncated_from_lines,
+            ..
+        } = &resolution
+        else {
+            panic!("expected a governing copy, got {resolution:?}");
+        };
+        assert_eq!(content, "rule line 1\nrule line 2\nrule line 3\n");
+        assert_eq!(*truncated_from_lines, Some(10));
+        let (event, detail) = resolution.recorded_event().expect("truncation is recorded");
+        assert_eq!(event, "entry_truncated");
+        assert!(detail.contains("first 3 of 10 lines"), "{detail}");
+    }
+
+    #[test]
+    fn an_unresolvable_base_ref_is_a_caller_error() {
+        let fixture = GitFixture::new("bad-ref");
+        fixture.write("AGENTS.md", b"rules\n");
+        fixture.commit_all("base");
+
+        let error = resolve_contract(&fixture.repo, "no-such-branch", &ForgeConfig::default())
+            .expect_err("a bad base ref must fail");
+        assert!(
+            matches!(error, ContractError::BadBaseRef { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("no-such-branch"), "{error}");
     }
 }

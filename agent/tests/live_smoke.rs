@@ -64,7 +64,7 @@ impl Fixture {
             "src/parse.rs",
             "pub fn parse_port(raw: &str) -> u16 {\n    raw.parse().unwrap_or_default()\n}\n",
         );
-        fixture.git(&["init", "-q"]);
+        fixture.git(&["init", "-q", "-b", "main"]);
         fixture.git(&["add", "-A"]);
         fixture.git(&["commit", "-q", "-m", "base"]);
         fixture.write(

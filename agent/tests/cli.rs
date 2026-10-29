@@ -29,7 +29,7 @@ impl Fixture {
         // The FRG-19 review path captures a snapshot, which needs a
         // real git checkout with a HEAD commit.
         for args in [
-            vec!["init", "-q"],
+            vec!["init", "-q", "-b", "main"],
             vec!["add", "-A"],
             vec!["commit", "-q", "-m", "base"],
         ] {
@@ -54,6 +54,27 @@ impl Fixture {
             pr_agent: root.join("pr-agent.md"),
             repo,
             root,
+        }
+    }
+
+    /// Commit an extra file on top of the base commit, so it exists
+    /// on the base branch (`main`) the review resolves against.
+    fn commit_extra(&self, rel: &str, contents: &str) {
+        fs::write(self.repo.join(rel), contents).expect("write extra file");
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "extra"]] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args([
+                    "-c",
+                    "user.email=fixture@example.com",
+                    "-c",
+                    "user.name=Fixture",
+                ])
+                .args(&args)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?} failed");
         }
     }
 
@@ -230,11 +251,52 @@ fn fixture_review_exits_zero_and_writes_all_outputs() {
         serde_json::from_str(&fs::read_to_string(&fixture.decisions).expect("decisions written"))
             .expect("decisions are JSON");
     assert_eq!(decisions["version"], 1);
-    assert_eq!(decisions["entries"], serde_json::json!([]));
+    // FRG-20: this fixture has no entry file on the base branch, so
+    // the run records the contract stand-down and still succeeds —
+    // absence degrades the review, it never fails it.
+    assert_eq!(decisions["entries"][0]["kind"], "contract");
+    assert_eq!(decisions["entries"][0]["event"], "entry_absent");
     assert_eq!(
         fs::read(&fixture.pr_agent).expect("pr-agent guide written"),
         Vec::<u8>::new()
     );
+}
+
+#[test]
+fn oversized_entry_file_records_its_truncation() {
+    let fixture = Fixture::new("truncated-entry");
+    let mut agents = String::new();
+    for line in 1..=10 {
+        agents.push_str(&format!("rule line {line}\n"));
+    }
+    fixture.commit_extra("AGENTS.md", &agents);
+    fixture.commit_extra(".pr_agent.toml", "[forge]\nentry_max_lines = 3\n");
+    fixture.write_diff();
+
+    let base_url = stub_model_server(
+        r#"{"choices":[{"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}]}"#,
+    );
+    let output = run_with_env(
+        &fixture.review_args(),
+        &[
+            ("OPENROUTER_API_KEY", "test-key"),
+            ("OPENROUTER_BASE_URL", &base_url),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decisions: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&fixture.decisions).expect("decisions written"))
+            .expect("decisions are JSON");
+    assert_eq!(decisions["entries"][0]["kind"], "contract");
+    assert_eq!(decisions["entries"][0]["event"], "entry_truncated");
+    let detail = decisions["entries"][0]["detail"]
+        .as_str()
+        .expect("detail is text");
+    assert!(detail.contains("first 3 of 10 lines"), "{detail}");
 }
 
 #[test]

@@ -44,22 +44,36 @@ pub struct Finding {
 
 /// Versioned synthesis decision log.
 ///
-/// The log stays empty until FRG-25/FRG-26 populate dispositions for
-/// producer findings.
+/// Entries are kind-namespaced JSON objects. Host events land from
+/// FRG-20 (contract resolution); per-finding dispositions join in
+/// FRG-25/FRG-26 under their own kinds.
 #[derive(Debug, Serialize)]
 struct DecisionLog {
     version: u32,
     entries: Vec<serde_json::Value>,
 }
 
+/// One host event for the decision log: a named occurrence in a
+/// named subsystem, with the human-readable specifics attached.
+/// Producer dispositions (FRG-25/26) carry richer per-kind shapes;
+/// host events are deliberately this small.
+pub fn host_event(kind: &str, event: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "event": event,
+        "detail": detail,
+    })
+}
+
 /// Write the three review outputs.
 ///
 /// Findings are the session's validated findings (an empty slice is
-/// a legitimately empty review and writes `[]`), the decision log is
-/// the minimal versioned empty object, and the PR-Agent guide is an
-/// empty file until FRG-23 captures a real one.
+/// a legitimately empty review and writes `[]`), the decision log
+/// carries the run's recorded entries (possibly none), and the
+/// PR-Agent guide is an empty file until FRG-23 captures a real one.
 pub fn write_outputs(
     findings: &[Finding],
+    decision_entries: &[serde_json::Value],
     findings_path: &Path,
     decisions_path: &Path,
     pr_agent_path: &Path,
@@ -71,7 +85,7 @@ pub fn write_outputs(
 
     let decision_log = DecisionLog {
         version: 1,
-        entries: Vec::new(),
+        entries: decision_entries.to_vec(),
     };
     let mut decisions = serde_json::to_string_pretty(&decision_log)
         .map_err(|error| format!("failed to serialize Chomp decision log: {error}"))?;
@@ -109,7 +123,7 @@ mod tests {
         let decisions = dir.join("decisions.json");
         let pr_agent = dir.join("pr-agent.md");
 
-        write_outputs(&[], &findings, &decisions, &pr_agent).expect("write outputs");
+        write_outputs(&[], &[], &findings, &decisions, &pr_agent).expect("write outputs");
 
         assert_eq!(
             fs::read_to_string(&findings).expect("read findings"),
@@ -149,6 +163,7 @@ mod tests {
 
         write_outputs(
             std::slice::from_ref(&finding),
+            &[],
             &findings_path,
             &decisions,
             &pr_agent,
@@ -159,6 +174,28 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&findings_path).expect("read findings"))
                 .expect("findings round-trip");
         assert_eq!(written, vec![finding]);
+        fs::remove_dir_all(dir).expect("clean temp dir");
+    }
+
+    #[test]
+    fn decision_entries_are_written_into_the_log() {
+        let dir = temp_dir();
+        let findings = dir.join("findings.json");
+        let decisions = dir.join("decisions.json");
+        let pr_agent = dir.join("pr-agent.md");
+        let entries = vec![host_event(
+            "contract",
+            "entry_absent",
+            "no entry file at AGENTS.md on the base ref; contract channel empty",
+        )];
+
+        write_outputs(&[], &entries, &findings, &decisions, &pr_agent).expect("write outputs");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&decisions).expect("read decisions"))
+                .expect("decisions are JSON");
+        assert_eq!(written["version"], 1);
+        assert_eq!(written["entries"], serde_json::json!(entries));
         fs::remove_dir_all(dir).expect("clean temp dir");
     }
 }
