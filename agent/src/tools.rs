@@ -1,13 +1,21 @@
-//! Read-only repository tools for lens sessions (FRG-18, slices 1-5).
+//! Read-only repository tools for lens sessions (FRG-18).
 //!
-//! Slice scope: the host port trait ([`ToolExecutor`]), root confinement,
-//! the `read_file`, `list_dir`, `grep`, and `read_symbol` tools, a
-//! thread-safe cache of successful records, and fail-closed secret
-//! redaction — all served by [`RepoToolExecutor`]. The executor is
+//! The executor ([`RepoToolExecutor`]) serves the `read_file`,
+//! `list_dir`, `grep`, and `read_symbol` tools over one immutable
+//! snapshot, with root confinement, a thread-safe cache of successful
+//! records, and fail-closed secret redaction. The executor is
 //! constructed from a checkout root plus its head SHA; its only shared
 //! mutable state is the result cache behind a [`std::sync::Mutex`], so
 //! `&self` execution composes with `Arc<dyn ToolExecutor + Send + Sync>`
 //! and concurrent sessions share one cache safely.
+//!
+//! The tool definitions live here too, built from the single source of
+//! truth [`TOOL_NAMES`]: [`TOOLS_SCHEMA_JSON`] is the schema channel
+//! text FRG-19 drops into
+//! [`SessionIoParams`](agent_core::engine::SessionIoParams), and
+//! [`tool_catalog_config`] is the catalog value FRG-19 drops into
+//! `AgentConfig.tool_semantics`. FRG-18 is complete in scope: the
+//! executor plus these definitions are ready for FRG-19 to wire.
 //!
 //! Redaction runs inside the tool inners, before a record reaches the
 //! [`ToolExecutor::execute`] boundary — so every cached record is already
@@ -64,10 +72,8 @@
 //! `truncated`: true for a `found` window that does not cover the
 //! whole file, or an `ambiguous` list that was capped at 10.
 //!
-//! Explicitly NOT in this slice: the tool schemas / `ToolSpec`s —
-//! those land in a later FRG-18 slice. The cache and redaction slices
-//! have landed, so the executor is session-safe with respect to secret
-//! leakage.
+//! The cache and redaction slices have landed, so the executor is
+//! session-safe with respect to secret leakage.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -75,7 +81,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use agent_core::catalog::ToolSpec;
 use agent_core::message::{ToolCallRecord, ToolResultRecord};
+use agent_core::tool_name::ToolName;
+use agent_core::tool_semantics::ToolCatalogConfig;
 use globset::GlobBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -98,6 +107,51 @@ const MAX_SNIPPET_CHARS: usize = 200;
 /// order. `found` always carries exactly one; `ambiguous` carries up
 /// to this many while `truncated` reports whether more existed.
 const MAX_SYMBOL_CANDIDATES: usize = 10;
+
+/// The single source of truth for the FRG-18 tool name set, in schema
+/// order. [`TOOLS_SCHEMA_JSON`], [`tool_specs`], and
+/// [`tool_catalog_config`] are all built from (or checked against)
+/// this array — never from a second hand-typed list.
+pub const TOOL_NAMES: [&str; 4] = ["list_dir", "grep", "read_file", "read_symbol"];
+
+/// The schema channel text for the four FRG-18 tools, in [`TOOL_NAMES`]
+/// order. Each entry carries a `name`, a one-or-two-sentence
+/// `description` (what the tool does, that paths are repo-relative and
+/// confined to the snapshot, and its hard caps), and a `parameters`
+/// object whose `required` array matches the corresponding `Args`
+/// struct exactly. FRG-19 passes this string to
+/// [`SessionIoParams::new`](agent_core::engine::SessionIoParams::new)
+/// as `tools_schema_json`.
+pub const TOOLS_SCHEMA_JSON: &str = r#"[
+  {"name":"list_dir","description":"List one directory of the review snapshot: paths are repo-relative and confined to the snapshot, and at most 200 entries are returned sorted by name.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Repo-relative directory to list; \".\" for the snapshot root."}},"required":["path"],"additionalProperties":false}},
+  {"name":"grep","description":"Search snapshot file contents with a regular expression: paths are repo-relative and confined to the snapshot, and at most 50 hits are returned with 200-character snippets.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression matched against each text line."},"glob":{"type":"string","description":"Optional glob: matched against the file name when it has no slash, else the full repo-relative path."},"path":{"type":"string","description":"Optional file or directory scope; defaults to the snapshot root."}},"required":["pattern"],"additionalProperties":false}},
+  {"name":"read_file","description":"Read a numbered window of one snapshot text file: paths are repo-relative and confined to the snapshot, at most 200 lines are returned per call, and binary files are refused.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Repo-relative file path."},"start_line":{"type":"integer","minimum":1,"description":"Optional 1-based first line; defaults to 1."},"end_line":{"type":"integer","minimum":1,"description":"Optional 1-based last line; defaults to start_line plus 199."}},"required":["path"],"additionalProperties":false}},
+  {"name":"read_symbol","description":"Look up a symbol definition in the snapshot and read a 200-line window around it: paths are repo-relative and confined to the snapshot, and an ambiguous name returns up to 10 candidates.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name; qualified forms search the last segment."},"path":{"type":"string","description":"Optional file or directory hint; defaults to the snapshot root."}},"required":["name"],"additionalProperties":false}}
+]"#;
+
+/// One [`ToolSpec`] per [`TOOL_NAMES`] entry, built from [`TOOL_NAMES`]
+/// itself. Every tool is reproducible (same arguments over the same
+/// snapshot yield the same result), carries no aliases, and needs no
+/// schema hint — the model-facing shape lives in [`TOOLS_SCHEMA_JSON`].
+pub fn tool_specs() -> Vec<ToolSpec> {
+    TOOL_NAMES
+        .iter()
+        .map(|name| ToolSpec {
+            name: ToolName::new(name).expect("static tool names are valid"),
+            aliases: Vec::new(),
+            reproducible: true,
+            schema_hint: None,
+        })
+        .collect()
+}
+
+/// The catalog value FRG-19 drops into `AgentConfig.tool_semantics`:
+/// the FRG-18 tool set with no discovery extras.
+pub fn tool_catalog_config() -> ToolCatalogConfig {
+    ToolCatalogConfig {
+        tools: tool_specs(),
+    }
+}
 
 /// The application port for repository tools — the seam between the
 /// host's session driver (FRG-19) and the filesystem, following the
@@ -3651,6 +3705,121 @@ mod tests {
         // No assignment operator, no identifier-run key: untouched.
         assert_eq!(redact_line("café naïve résumé"), "café naïve résumé");
         assert_eq!(redact_line("token💧 = hunter2"), "token💧 = hunter2");
+    }
+
+    // -- FRG-18 slice 6: tool definitions consistency ------------------------
+
+    #[test]
+    fn tool_definitions_are_consistent() {
+        use agent_core::engine::SessionIoParams;
+
+        // 1. The schema channel parses at the session boundary.
+        SessionIoParams::new(
+            "openrouter".to_string(),
+            200_000,
+            TOOLS_SCHEMA_JSON.to_string(),
+            "system".to_string(),
+        )
+        .expect("tool schema parses");
+
+        // 2. The same name set everywhere, with no duplicates.
+        let schema: serde_json::Value =
+            serde_json::from_str(TOOLS_SCHEMA_JSON).expect("tool schema is JSON");
+        let schema_names: Vec<String> = schema
+            .as_array()
+            .expect("tool schema is an array")
+            .iter()
+            .map(|entry| {
+                entry["name"]
+                    .as_str()
+                    .expect("schema entry has a name")
+                    .to_string()
+            })
+            .collect();
+        let spec_names: Vec<String> = tool_specs()
+            .iter()
+            .map(|spec| spec.name.as_str().to_string())
+            .collect();
+        let catalog_names: Vec<String> = tool_catalog_config()
+            .tools
+            .iter()
+            .map(|spec| spec.name.as_str().to_string())
+            .collect();
+        let tool_names: Vec<String> = TOOL_NAMES.iter().map(|name| name.to_string()).collect();
+        for names in [&schema_names, &spec_names, &catalog_names, &tool_names] {
+            let mut sorted = names.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), 4, "no duplicate tool names: {names:?}");
+        }
+        let mut expected = tool_names.clone();
+        expected.sort();
+        for names in [&schema_names, &spec_names, &catalog_names] {
+            let mut sorted = names.clone();
+            sorted.sort();
+            assert_eq!(sorted, expected, "name set matches TOOL_NAMES");
+        }
+
+        // 3. Dispatch covers exactly the schema names: every TOOL_NAMES
+        // entry with empty arguments fails softly on the arguments —
+        // never as an unknown tool — while a bogus name still does.
+        let fixture = Fixture::new("tooldefs");
+        let executor = fixture.executor();
+        for name in TOOL_NAMES {
+            let result = executor.execute(&call(name, "{}"));
+            assert!(
+                !result.result_json.contains("unknown tool"),
+                "{name} dispatches: {}",
+                result.result_json
+            );
+        }
+        let bogus = executor.execute(&call("no_such_tool", "{}"));
+        assert!(bogus.soft_failure);
+        assert!(
+            bogus.result_json.contains("unknown tool"),
+            "{}",
+            bogus.result_json
+        );
+
+        // 4. Every entry's required array matches its Args struct, and
+        // every entry carries a non-empty description.
+        let expected_required = [
+            ("list_dir", vec!["path"]),
+            ("grep", vec!["pattern"]),
+            ("read_file", vec!["path"]),
+            ("read_symbol", vec!["name"]),
+        ];
+        assert_eq!(
+            schema.as_array().expect("tool schema is an array").len(),
+            expected_required.len(),
+            "schema has exactly one entry per tool"
+        );
+        for (name, required) in expected_required {
+            let entry = schema
+                .as_array()
+                .expect("tool schema is an array")
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap_or_else(|| panic!("schema has an entry for {name}"));
+            let actual: Vec<String> = entry["parameters"]["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} parameters has a required array"))
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{name} required entries are strings"))
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(actual, required, "{name} required matches its Args struct");
+            assert!(
+                entry["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.is_empty()),
+                "{name} has a non-empty description"
+            );
+        }
     }
 
     #[test]
