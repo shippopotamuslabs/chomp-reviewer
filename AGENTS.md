@@ -1,5 +1,24 @@
 # AGENTS.md — forge-reviewer contributor notes
 
+## Gospels
+
+The cross-repo canon lives in the `shippopotamuslabs/gospels` repo,
+pinned in this repo as a submodule at `contracts/gospel/`. Read the
+gospels there; bump the pin deliberately, and never edit the
+submodule's contents from this repo.
+
+- Architecture of the Rust crate (`agent/`) follows
+  `contracts/gospel/ARCHITECTURE-GOSPEL.md` §15, the Rust dialect.
+  §§0–14 state the intent §15 translates; where the two differ for
+  Rust, §15 governs.
+- Anything a person reads — `.forge/prompts/`, posted review
+  comments, docs — follows `contracts/gospel/WUMBO-GOSPEL.md`.
+- Tests follow `contracts/gospel/TESTING-GOSPEL.md`: the general
+  sections apply in full; its Android-specific §6 does not apply
+  here.
+- The UI gospels (Palette, Compose, Glass Bars, Button Shape) do
+  not apply to this repo; it has no UI surface.
+
 ## Tests
 
 - Run: `python3 -m unittest discover -s tests -v` (stdlib only, no network).
