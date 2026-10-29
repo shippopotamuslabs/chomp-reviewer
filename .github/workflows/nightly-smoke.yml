@@ -1,0 +1,34 @@
+name: Nightly live smoke
+
+# FRG-54: one full Chomp review against the real OpenRouter endpoint
+# every night, driven by the ignored live_smoke integration test.
+# It asserts mechanics only (exit 0, output shapes) — model behavior
+# is nondeterministic and is never gated on. A red run is an alert to
+# investigate, not a merge blocker: this workflow is deliberately
+# NOT a required status check and must not be added to branch
+# protection.
+
+on:
+  schedule:
+    # 07:23 UTC — overnight US/Eastern, off the round hour.
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-smoke:
+    name: live-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+      - name: Run the live smoke test
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: cargo test --locked --test live_smoke -- --ignored --nocapture
