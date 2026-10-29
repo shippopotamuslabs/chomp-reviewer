@@ -10,7 +10,6 @@ mod outputs;
 mod pr_agent;
 mod sessions;
 mod synthesis;
-mod tools;
 
 use std::env;
 use std::ffi::OsString;
