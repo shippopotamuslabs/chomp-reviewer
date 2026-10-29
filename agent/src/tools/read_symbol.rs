@@ -8,7 +8,6 @@ use super::confine::normalize_rel_path;
 use super::error::ToolError;
 use super::redaction::{redact_line, BlockTracker};
 use super::render_record;
-use super::soft_failure;
 use super::symbol_shape::is_symbol_definition;
 use super::RepoToolExecutor;
 use super::MAX_READ_LINES;
@@ -104,11 +103,8 @@ impl RepoToolExecutor {
     /// full where the file allows); zero candidates is a `not_found`
     /// success; more than one is an `ambiguous` list with no window,
     /// capped at [`MAX_SYMBOL_CANDIDATES`].
-    pub(super) fn read_symbol(&self, call: &ToolCallRecord) -> ToolResultRecord {
-        match self.read_symbol_inner(call) {
-            Ok(record) => record,
-            Err(error) => soft_failure(call, error),
-        }
+    pub(super) fn read_symbol(&self, call: &ToolCallRecord) -> Result<ToolResultRecord, ToolError> {
+        self.read_symbol_inner(call)
     }
 
     fn read_symbol_inner(&self, call: &ToolCallRecord) -> Result<ToolResultRecord, ToolError> {

@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use super::error::ToolError;
 use super::redaction::{redact_line, BlockTracker};
 use super::render_record;
-use super::soft_failure;
 use super::RepoToolExecutor;
 use super::MAX_READ_LINES;
 
@@ -73,11 +72,8 @@ impl RepoToolExecutor {
     /// line by line: every line is counted and fed to the redaction
     /// block tracker, but only the returned window's lines pay the
     /// pattern-redaction cost or are held in memory.
-    pub(super) fn read_file(&self, call: &ToolCallRecord) -> ToolResultRecord {
-        match self.read_file_inner(call) {
-            Ok(record) => record,
-            Err(error) => soft_failure(call, error),
-        }
+    pub(super) fn read_file(&self, call: &ToolCallRecord) -> Result<ToolResultRecord, ToolError> {
+        self.read_file_inner(call)
     }
 
     fn read_file_inner(&self, call: &ToolCallRecord) -> Result<ToolResultRecord, ToolError> {

@@ -93,10 +93,10 @@ use serde::Serialize;
 
 use self::cache::{cache_key_for, lock_cache, CacheKey};
 use self::confine::SnapshotRoot;
-use self::error::ToolError;
 use self::redaction::redact_line;
 
 pub use self::definitions::{tool_catalog_config, tool_specs, TOOLS_SCHEMA_JSON, TOOL_NAMES};
+pub use self::error::ToolError;
 
 /// Maximum lines one `read_file` call returns.
 const MAX_READ_LINES: usize = 200;
@@ -108,7 +108,12 @@ const MAX_SNIPPET_CHARS: usize = 200;
 /// host's session driver (FRG-19) and the filesystem, following the
 /// [`crate::model_transport::ModelTransport`] precedent. Implementations
 /// never panic on untrusted input: every failure surfaces as a
-/// soft-failure [`ToolResultRecord`].
+/// soft-failure [`ToolResultRecord`] — the model-facing report form.
+/// Host code that needs to *match* a failure instead of showing it to
+/// the model uses the typed surface,
+/// [`RepoToolExecutor::execute_typed`], which returns [`ToolError`]
+/// (ARCHITECTURE §15: typed errors inside the library, reports only
+/// at the edge — and at this port, the model is the edge's reader).
 pub trait ToolExecutor {
     fn execute(&self, call: &ToolCallRecord) -> ToolResultRecord;
 }
@@ -148,24 +153,27 @@ impl RepoToolExecutor {
 
 impl RepoToolExecutor {
     /// Dispatch a call to its tool without consulting the cache.
-    fn dispatch(&self, call: &ToolCallRecord) -> ToolResultRecord {
+    fn dispatch(&self, call: &ToolCallRecord) -> Result<ToolResultRecord, ToolError> {
         match call.name.as_str() {
             "read_file" => self.read_file(call),
             "list_dir" => self.list_dir(call),
             "grep" => self.grep(call),
             "read_symbol" => self.read_symbol(call),
-            _ => soft_failure(
-                call,
-                ToolError::UnknownTool {
-                    name: call.name.clone(),
-                },
-            ),
+            _ => Err(ToolError::UnknownTool {
+                name: call.name.clone(),
+            }),
         }
     }
-}
 
-impl ToolExecutor for RepoToolExecutor {
-    fn execute(&self, call: &ToolCallRecord) -> ToolResultRecord {
+    /// The typed execution surface: like [`ToolExecutor::execute`],
+    /// but failures come back as a matchable [`ToolError`] instead of
+    /// a soft-failure record. This is the host-side API — telemetry,
+    /// policy, and tests match variants here; the record conversion
+    /// happens only in the port implementation below, which renders
+    /// the failure for the model. Successes are the same
+    /// already-redacted records the port returns, cached the same
+    /// way; failures are never cached.
+    pub fn execute_typed(&self, call: &ToolCallRecord) -> Result<ToolResultRecord, ToolError> {
         // Cache boundary: on a hit, clone the stored record and stamp
         // the current call's id on it. The lock is held only for the
         // map lookup/clone and the insert below — never for filesystem
@@ -180,13 +188,22 @@ impl ToolExecutor for RepoToolExecutor {
         if let Some(cached) = lock_cache(&self.cache).get(&key).cloned() {
             let mut hit = cached;
             hit.call_id = call.call_id.clone();
-            return hit;
+            return Ok(hit);
         }
-        let result = self.dispatch(call);
-        if !result.soft_failure {
-            lock_cache(&self.cache).insert(key, result.clone());
+        let result = self.dispatch(call)?;
+        lock_cache(&self.cache).insert(key, result.clone());
+        Ok(result)
+    }
+}
+
+impl ToolExecutor for RepoToolExecutor {
+    fn execute(&self, call: &ToolCallRecord) -> ToolResultRecord {
+        // The port boundary is the one place typed failures become
+        // model-facing reports.
+        match self.execute_typed(call) {
+            Ok(record) => record,
+            Err(error) => soft_failure(call, error),
         }
-        result
     }
 }
 
@@ -362,6 +379,51 @@ mod tests {
         let body = payload(&result);
         assert_eq!(body["error"], "unknown tool: shell_exec");
     }
+    // -- typed surface ------------------------------------------------------
+
+    #[test]
+    fn typed_surface_returns_matchable_errors() {
+        use super::ToolError;
+
+        let fixture = Fixture::new("typed");
+        let executor = fixture.executor();
+
+        // An existing file outside the root, so the escape is real.
+        let outside = fixture.dir.join("../typed-outside.txt");
+        std::fs::write(&outside, "outside\n").expect("write outside file");
+
+        // The same call through both surfaces: typed failure for the
+        // host, soft-failure record for the model.
+        let typed = executor.execute_typed(&call("read_file", &read_args("../typed-outside.txt")));
+        assert!(
+            matches!(typed, Err(ToolError::PathEscapesRoot { .. })),
+            "{typed:?}"
+        );
+        let port = executor.execute(&call("read_file", &read_args("../typed-outside.txt")));
+        assert!(port.soft_failure);
+        std::fs::remove_file(&outside).expect("clean outside file");
+
+        let typed = executor.execute_typed(&call("read_file", &read_args("missing.txt")));
+        assert!(
+            matches!(typed, Err(ToolError::NotFound { .. })),
+            "{typed:?}"
+        );
+
+        let typed = executor.execute_typed(&call("shell_exec", "{}"));
+        assert!(
+            matches!(typed, Err(ToolError::UnknownTool { .. })),
+            "{typed:?}"
+        );
+
+        // Typed successes are the port's successes.
+        fixture.write("ok.txt", "fine\n");
+        let typed = executor
+            .execute_typed(&call("read_file", &read_args("ok.txt")))
+            .expect("typed success");
+        assert!(!typed.soft_failure);
+        assert_eq!(payload(&typed)["content"], "1: fine");
+    }
+
     // -- sharing --------------------------------------------------------------------------
 
     #[test]

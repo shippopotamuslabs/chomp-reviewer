@@ -12,7 +12,6 @@ use super::confine::normalize_rel_path;
 use super::error::ToolError;
 use super::redaction::redact_line;
 use super::render_record;
-use super::soft_failure;
 use super::RepoToolExecutor;
 use super::MAX_SNIPPET_CHARS;
 
@@ -64,11 +63,8 @@ impl RepoToolExecutor {
     /// Serve the `grep` regex search: one hit per matching line, at
     /// most [`MAX_GREP_HITS`] retained in (path, line) order, with the
     /// true count visible through `total_hits` and `truncated`.
-    pub(super) fn grep(&self, call: &ToolCallRecord) -> ToolResultRecord {
-        match self.grep_inner(call) {
-            Ok(record) => record,
-            Err(error) => soft_failure(call, error),
-        }
+    pub(super) fn grep(&self, call: &ToolCallRecord) -> Result<ToolResultRecord, ToolError> {
+        self.grep_inner(call)
     }
 
     fn grep_inner(&self, call: &ToolCallRecord) -> Result<ToolResultRecord, ToolError> {

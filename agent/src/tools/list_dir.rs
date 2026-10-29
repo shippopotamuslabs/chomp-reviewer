@@ -7,7 +7,6 @@ use super::confine::normalize_rel_path;
 use super::error::ToolError;
 use super::redaction::redact_line;
 use super::render_record;
-use super::soft_failure;
 use super::RepoToolExecutor;
 
 /// Maximum entries one `list_dir` call returns, after sorting by name.
@@ -62,11 +61,8 @@ impl RepoToolExecutor {
     /// in the payload, and every entry carries its full repo-relative
     /// path so it can feed a later tool call directly. Entry kinds
     /// come from the entry's own file type without following symlinks.
-    pub(super) fn list_dir(&self, call: &ToolCallRecord) -> ToolResultRecord {
-        match self.list_dir_inner(call) {
-            Ok(record) => record,
-            Err(error) => soft_failure(call, error),
-        }
+    pub(super) fn list_dir(&self, call: &ToolCallRecord) -> Result<ToolResultRecord, ToolError> {
+        self.list_dir_inner(call)
     }
 
     fn list_dir_inner(&self, call: &ToolCallRecord) -> Result<ToolResultRecord, ToolError> {

@@ -1,10 +1,15 @@
 use std::fmt;
 
-/// Typed tool failures. Every failure path lands in one of these
-/// variants; the trait boundary converts each into a soft-failure
-/// `ToolResultRecord` whose `result_json` is `{"error": "<display>"}`.
+/// Typed tool failures: the executor's public error surface
+/// (ARCHITECTURE §15 — library errors are typed and matchable; only
+/// the edge converts them into reports). Every failure path lands in
+/// one of these variants; [`RepoToolExecutor::execute_typed`]
+/// returns them typed, and the [`ToolExecutor`] port boundary
+/// converts each into a soft-failure `ToolResultRecord` whose
+/// `result_json` is `{"error": "<display>"}` — the model-facing
+/// report form.
 #[derive(Debug)]
-pub(crate) enum ToolError {
+pub enum ToolError {
     /// The call's `arguments_json` could not be parsed into the tool's
     /// request shape, or a field value is out of range (empty path,
     /// `start_line` of 0, `end_line` below `start_line`, ...).
