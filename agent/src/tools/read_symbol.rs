@@ -23,9 +23,22 @@ const MAX_SYMBOL_CANDIDATES: usize = 10;
 /// into this, so a missing `name` (or malformed JSON) is a parse
 /// failure. `path` defaults to the root when absent.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ReadSymbolArgs {
     pub(super) name: String,
     pub(super) path: Option<String>,
+}
+
+/// The `read_symbol` outcome as a state space, not a string: the
+/// payload serializes it as `found` / `not_found` / `ambiguous`, and
+/// internal construction can only name a real variant (ARCHITECTURE
+/// §15: statuses are ADTs, never string fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SymbolStatus {
+    Found,
+    NotFound,
+    Ambiguous,
 }
 
 /// One `read_symbol` candidate: the repo-relative path, the 1-based
@@ -48,7 +61,7 @@ struct SymbolCandidate {
 #[derive(Debug, Serialize)]
 struct ReadSymbolPayload {
     name: String,
-    status: String,
+    status: SymbolStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,7 +181,7 @@ impl RepoToolExecutor {
         if candidates.is_empty() {
             let payload = ReadSymbolPayload {
                 name: redact_line(&args.name),
-                status: "not_found".to_string(),
+                status: SymbolStatus::NotFound,
                 path: None,
                 line: None,
                 start_line: None,
@@ -187,7 +200,7 @@ impl RepoToolExecutor {
             candidates.truncate(MAX_SYMBOL_CANDIDATES);
             let payload = ReadSymbolPayload {
                 name: redact_line(&args.name),
-                status: "ambiguous".to_string(),
+                status: SymbolStatus::Ambiguous,
                 path: None,
                 line: None,
                 start_line: None,
@@ -273,7 +286,7 @@ impl RepoToolExecutor {
         let truncated = start_line > 1 || end_line < total_lines;
         let payload = ReadSymbolPayload {
             name: redact_line(&args.name),
-            status: "found".to_string(),
+            status: SymbolStatus::Found,
             path: Some(redact_line(&found.path)),
             line: Some(found.line),
             start_line: Some(start_line),

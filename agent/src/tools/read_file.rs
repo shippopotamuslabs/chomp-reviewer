@@ -14,6 +14,7 @@ use super::MAX_READ_LINES;
 /// The `read_file` request shape: `arguments_json` deserializes into
 /// this, so a missing `path` (or malformed JSON) is a parse failure.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ReadFileArgs {
     pub(super) path: String,
     pub(super) start_line: Option<usize>,
@@ -325,6 +326,23 @@ mod tests {
                 .contains("invalid arguments"),
             "{body}"
         );
+    }
+
+    #[test]
+    fn unknown_argument_fields_are_refused() {
+        // The published schema says additionalProperties: false; the
+        // DTO enforces it, so a misspelled argument fails closed
+        // instead of being silently ignored (ARCHITECTURE §15: DTOs
+        // state an unknown-field policy).
+        let fixture = Fixture::new("unknownfield");
+        fixture.write("a.txt", "one\n");
+        let executor = fixture.executor();
+
+        let args = serde_json::json!({"path": "a.txt", "startline": 1}).to_string();
+        let result = executor.execute(&call("read_file", &args));
+
+        assert!(result.soft_failure);
+        assert!(payload(&result).get("error").is_some());
     }
 
     #[test]

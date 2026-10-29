@@ -24,6 +24,7 @@ const MAX_GREP_HITS: usize = 50;
 /// failure. `path` defaults to the root when absent; `glob` defaults
 /// to matching every walked file.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct GrepArgs {
     pub(super) pattern: String,
     pub(super) glob: Option<String>,

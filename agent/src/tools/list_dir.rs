@@ -16,8 +16,21 @@ const MAX_LIST_ENTRIES: usize = 200;
 /// The `list_dir` request shape: `arguments_json` deserializes into
 /// this, so a missing `path` (or malformed JSON) is a parse failure.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ListDirArgs {
     pub(super) path: String,
+}
+
+/// A `list_dir` entry kind as a state space, not a string: the
+/// payload serializes it as `file` / `dir` / `symlink` / `other`
+/// (ARCHITECTURE §15: statuses are ADTs, never string fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
 }
 
 /// One `list_dir` entry: the full repo-relative path plus the entry's
@@ -25,7 +38,7 @@ pub(super) struct ListDirArgs {
 #[derive(Debug, Serialize)]
 struct ListDirEntry {
     path: String,
-    kind: String,
+    kind: EntryKind,
     size: Option<u64>,
 }
 
@@ -77,7 +90,7 @@ impl RepoToolExecutor {
             path: args.path.clone(),
             message: error.to_string(),
         })?;
-        let mut names: Vec<(String, String, Option<u64>)> = Vec::new();
+        let mut names: Vec<(String, EntryKind, Option<u64>)> = Vec::new();
         for entry in read_dir {
             let entry = entry.map_err(|error| ToolError::Io {
                 path: args.path.clone(),
@@ -90,28 +103,24 @@ impl RepoToolExecutor {
             // Symlinks report as symlinks even when they point at a
             // file or a directory: the type is never followed here.
             let kind = if file_type.is_symlink() {
-                "symlink"
+                EntryKind::Symlink
             } else if file_type.is_dir() {
-                "dir"
+                EntryKind::Dir
             } else if file_type.is_file() {
-                "file"
+                EntryKind::File
             } else {
-                "other"
+                EntryKind::Other
             };
             // `DirEntry::metadata` does not traverse symlinks, so a
             // link reports its own length. Directories carry no size.
             // One entry's unreadable metadata must not fail the whole
             // listing, so it degrades to `None`.
-            let size = if kind == "dir" {
+            let size = if kind == EntryKind::Dir {
                 None
             } else {
                 entry.metadata().ok().map(|metadata| metadata.len())
             };
-            names.push((
-                entry.file_name().to_string_lossy().into_owned(),
-                kind.to_string(),
-                size,
-            ));
+            names.push((entry.file_name().to_string_lossy().into_owned(), kind, size));
         }
         names.sort_by(|left, right| left.0.cmp(&right.0));
         let total_entries = names.len();
