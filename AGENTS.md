@@ -8,9 +8,11 @@ gospels there; bump the pin deliberately, and never edit the
 submodule's contents from this repo.
 
 - Architecture of the Rust crate (`agent/`) follows
-  `contracts/gospel/ARCHITECTURE-GOSPEL.md` §15, the Rust dialect.
-  §§0–14 state the intent §15 translates; where the two differ for
-  Rust, §15 governs.
+  `contracts/gospel/RUST-ARCHITECTURE-GOSPEL.md` — the dependency
+  rule in Rust form: crates as boundaries, traits only at genuine
+  ports, checked facts as types, typed errors. (Its sibling,
+  `ARCHITECTURE-GOSPEL.md`, is the Android/Kotlin statement of the
+  same intent; it does not govern this repo.)
 - Anything a person reads — `.forge/prompts/`, posted review
   comments, docs — follows `contracts/gospel/WUMBO-GOSPEL.md`.
 - Tests follow `contracts/gospel/TESTING-GOSPEL.md`: the general
