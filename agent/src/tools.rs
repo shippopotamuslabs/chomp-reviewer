@@ -1,10 +1,19 @@
-//! Read-only repository tools for lens sessions (FRG-18, slices 1-4).
+//! Read-only repository tools for lens sessions (FRG-18, slices 1-5).
 //!
 //! Slice scope: the host port trait ([`ToolExecutor`]), root confinement,
-//! and the `read_file`, `list_dir`, `grep`, and `read_symbol` tools,
-//! served by [`RepoToolExecutor`]. The executor is constructed from a
-//! checkout root plus its head SHA and shares nothing mutable, so
-//! `&self` execution composes with `Arc<dyn ToolExecutor + Send + Sync>`.
+//! the `read_file`, `list_dir`, `grep`, and `read_symbol` tools, a
+//! thread-safe cache of successful records, and fail-closed secret
+//! redaction — all served by [`RepoToolExecutor`]. The executor is
+//! constructed from a checkout root plus its head SHA; its only shared
+//! mutable state is the result cache behind a [`std::sync::Mutex`], so
+//! `&self` execution composes with `Arc<dyn ToolExecutor + Send + Sync>`
+//! and concurrent sessions share one cache safely.
+//!
+//! Redaction runs inside the tool inners, before a record reaches the
+//! [`ToolExecutor::execute`] boundary — so every cached record is already
+//! redacted, and the executor is session-safe with respect to secret
+//! leakage. One executor serves one immutable snapshot for one review, so
+//! the cache is unbounded by design and entries never need invalidation.
 //!
 //! The settled `read_file` payload shape is `{"path": <repo-relative
 //! path as given>, "start_line": <requested start>, "end_line": <last
@@ -55,13 +64,16 @@
 //! `truncated`: true for a `found` window that does not cover the
 //! whole file, or an `ambiguous` list that was capped at 10.
 //!
-//! Explicitly NOT in this slice: the result cache, redaction, and tool
-//! schemas / `ToolSpec`s — those land in later FRG-18 slices. This
-//! executor must not be wired into sessions until redaction lands.
+//! Explicitly NOT in this slice: the tool schemas / `ToolSpec`s —
+//! those land in a later FRG-18 slice. The cache and redaction slices
+//! have landed, so the executor is session-safe with respect to secret
+//! leakage.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use agent_core::message::{ToolCallRecord, ToolResultRecord};
 use globset::GlobBuilder;
@@ -98,11 +110,14 @@ pub trait ToolExecutor {
 
 /// The concrete filesystem executor: serves reads confined under
 /// `root` (canonicalized once in [`RepoToolExecutor::new`]) and stamps
-/// nothing itself — `head_sha` is carried so later slices (and the
-/// driver) can attribute reads to the snapshot they describe.
+/// nothing itself — `head_sha` is carried so the cache keys (and the
+/// driver) can attribute reads to the snapshot they describe. The cache
+/// holds only successful, already-redacted records: redaction happens in
+/// the tool inners, before [`ToolExecutor::execute`] can insert.
 pub struct RepoToolExecutor {
     root: PathBuf,
     head_sha: String,
+    cache: Mutex<HashMap<CacheKey, ToolResultRecord>>,
 }
 
 impl RepoToolExecutor {
@@ -110,7 +125,11 @@ impl RepoToolExecutor {
     /// later [`ToolExecutor::execute`] compares canonical paths.
     pub fn new(root: PathBuf, head_sha: String) -> std::io::Result<Self> {
         let root = root.canonicalize()?;
-        Ok(Self { root, head_sha })
+        Ok(Self {
+            root,
+            head_sha,
+            cache: Mutex::new(HashMap::new()),
+        })
     }
 
     /// The canonicalized checkout root reads are confined under.
@@ -176,25 +195,16 @@ impl RepoToolExecutor {
                 "arguments are not a valid read_file request: {error}"
             ))
         })?;
-        let start = args.start_line.unwrap_or(1);
-        if start == 0 {
-            return Err(ToolError::InvalidArguments(
-                "start_line must be at least 1".to_string(),
-            ));
-        }
-        let default_end = start.saturating_add(MAX_READ_LINES - 1);
-        let mut end = match args.end_line {
-            Some(end) => {
-                if end == 0 || end < start {
-                    return Err(ToolError::InvalidArguments(
-                        "end_line must be at least start_line and at least 1".to_string(),
-                    ));
-                }
-                end
-            }
-            None => default_end,
-        };
-        end = end.min(start.saturating_add(MAX_READ_LINES - 1));
+        // The effective window shares [`effective_read_window`] with the
+        // cache key so dispatch and caching can never disagree on what
+        // "the same arguments" means.
+        let (start, end) =
+            effective_read_window(args.start_line, args.end_line).ok_or_else(|| {
+                ToolError::InvalidArguments(
+                    "start_line must be at least 1 and end_line must be at least start_line"
+                        .to_string(),
+                )
+            })?;
 
         let candidate = self.confine(&args.path)?;
         let metadata = fs::metadata(&candidate).map_err(|error| ToolError::Io {
@@ -218,7 +228,10 @@ impl RepoToolExecutor {
         let text = String::from_utf8(bytes).map_err(|_| ToolError::BinaryFile {
             path: args.path.clone(),
         })?;
-        let lines: Vec<&str> = text.lines().collect();
+        // Redact before numbering: block state carries across the whole
+        // window while line counts and numbers are preserved.
+        let redacted = redact_text(&text);
+        let lines: Vec<&str> = redacted.lines().collect();
         let total_lines = lines.len();
         // `last` is the 1-based number of the final returned line;
         // `start - 1` when nothing is returned (start past EOF, or an
@@ -340,15 +353,17 @@ impl RepoToolExecutor {
         names.sort_by(|left, right| left.0.cmp(&right.0));
         let total_entries = names.len();
         let truncated = total_entries > MAX_LIST_ENTRIES;
-        let listed = normalize_list_path(&args.path);
+        // Entry paths are repository-derived text, so a secret-shaped
+        // file name is redacted here before it lands in the payload.
+        let listed = redact_line(&normalize_list_path(&args.path));
         let entries: Vec<ListDirEntry> = names
             .into_iter()
             .take(MAX_LIST_ENTRIES)
             .map(|(name, kind, size)| ListDirEntry {
                 path: if listed == "." {
-                    name
+                    redact_line(&name)
                 } else {
-                    format!("{listed}/{name}")
+                    redact_line(&format!("{listed}/{name}"))
                 },
                 kind,
                 size,
@@ -469,10 +484,15 @@ impl RepoToolExecutor {
                 if regex.is_match(line) {
                     total_hits += 1;
                     if hits.len() < MAX_GREP_HITS {
+                        // Snippets carry raw file text, so each one is
+                        // redacted as a single line before it lands in
+                        // the payload (a `-----BEGIN` marker redacts the
+                        // snippet line on its own).
+                        let snippet: String = line.chars().take(MAX_SNIPPET_CHARS).collect();
                         hits.push(GrepHit {
-                            path: rel.clone(),
+                            path: redact_line(rel),
                             line: index + 1,
-                            snippet: line.chars().take(MAX_SNIPPET_CHARS).collect(),
+                            snippet: redact_line(&snippet),
                         });
                     }
                 }
@@ -654,10 +674,15 @@ impl RepoToolExecutor {
             };
             for (index, line) in text.lines().enumerate() {
                 if is_symbol_definition(line, needle) {
+                    // The snippet is redacted now; the path stays raw
+                    // here because `found` re-reads the file through it
+                    // below — paths are redacted when the payload is
+                    // built (see [`redact_symbol_paths`]).
+                    let snippet: String = line.chars().take(MAX_SNIPPET_CHARS).collect();
                     candidates.push(SymbolCandidate {
                         path: rel.clone(),
                         line: index + 1,
-                        snippet: line.chars().take(MAX_SNIPPET_CHARS).collect(),
+                        snippet: redact_line(&snippet),
                     });
                 }
             }
@@ -692,7 +717,7 @@ impl RepoToolExecutor {
                 end_line: None,
                 total_lines: None,
                 content: None,
-                candidates,
+                candidates: redact_symbol_paths(candidates),
                 truncated,
                 note: Some("Multiple definition candidates; pass path to narrow.".to_string()),
             };
@@ -712,7 +737,11 @@ impl RepoToolExecutor {
         let text = String::from_utf8(bytes).map_err(|_| ToolError::BinaryFile {
             path: found.path.clone(),
         })?;
-        let lines: Vec<&str> = text.lines().collect();
+        // Redact before numbering, exactly like `read_file`: block
+        // state carries across the whole window while line counts and
+        // numbers are preserved.
+        let redacted = redact_text(&text);
+        let lines: Vec<&str> = redacted.lines().collect();
         let total_lines = lines.len();
         // The file held the candidate a moment ago, so it is
         // non-empty and covers the definition line; a concurrent
@@ -741,13 +770,13 @@ impl RepoToolExecutor {
         let payload = ReadSymbolPayload {
             name: args.name.clone(),
             status: "found".to_string(),
-            path: Some(found.path.clone()),
+            path: Some(redact_line(&found.path)),
             line: Some(found.line),
             start_line: Some(start_line),
             end_line: Some(end_line),
             total_lines: Some(total_lines),
             content: Some(content),
-            candidates,
+            candidates: redact_symbol_paths(candidates),
             truncated,
             note: None,
         };
@@ -775,8 +804,9 @@ impl RepoToolExecutor {
     }
 }
 
-impl ToolExecutor for RepoToolExecutor {
-    fn execute(&self, call: &ToolCallRecord) -> ToolResultRecord {
+impl RepoToolExecutor {
+    /// Dispatch a call to its tool without consulting the cache.
+    fn dispatch(&self, call: &ToolCallRecord) -> ToolResultRecord {
         match call.name.as_str() {
             "read_file" => self.read_file(call),
             "list_dir" => self.list_dir(call),
@@ -790,6 +820,162 @@ impl ToolExecutor for RepoToolExecutor {
             ),
         }
     }
+}
+
+impl ToolExecutor for RepoToolExecutor {
+    fn execute(&self, call: &ToolCallRecord) -> ToolResultRecord {
+        // Cache boundary: on a hit, clone the stored record and stamp
+        // the current call's id on it. The lock is held only for the
+        // map lookup/clone and the insert below — never for filesystem
+        // work. Two threads missing the same key concurrently may both
+        // compute it (a benign duplicate read of an immutable snapshot);
+        // the second insert simply overwrites the first with an equal
+        // record. Only successes are cached: the tool inners return
+        // already-redacted records, so the cache never holds secrets.
+        let Some(key) = cache_key_for(&self.head_sha, call) else {
+            return self.dispatch(call);
+        };
+        if let Some(cached) = lock_cache(&self.cache).get(&key).cloned() {
+            let mut hit = cached;
+            hit.call_id = call.call_id.clone();
+            return hit;
+        }
+        let result = self.dispatch(call);
+        if !result.soft_failure {
+            lock_cache(&self.cache).insert(key, result.clone());
+        }
+        result
+    }
+}
+
+/// Recover the cache guard without panicking: a poisoned mutex still
+/// holds a usable map, and a cache must never fail a tool call.
+fn lock_cache<'a>(
+    cache: &'a Mutex<HashMap<CacheKey, ToolResultRecord>>,
+) -> MutexGuard<'a, HashMap<CacheKey, ToolResultRecord>> {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The cache key: the snapshot plus the canonical effective arguments.
+/// Only calls whose key is `Some` are cacheable; anything the tools
+/// would soft-fail on (unparseable arguments, an invalid window) has no
+/// key and dispatches uncached.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CacheKey {
+    ReadFile {
+        head_sha: String,
+        path: String,
+        start: usize,
+        end: usize,
+    },
+    ListDir {
+        head_sha: String,
+        path: String,
+    },
+    Grep {
+        head_sha: String,
+        pattern: String,
+        glob: Option<String>,
+        scope: String,
+    },
+    ReadSymbol {
+        head_sha: String,
+        name: String,
+        scope: String,
+    },
+}
+
+/// Compute the cache key for a call, or `None` when the call is not
+/// cacheable (an unknown tool, unparseable arguments, or arguments that
+/// dispatch would soft-fail on). Normalization mirrors the tools: the
+/// `read_file` window uses [`effective_read_window`], the `list_dir`
+/// scope uses [`normalize_list_path`], and the `grep` / `read_symbol`
+/// scopes default to `"."` exactly as the inners do.
+fn cache_key_for(head_sha: &str, call: &ToolCallRecord) -> Option<CacheKey> {
+    match call.name.as_str() {
+        "read_file" => {
+            let args: ReadFileArgs = serde_json::from_str(&call.arguments_json).ok()?;
+            if args.path.is_empty() {
+                return None;
+            }
+            let (start, end) = effective_read_window(args.start_line, args.end_line)?;
+            Some(CacheKey::ReadFile {
+                head_sha: head_sha.to_string(),
+                path: args.path,
+                start,
+                end,
+            })
+        }
+        "list_dir" => {
+            let args: ListDirArgs = serde_json::from_str(&call.arguments_json).ok()?;
+            if args.path.is_empty() {
+                return None;
+            }
+            Some(CacheKey::ListDir {
+                head_sha: head_sha.to_string(),
+                path: normalize_list_path(&args.path),
+            })
+        }
+        "grep" => {
+            let args: GrepArgs = serde_json::from_str(&call.arguments_json).ok()?;
+            if args.pattern.is_empty() {
+                return None;
+            }
+            let raw_scope = args.path.as_deref().unwrap_or(".");
+            if raw_scope.is_empty() {
+                return None;
+            }
+            Some(CacheKey::Grep {
+                head_sha: head_sha.to_string(),
+                pattern: args.pattern,
+                glob: args.glob,
+                scope: normalize_list_path(raw_scope),
+            })
+        }
+        "read_symbol" => {
+            let args: ReadSymbolArgs = serde_json::from_str(&call.arguments_json).ok()?;
+            if args.name.trim().is_empty() {
+                return None;
+            }
+            let raw_scope = args.path.as_deref().unwrap_or(".");
+            if raw_scope.is_empty() {
+                return None;
+            }
+            Some(CacheKey::ReadSymbol {
+                head_sha: head_sha.to_string(),
+                name: args.name,
+                scope: normalize_list_path(raw_scope),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The canonical `read_file` window: `start_line` defaults to 1,
+/// `end_line` defaults to `start_line + 199`, always clamped to at most
+/// [`MAX_READ_LINES`] lines. Returns `None` for an invalid window — a
+/// zero `start_line`, or an `end_line` that is zero or below `start` —
+/// which dispatch reports as a soft failure. Shared by
+/// [`RepoToolExecutor::read_file_inner`] and [`cache_key_for`] so the
+/// two can never drift apart.
+fn effective_read_window(start: Option<usize>, end: Option<usize>) -> Option<(usize, usize)> {
+    let effective_start = start.unwrap_or(1);
+    if effective_start == 0 {
+        return None;
+    }
+    let cap = effective_start.saturating_add(MAX_READ_LINES - 1);
+    let effective_end = match end {
+        Some(requested) => {
+            if requested == 0 || requested < effective_start {
+                return None;
+            }
+            requested.min(cap)
+        }
+        None => cap,
+    };
+    Some((effective_start, effective_end))
 }
 
 /// Typed tool failures. Every failure path lands in one of these
@@ -1289,9 +1475,297 @@ fn file_name_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Redact `read_symbol` candidate paths for the payload. The single
+/// `found` candidate keeps its raw path through the file re-read above;
+/// every path is redacted here, at the last step before serialization.
+fn redact_symbol_paths(candidates: Vec<SymbolCandidate>) -> Vec<SymbolCandidate> {
+    candidates
+        .into_iter()
+        .map(|candidate| SymbolCandidate {
+            path: redact_line(&candidate.path),
+            line: candidate.line,
+            snippet: candidate.snippet,
+        })
+        .collect()
+}
+
+/// Fail-closed secret redaction (FRG-18 slice 5). Every pattern is
+/// compiled once behind a [`OnceLock`]; matching is line-oriented so
+/// line counts and line numbers never shift, and the replacement token
+/// is always exactly `<redacted>`. When in doubt the value is redacted:
+/// a bare word that merely names a secret without an assignment
+/// operator is left alone, but any `key`/`=`-style assignment whose key
+/// denotes a secret by meaning loses its value.
+struct Redactor {
+    auth_header: Regex,
+    jwt: Regex,
+    github_token: Regex,
+    gitlab_token: Regex,
+    aws_key_id: Regex,
+    slack_token: Regex,
+    openai_key: Regex,
+    bearer_token: Regex,
+    url_password: Regex,
+    secret_assignment: Regex,
+    generic_assignment: Regex,
+}
+
+impl Redactor {
+    fn new() -> Self {
+        // Each literal below is fixed and valid; a failure here is a
+        // programming error, never untrusted input.
+        let compile = |pattern: &str| Regex::new(pattern).expect("redaction pattern compiles");
+        Self {
+            // `Authorization: <anything>` — the whole credential tail.
+            auth_header: compile(
+                r#"(?i)("Authorization"|Authorization)\s*:\s*("[^"]*"|'[^']*'|.+)"#,
+            ),
+            // Three base64url segments opening with `eyJ`.
+            jwt: compile(r"eyJ[A-Za-z0-9_\-]*\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
+            // GitHub `gh[pousr]_` tokens (at least 20 token chars).
+            github_token: compile(r"gh[prous]_[A-Za-z0-9]{20,}"),
+            gitlab_token: compile(r"glpat-[A-Za-z0-9_\-]+"),
+            aws_key_id: compile(r"(AKIA|ASIA)[A-Z0-9]{16}"),
+            slack_token: compile(r"xox[baprs]-[A-Za-z0-9\-]+"),
+            // `sk-` / `sk-proj-` keys (at least 20 token chars).
+            openai_key: compile(r"sk-(?:proj-)?[A-Za-z0-9_\-]{20,}"),
+            // The credential after a `Bearer` / `Basic` scheme word.
+            bearer_token: compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9_\-\.=~+/]+"),
+            // The password in `scheme://user:password@host`.
+            url_password: compile(r"([A-Za-z][A-Za-z0-9+.\-]*://[^/\s:@?#]+:)([^/\s@?#]+)(@)"),
+            // A value assigned to a secret-denoting key: the key holds
+            // one of the secret segments (`secret`, `token`, `password`,
+            // `passwd`, `credential`, `api-key` / `apikey`, `access-key`,
+            // `auth`, `private-key`, `session-key`, `signing-key`,
+            // `encryption-key`, case-insensitive, camelCase included)
+            // followed by `:` or `=` and a quoted or bare value.
+            secret_assignment: compile(
+                r#"(?i)([A-Za-z0-9_.$\-]*?(?:secret|passwd|password|token|credential|api[_-]?key|access[_-]?key|auth|private[_-]?key|session[_-]?key|signing[_-]?key|encryption[_-]?key)[A-Za-z0-9_.$\-]*)(?:["'])?\s*([:=])\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;]+)"#,
+            ),
+            // A candidate assignment of any key shape: a key of
+            // identifier characters whose words may be space-separated
+            // (as in `application programming interface key`), an
+            // optional closing quote, `:` or `=`, and a quoted or bare
+            // value. The key is greedy over its identifier run, so
+            // `mytokenize = v` classifies on the whole key rather than
+            // a suffix of it; a leading quote stays outside the match
+            // and is preserved untouched. This pattern never classifies
+            // on its own: [`key_denotes_secret`] decides in code whether
+            // the key denotes a secret by meaning.
+            generic_assignment: compile(
+                r#"([A-Za-z0-9_.$\-]+(?:[ \t]+[A-Za-z0-9_.$\-]+)*)(["']?)\s*([:=])\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;]+)"#,
+            ),
+        }
+    }
+
+    fn redact_one_line(&self, line: &str) -> String {
+        // The authorization header consumes its whole tail first so a
+        // later pattern can never see a fragment of it; the scheme-word
+        // pattern runs before the generic assignment so credentials
+        // after a scheme word are fully removed.
+        let owned = self.auth_header.replace_all(line, "${1}: <redacted>");
+        let owned = self.jwt.replace_all(&owned, "<redacted>");
+        let owned = self.github_token.replace_all(&owned, "<redacted>");
+        let owned = self.gitlab_token.replace_all(&owned, "<redacted>");
+        let owned = self.aws_key_id.replace_all(&owned, "<redacted>");
+        let owned = self.slack_token.replace_all(&owned, "<redacted>");
+        let owned = self.openai_key.replace_all(&owned, "<redacted>");
+        let owned = self.bearer_token.replace_all(&owned, "${1} <redacted>");
+        let owned = self.url_password.replace_all(&owned, "${1}<redacted>${3}");
+        // The enumerated assignment pattern runs first so every key it
+        // already covered keeps its exact historical string; the
+        // meaning-based pass below only adds coverage for keys the
+        // enumeration cannot name.
+        let owned = self
+            .secret_assignment
+            .replace_all(&owned, "${1}${2} <redacted>");
+        self.redact_generic_assignments(&owned)
+    }
+
+    /// Redact the values of candidate assignments whose key denotes a
+    /// secret by meaning ([`key_denotes_secret`]), one overlapping
+    /// candidate at a time: a non-secret key advances a single
+    /// character so a secret assignment nested behind it (as in `info:
+    /// session_id = v`, where `session_id` first parses as the value)
+    /// is still examined. Only the value is replaced; the key, any
+    /// closing quote, and the separator are preserved verbatim. Never
+    /// panics on untrusted text: every index is a regex match boundary
+    /// or a `char` boundary derived from one.
+    fn redact_generic_assignments(&self, line: &str) -> String {
+        let mut redacted = String::with_capacity(line.len());
+        let mut pos = 0;
+        while pos < line.len() {
+            let Some(captures) = self.generic_assignment.captures_at(line, pos) else {
+                redacted.push_str(&line[pos..]);
+                break;
+            };
+            let whole = captures.get(0).expect("assignment match covers itself");
+            let key = captures.get(1).map(|key| key.as_str()).unwrap_or("");
+            redacted.push_str(&line[pos..whole.start()]);
+            if key_denotes_secret(key) {
+                let close = captures.get(2).map(|quote| quote.as_str()).unwrap_or("");
+                let separator = captures.get(3).map(|sep| sep.as_str()).unwrap_or("");
+                redacted.push_str(key);
+                redacted.push_str(close);
+                redacted.push_str(separator);
+                redacted.push_str(" <redacted>");
+                pos = whole.end();
+            } else {
+                let step = line[whole.start()..]
+                    .chars()
+                    .next()
+                    .expect("assignment match is non-empty")
+                    .len_utf8();
+                let next = whole.start() + step;
+                redacted.push_str(&line[whole.start()..next]);
+                pos = next;
+            }
+        }
+        redacted
+    }
+}
+
+/// Subtokens marking an assignment key as secret-denoting. The
+/// check is whole-subtoken equality after splitting the key on `_`,
+/// `-`, `.`, `$`, whitespace, and camelCase humps, so `master_key`
+/// (via `key`), `databasePassphrase` (via `passphrase`), and
+/// `application programming interface key` (via `key`) all classify
+/// while prose without an assignment operator never reaches this
+/// check. `authorization` and `authenticate` keep parity with the
+/// enumerated pattern's `auth` substring for `=`-shaped assignments
+/// (the `:` shape is already consumed by the header pattern).
+const SECRET_MEANING_SUBTOKENS: &[&str] = &[
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+    "password",
+    "passwords",
+    "passwd",
+    "passphrase",
+    "passcode",
+    "pwd",
+    "credential",
+    "credentials",
+    "auth",
+    "authentication",
+    "authorization",
+    "authenticate",
+    "key",
+    "keys",
+    "cookie",
+    "cookies",
+    "session",
+    "private",
+    "dsn",
+];
+
+/// Whether an assignment key denotes a secret by meaning: split the
+/// key into subtokens and check each against
+/// [`SECRET_MEANING_SUBTOKENS`]. Fail closed on shape, open on prose:
+/// an empty key never denotes a secret (there is nothing to name a
+/// value with), while any single secret-meaning subtoken redacts the
+/// value even when sibling subtokens look benign (`token_count`).
+/// Never panics on untrusted text: all splitting is on `char`
+/// boundaries.
+fn key_denotes_secret(raw_key: &str) -> bool {
+    let key = raw_key
+        .trim()
+        .trim_matches(|next: char| next == '"' || next == '\'');
+    if key.is_empty() {
+        return false;
+    }
+    for chunk in key.split(|next: char| {
+        next == '_' || next == '-' || next == '.' || next == '$' || next.is_whitespace()
+    }) {
+        if chunk.is_empty() {
+            continue;
+        }
+        for subtoken in split_camel_humps(chunk) {
+            if SECRET_MEANING_SUBTOKENS.contains(&subtoken.to_lowercase().as_str()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Split one separator-free chunk on camelCase humps: a boundary sits
+/// before an uppercase letter following a lowercase letter or digit
+/// (`databasePassphrase` into `database` + `Passphrase`), and before
+/// an uppercase letter following capitals when a lowercase letter
+/// comes next (`APIKey` into `API` + `Key`). Slices are cut at the
+/// `char_indices` boundaries, so multi-byte text cannot misalign them.
+fn split_camel_humps(chunk: &str) -> Vec<&str> {
+    let indices: Vec<(usize, char)> = chunk.char_indices().collect();
+    if indices.is_empty() {
+        return Vec::new();
+    }
+    let mut starts = vec![0usize];
+    for (position, (index, next)) in indices.iter().enumerate() {
+        if position == 0 || !next.is_uppercase() {
+            continue;
+        }
+        let previous = indices[position - 1].1;
+        let next_is_lower = indices
+            .get(position + 1)
+            .is_some_and(|(_, after)| after.is_lowercase());
+        if previous.is_lowercase() || previous.is_numeric() || next_is_lower {
+            starts.push(*index);
+        }
+    }
+    starts.push(chunk.len());
+    starts
+        .windows(2)
+        .map(|pair| &chunk[pair[0]..pair[1]])
+        .collect()
+}
+
+fn redactor() -> &'static Redactor {
+    static INSTANCE: OnceLock<Redactor> = OnceLock::new();
+    INSTANCE.get_or_init(Redactor::new)
+}
+
+/// Redact one repository-derived line: a `-----BEGIN` / `-----END`
+/// marker line redacts as a whole on its own (single-line callers have
+/// no block state to carry), anything else runs the inline patterns.
+fn redact_line(line: &str) -> String {
+    if line.contains("-----BEGIN") || line.contains("-----END") {
+        return "<redacted>".to_string();
+    }
+    redactor().redact_one_line(line)
+}
+
+/// Redact whole text (a `read_file` / `read_symbol` window) line by
+/// line so line counts and numbers never shift. A line holding
+/// `-----BEGIN ... PRIVATE KEY-----` starts block state: the header
+/// line, every line inside, and the `-----END ...` line are each
+/// replaced by one `<redacted>` line. An unterminated block redacts
+/// through the end of the input (fail closed).
+fn redact_text(text: &str) -> String {
+    let mut redacted: Vec<String> = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        if !in_block && line.contains("-----BEGIN") && line.contains("PRIVATE KEY") {
+            in_block = true;
+            redacted.push("<redacted>".to_string());
+        } else if in_block {
+            redacted.push("<redacted>".to_string());
+            if line.contains("-----END") {
+                in_block = false;
+            }
+        } else {
+            redacted.push(redact_line(line));
+        }
+    }
+    redacted.join("\n")
+}
+
 fn soft_failure(call: &ToolCallRecord, error: ToolError) -> ToolResultRecord {
+    // Error text is repository-derived too (paths echo the request), so
+    // it is redacted as a single line before it lands in the payload.
     let result_json = serde_json::to_string(&ErrorPayload {
-        error: error.to_string(),
+        error: redact_line(&error.to_string()),
     })
     .unwrap_or_else(|_| r#"{"error":"cannot render tool error"}"#.to_string());
     ToolResultRecord {
@@ -2733,5 +3207,471 @@ mod tests {
                 assert_eq!(body["content"], "1: alpha\n2: beta");
             }
         });
+    }
+
+    // -- result cache ---------------------------------------------------------
+
+    fn call_with_id(id: &str, name: &str, arguments_json: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            call_id: id.to_string(),
+            name: name.to_string(),
+            arguments_json: arguments_json.to_string(),
+            attempt_metadata: None,
+            repair_metadata: None,
+        }
+    }
+
+    #[test]
+    fn read_file_cache_hit_returns_original_with_new_call_id() {
+        let fixture = Fixture::new("cachehit");
+        fixture.write("doc.txt", "version one\n");
+        let executor = fixture.executor();
+
+        let first = executor.execute(&call("read_file", &read_args("doc.txt")));
+        assert!(!first.soft_failure);
+        assert_eq!(payload(&first)["content"], "1: version one");
+
+        // Mutate on disk, then read again with identical effective
+        // arguments but a different JSON shape/order and the defaults
+        // spelled out explicitly.
+        fixture.write("doc.txt", "version two\n");
+        let restated =
+            serde_json::json!({"end_line": 200, "start_line": 1, "path": "doc.txt"}).to_string();
+        let second = executor.execute(&call_with_id("call-2", "read_file", &restated));
+
+        assert!(!second.soft_failure);
+        assert_eq!(second.call_id, "call-2");
+        assert_eq!(
+            payload(&second)["content"],
+            "1: version one",
+            "the cached record wins over the mutated file"
+        );
+    }
+
+    #[test]
+    fn soft_failures_are_not_cached() {
+        let fixture = Fixture::new("cacheneg");
+        let executor = fixture.executor();
+
+        let missing = executor.execute(&call("read_file", &read_args("missing.txt")));
+        assert!(missing.soft_failure);
+
+        fixture.write("missing.txt", "now here\n");
+        let found = executor.execute(&call("read_file", &read_args("missing.txt")));
+
+        assert!(
+            !found.soft_failure,
+            "a soft failure must not poison the cache"
+        );
+        assert_eq!(payload(&found)["content"], "1: now here");
+    }
+
+    #[test]
+    fn read_file_cache_is_per_effective_window() {
+        let fixture = Fixture::new("cachewindow");
+        fixture.write("w.txt", "one\ntwo\nthree\n");
+        let executor = fixture.executor();
+
+        let first = executor.execute(&call("read_file", &read_args("w.txt")));
+        assert!(!first.soft_failure);
+        assert_eq!(payload(&first)["content"], "1: one\n2: two\n3: three");
+
+        fixture.write("w.txt", "uno\ndos\ntres\n");
+        let args = serde_json::json!({"path": "w.txt", "start_line": 2}).to_string();
+        let second = executor.execute(&call("read_file", &args));
+
+        assert!(!second.soft_failure);
+        assert_eq!(
+            payload(&second)["content"],
+            "2: dos\n3: tres",
+            "a different start_line is a different key and re-reads"
+        );
+    }
+
+    #[test]
+    fn concurrent_cached_reads_share_correct_content() {
+        let fixture = Fixture::new("cachethreads");
+        fixture.write("a.txt", "alpha\n");
+        fixture.write("b.txt", "beta\n");
+        let executor: Arc<dyn ToolExecutor + Send + Sync> = Arc::new(fixture.executor());
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for index in 0..8 {
+                let target = if index % 2 == 0 { "a.txt" } else { "b.txt" };
+                let worker = Arc::clone(&executor);
+                handles.push(scope.spawn(move || {
+                    let result = worker.execute(&call("read_file", &read_args(target)));
+                    (target.to_string(), result)
+                }));
+            }
+            for handle in handles {
+                let (target, result) = handle.join().expect("worker threads join");
+                assert!(!result.soft_failure, "{target} must succeed");
+                let expected = if target == "a.txt" {
+                    "1: alpha"
+                } else {
+                    "1: beta"
+                };
+                assert_eq!(payload(&result)["content"], expected, "{target}");
+            }
+        });
+    }
+
+    #[test]
+    fn grep_results_are_cached() {
+        let fixture = Fixture::new("cachegrep");
+        fixture.write("g.txt", "needle one\n");
+        let executor = fixture.executor();
+
+        let first = executor.execute(&call("grep", &grep_args("needle", None, None)));
+        assert!(!first.soft_failure);
+        assert_eq!(payload(&first)["total_hits"], 1);
+
+        fixture.write("g.txt", "needle one\nneedle two\n");
+        let second = executor.execute(&call("grep", &grep_args("needle", None, None)));
+
+        assert!(!second.soft_failure);
+        assert_eq!(
+            payload(&second)["total_hits"],
+            1,
+            "the cached hit list wins over the mutated file"
+        );
+    }
+
+    #[test]
+    fn list_dir_results_are_cached() {
+        let fixture = Fixture::new("cachelist");
+        fixture.write("a.txt", "aye\n");
+        let executor = fixture.executor();
+
+        let first = executor.execute(&call("list_dir", &list_args(".")));
+        assert!(!first.soft_failure);
+        assert_eq!(payload(&first)["total_entries"], 1);
+
+        fixture.write("b.txt", "bee\n");
+        let second = executor.execute(&call("list_dir", &list_args(".")));
+
+        assert!(!second.soft_failure);
+        assert_eq!(
+            payload(&second)["total_entries"],
+            1,
+            "the cached listing wins over the mutated directory"
+        );
+    }
+
+    #[test]
+    fn read_symbol_results_are_cached() {
+        let fixture = Fixture::new("cachesym");
+        fixture.write("s.rs", "fn capture() {}\n");
+        let executor = fixture.executor();
+
+        let first = executor.execute(&call("read_symbol", &symbol_args("capture", None)));
+        assert!(!first.soft_failure);
+        assert_eq!(payload(&first)["status"], "found");
+
+        // A second definition would turn a fresh lookup ambiguous; the
+        // cached `found` record wins instead.
+        fixture.write("s.rs", "fn capture() {}\nfn capture() {}\n");
+        let second = executor.execute(&call("read_symbol", &symbol_args("capture", None)));
+
+        assert!(!second.soft_failure);
+        assert_eq!(payload(&second)["status"], "found");
+        assert_eq!(payload(&second)["line"], 1);
+    }
+
+    // -- redaction ------------------------------------------------------------
+
+    #[test]
+    fn redactor_covers_secret_shapes() {
+        let cases = [
+            (
+                "OPENAI_API_KEY=sk-abcdefghij1234567890XY",
+                "abcdefghij1234567890",
+            ),
+            ("OPENAI_API_KEY=sk-proj-abcdefghij1234567890XY", "sk-proj-"),
+            ("\"client_secret\": \"s3cr3t-value-99\"", "s3cr3t-value-99"),
+            ("authToken = 'hunter2-value'", "hunter2"),
+            ("service_credential_value=topsecret1", "topsecret1"),
+            ("password: hunter2", "hunter2"),
+            (
+                "Authorization: Bearer abcdef1234567890",
+                "abcdef1234567890",
+            ),
+            ("token = Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("aws_key = AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+            (
+                "deploy_key = ghp_abcdefghij1234567890XY",
+                "ghp_abcdefghij1234567890",
+            ),
+            ("ci_token: glpat-abcdefghij1234567890", "glpat-abcdefghij"),
+            ("slack = xoxb-123456789012-abcdefghij", "xoxb-123456789012"),
+            (
+                "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c end",
+                "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV",
+            ),
+            (
+                "clone https://deploy:hunter2pw@git.example.com/repo.git now",
+                "hunter2pw",
+            ),
+        ];
+        for (input, secret) in cases {
+            let redacted = redact_line(input);
+            assert!(
+                !redacted.contains(secret),
+                "{input} must lose its secret: {redacted}"
+            );
+            assert!(
+                redacted.contains("<redacted>"),
+                "{input} must carry the replacement token: {redacted}"
+            );
+        }
+        // The URL user survives while the password does not.
+        let url = redact_line("clone https://deploy:hunter2pw@git.example.com/repo.git now");
+        assert!(url.contains("deploy"), "{url}");
+    }
+
+    #[test]
+    fn redactor_preserves_private_key_line_count() {
+        let key = [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "MIIEpAIBAAKCAQEA7bQxabc123",
+            "QUJDRA==more-base64",
+            "-----END RSA PRIVATE KEY-----",
+        ]
+        .join("\n");
+        let redacted = redact_text(&key);
+        let lines: Vec<&str> = redacted.lines().collect();
+        assert_eq!(lines.len(), 4, "block redaction preserves line count");
+        assert!(lines.iter().all(|line| *line == "<redacted>"), "{redacted}");
+        assert!(!redacted.contains("MIIEpAIB"), "{redacted}");
+
+        // An unterminated block redacts through the end (fail closed).
+        let unterminated = "header\n-----BEGIN EC PRIVATE KEY-----\nQUJDRA==\ntail\n";
+        let redacted = redact_text(unterminated);
+        let lines: Vec<&str> = redacted.lines().collect();
+        assert_eq!(lines.len(), 4, "{redacted}");
+        assert_eq!(lines[0], "header");
+        assert!(lines[1..].iter().all(|line| *line == "<redacted>"));
+        assert!(!redacted.contains("QUJDRA"), "{redacted}");
+
+        // A lone marker line redacts on its own in single-line mode.
+        assert_eq!(
+            redact_line("snippet -----BEGIN RSA PRIVATE KEY----- tail"),
+            "<redacted>"
+        );
+    }
+
+    #[test]
+    fn redactor_leaves_benign_text_untouched() {
+        for benign in [
+            "the token count is 3",
+            "pub fn tokenize(input) {",
+            "commit 0123456789abcdef0123456789abcdef01234567",
+            "contact the author of this file",
+        ] {
+            assert_eq!(redact_line(benign), benign, "{benign} must pass through");
+        }
+        assert_eq!(
+            redact_text("line one\nline two\n"),
+            "line one\nline two",
+            "plain multi-line text keeps its lines"
+        );
+    }
+
+    #[test]
+    fn tool_results_redact_secrets() {
+        let password = "hunter2-value-99";
+        let api_secret = "ghp_abcdefghij1234567890XY";
+        let fixture = Fixture::new("redacttools");
+        fixture.write(
+            "leak.rs",
+            &format!("fn capture() {{}} // password={password}\napi_key = \"{api_secret}\"\n"),
+        );
+        let executor = fixture.executor();
+
+        let read = executor.execute(&call("read_file", &read_args("leak.rs")));
+        assert!(!read.soft_failure);
+        assert!(
+            read.result_json.contains("<redacted>"),
+            "{}",
+            read.result_json
+        );
+        assert!(!read.result_json.contains(password), "{}", read.result_json);
+        assert!(
+            !read.result_json.contains(api_secret),
+            "{}",
+            read.result_json
+        );
+
+        let grepped = executor.execute(&call("grep", &grep_args("password", None, None)));
+        assert!(!grepped.soft_failure);
+        let body = payload(&grepped);
+        assert_eq!(body["total_hits"], 1);
+        let snippet = body["hits"][0]["snippet"]
+            .as_str()
+            .expect("snippet is a string");
+        assert!(snippet.contains("<redacted>"), "{snippet}");
+        assert!(
+            !grepped.result_json.contains(password),
+            "{}",
+            grepped.result_json
+        );
+
+        let symbol = executor.execute(&call("read_symbol", &symbol_args("capture", None)));
+        assert!(!symbol.soft_failure);
+        let body = payload(&symbol);
+        assert_eq!(body["status"], "found");
+        let content = body["content"].as_str().expect("content is a string");
+        assert!(content.contains("<redacted>"), "{content}");
+        let candidate = body["candidates"][0]["snippet"]
+            .as_str()
+            .expect("candidate snippet is a string");
+        assert!(candidate.contains("<redacted>"), "{candidate}");
+        assert!(
+            !symbol.result_json.contains(password),
+            "{}",
+            symbol.result_json
+        );
+        assert!(
+            !symbol.result_json.contains(api_secret),
+            "{}",
+            symbol.result_json
+        );
+    }
+
+    #[test]
+    fn redactor_covers_secret_meaning_assignments() {
+        let cases = [
+            ("master_key = \"topsecret-master-1\"", "topsecret-master-1"),
+            (
+                "\"databasePassphrase\": \"topsecret-db-2\"",
+                "topsecret-db-2",
+            ),
+            (
+                "application_programming_interface_key = \"topsecret-api-3\"",
+                "topsecret-api-3",
+            ),
+            (
+                "\"session_id\": \"topsecret-session-4\"",
+                "topsecret-session-4",
+            ),
+            (
+                "cookie = \"sessionid=topsecret-cookie-5\"",
+                "topsecret-cookie-5",
+            ),
+            (
+                "application programming interface key = \"topsecret-spaced-6\"",
+                "topsecret-spaced-6",
+            ),
+            (
+                "encryptionPassphrase = \"topsecret-enc-7\"",
+                "topsecret-enc-7",
+            ),
+        ];
+        for (input, secret) in cases {
+            let redacted = redact_line(input);
+            assert!(
+                !redacted.contains(secret),
+                "{input} must lose its secret: {redacted}"
+            );
+            assert!(
+                redacted.contains("<redacted>"),
+                "{input} must carry the replacement token: {redacted}"
+            );
+        }
+        // Only the value is redacted: the key, any closing quote, and
+        // the separator survive verbatim (up to the historical single
+        // space after the separator).
+        assert_eq!(
+            redact_line("master_key = \"topsecret-master-1\""),
+            "master_key= <redacted>"
+        );
+        assert_eq!(
+            redact_line("\"session_id\": \"topsecret-session-4\""),
+            "\"session_id\": <redacted>"
+        );
+        assert_eq!(
+            redact_line("cookie = \"sessionid=topsecret-cookie-5\""),
+            "cookie= <redacted>"
+        );
+        // A secret assignment nested behind a benign one on the same
+        // line is still found: `info` parses first with `session_id`
+        // as its value, then the scan re-examines the overlap.
+        let nested = redact_line("info: session_id = topsecret-nested-8");
+        assert!(!nested.contains("topsecret-nested-8"), "{nested}");
+        assert!(nested.contains("<redacted>"), "{nested}");
+    }
+
+    #[test]
+    fn read_file_redacts_secret_meaning_assignments() {
+        let fixture = Fixture::new("redactmeaning");
+        fixture.write(
+            "config.env",
+            "master_key = \"topsecret-master-1\"\n\"session_id\": \"topsecret-session-4\"\nplain line here\n",
+        );
+        let executor = fixture.executor();
+
+        let result = executor.execute(&call("read_file", &read_args("config.env")));
+
+        assert!(!result.soft_failure);
+        assert!(
+            !result.result_json.contains("topsecret-master-1"),
+            "{}",
+            result.result_json
+        );
+        assert!(
+            !result.result_json.contains("topsecret-session-4"),
+            "{}",
+            result.result_json
+        );
+        assert!(
+            result.result_json.contains("<redacted>"),
+            "{}",
+            result.result_json
+        );
+        assert!(
+            result.result_json.contains("plain line here"),
+            "{}",
+            result.result_json
+        );
+    }
+
+    #[test]
+    fn secret_meaning_redaction_is_unicode_safe() {
+        // Multi-byte text adjacent to (or inside) an assignment never
+        // panics, and a secret value with non-ASCII characters still
+        // redacts through the quoted-value shape.
+        let redacted = redact_line("🔑 session_id = \"topsecret-unicode-1\"");
+        assert!(!redacted.contains("topsecret-unicode-1"), "{redacted}");
+        assert!(redacted.contains("<redacted>"), "{redacted}");
+        let redacted = redact_line("session_id = \"sécret-unicode-2\"");
+        assert!(!redacted.contains("sécret-unicode-2"), "{redacted}");
+        assert!(redacted.contains("<redacted>"), "{redacted}");
+        // No assignment operator, no identifier-run key: untouched.
+        assert_eq!(redact_line("café naïve résumé"), "café naïve résumé");
+        assert_eq!(redact_line("token💧 = hunter2"), "token💧 = hunter2");
+    }
+
+    #[test]
+    fn list_dir_redacts_secret_shaped_names() {
+        let token = "ghp_abcdefghij1234567890XY";
+        let fixture = Fixture::new("redactname");
+        fixture.write(&format!("{token}.txt"), "x\n");
+        let executor = fixture.executor();
+
+        let result = executor.execute(&call("list_dir", &list_args(".")));
+
+        assert!(!result.soft_failure);
+        assert!(
+            !result.result_json.contains(token),
+            "{}",
+            result.result_json
+        );
+        assert!(
+            result.result_json.contains("<redacted>"),
+            "{}",
+            result.result_json
+        );
     }
 }
