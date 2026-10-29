@@ -53,7 +53,7 @@ pub(super) enum CacheKey {
 /// dispatch would soft-fail on). Normalization mirrors the tools: the
 /// `read_file` window uses
 /// [`effective_read_window`](super::read_file::effective_read_window),
-/// the `list_dir` scope uses
+/// paths and scopes use
 /// [`normalize_rel_path`](super::confine::normalize_rel_path), and the
 /// `grep` / `read_symbol`
 /// scopes default to `"."` exactly as the inners do.
@@ -67,7 +67,7 @@ pub(super) fn cache_key_for(head_sha: &str, call: &ToolCallRecord) -> Option<Cac
             let (start, end) = effective_read_window(args.start_line, args.end_line)?;
             Some(CacheKey::ReadFile {
                 head_sha: head_sha.to_string(),
-                path: args.path,
+                path: normalize_rel_path(&args.path),
                 start,
                 end,
             })
@@ -150,6 +150,26 @@ mod tests {
             payload(&second)["content"],
             "1: version one",
             "the cached record wins over the mutated file"
+        );
+    }
+
+    #[test]
+    fn read_file_cache_normalizes_path_spelling() {
+        let fixture = Fixture::new("cachespell");
+        fixture.write("doc.txt", "version one\n");
+        let executor = fixture.executor();
+
+        let first = executor.execute(&call("read_file", &read_args("./doc.txt")));
+        assert!(!first.soft_failure);
+
+        fixture.write("doc.txt", "version two\n");
+        let second = executor.execute(&call("read_file", &read_args("doc.txt")));
+
+        assert!(!second.soft_failure);
+        assert_eq!(
+            payload(&second)["content"],
+            "1: version one",
+            "./doc.txt and doc.txt share one cache entry"
         );
     }
 

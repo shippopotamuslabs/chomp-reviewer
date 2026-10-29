@@ -1,10 +1,12 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 
 use agent_core::message::{ToolCallRecord, ToolResultRecord};
 use serde::{Deserialize, Serialize};
 
 use super::error::ToolError;
-use super::redaction::redact_text;
+use super::redaction::{redact_line, BlockTracker};
+use super::render_record;
 use super::soft_failure;
 use super::RepoToolExecutor;
 use super::MAX_READ_LINES;
@@ -62,11 +64,14 @@ pub(super) fn effective_read_window(
 }
 
 impl RepoToolExecutor {
-    /// Serve the only implemented tool: a numbered `read_file` window.
-    /// Lines are 1-based; `start_line` defaults to 1 and `end_line`
-    /// defaults to `start_line + 199`, always clamped to at most
-    /// [`MAX_READ_LINES`] lines. Reading past EOF (and empty files) is
-    /// a success with empty content.
+    /// Serve `read_file`: a numbered window of one snapshot text
+    /// file. Lines are 1-based; `start_line` defaults to 1 and
+    /// `end_line` defaults to `start_line + 199`, always clamped to at
+    /// most [`MAX_READ_LINES`] lines. Reading past EOF (and empty
+    /// files) is a success with empty content. The file is streamed
+    /// line by line: every line is counted and fed to the redaction
+    /// block tracker, but only the returned window's lines pay the
+    /// pattern-redaction cost or are held in memory.
     pub(super) fn read_file(&self, call: &ToolCallRecord) -> ToolResultRecord {
         match self.read_file_inner(call) {
             Ok(record) => record,
@@ -101,39 +106,58 @@ impl RepoToolExecutor {
                 path: args.path.clone(),
             });
         }
-        let bytes = fs::read(candidate.as_path()).map_err(|error| ToolError::Io {
+        let file = File::open(candidate.as_path()).map_err(|error| ToolError::Io {
             path: args.path.clone(),
             message: error.to_string(),
         })?;
-        if bytes.contains(&0) {
-            return Err(ToolError::BinaryFile {
-                path: args.path.clone(),
-            });
+        // Stream the file once: count every line (a NUL byte or an
+        // invalid-UTF-8 line anywhere makes the file binary, exactly
+        // as the whole-file read judged it), carry private-key block
+        // state across the whole file, and keep only the window.
+        let mut tracker = BlockTracker::new();
+        let mut total_lines: usize = 0;
+        let mut window: Vec<String> = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidData {
+                    ToolError::BinaryFile {
+                        path: args.path.clone(),
+                    }
+                } else {
+                    ToolError::Io {
+                        path: args.path.clone(),
+                        message: error.to_string(),
+                    }
+                }
+            })?;
+            if line.contains('\0') {
+                return Err(ToolError::BinaryFile {
+                    path: args.path.clone(),
+                });
+            }
+            total_lines += 1;
+            let block = tracker.classify(&line);
+            if (start..=end).contains(&total_lines) {
+                window.push(if block {
+                    "<redacted>".to_string()
+                } else {
+                    redact_line(&line)
+                });
+            }
         }
-        let text = String::from_utf8(bytes).map_err(|_| ToolError::BinaryFile {
-            path: args.path.clone(),
-        })?;
-        // Redact before numbering: block state carries across the whole
-        // window while line counts and numbers are preserved.
-        let redacted = redact_text(&text);
-        let lines: Vec<&str> = redacted.lines().collect();
-        let total_lines = lines.len();
-        // `last` is the 1-based number of the final returned line;
+        // `end_line` is the 1-based number of the final returned line;
         // `start - 1` when nothing is returned (start past EOF, or an
-        // empty file). `truncated` is true whenever the tree holds more
+        // empty file). `truncated` is true whenever the file holds more
         // lines than that — including a small requested subwindow.
-        let last = end.min(total_lines);
         let (content, end_line) = if start > total_lines {
             (String::new(), start - 1)
         } else {
-            let numbered: Vec<String> = lines
+            let numbered: Vec<String> = window
                 .iter()
-                .skip(start - 1)
-                .take(last - start + 1)
                 .enumerate()
                 .map(|(index, line)| format!("{}: {line}", start + index))
                 .collect();
-            (numbered.join("\n"), last)
+            (numbered.join("\n"), end.min(total_lines))
         };
         let truncated = total_lines > end_line;
         let note = truncated.then(|| {
@@ -144,7 +168,7 @@ impl RepoToolExecutor {
             )
         });
         let payload = ReadFilePayload {
-            path: args.path.clone(),
+            path: redact_line(&args.path),
             start_line: start,
             end_line,
             total_lines,
@@ -152,16 +176,7 @@ impl RepoToolExecutor {
             truncated,
             note,
         };
-        let result_json = serde_json::to_string(&payload)
-            .map_err(|error| ToolError::Render(error.to_string()))?;
-        Ok(ToolResultRecord {
-            call_id: call.call_id.clone(),
-            result_json,
-            truncated: payload.truncated,
-            soft_failure: false,
-            activated_tool_names: Vec::new(),
-            result_metadata: None,
-        })
+        render_record(call, &payload, truncated)
     }
 }
 
@@ -479,6 +494,68 @@ mod tests {
         assert!(result.soft_failure);
         assert_eq!(result.call_id, "call-1");
         assert!(payload(&result).get("error").is_some());
+    }
+
+    // -- regression: review fixes --------------------------------------
+
+    #[test]
+    fn trailing_blank_line_is_a_counted_line() {
+        let fixture = Fixture::new("blankline");
+        fixture.write("a.txt", "a\n\n");
+        let executor = fixture.executor();
+
+        let result = executor.execute(&call("read_file", &read_args("a.txt")));
+
+        assert!(!result.soft_failure);
+        let body = payload(&result);
+        assert_eq!(body["total_lines"], 2);
+        assert_eq!(body["end_line"], 2);
+        assert_eq!(body["content"], "1: a\n2: ");
+    }
+
+    #[test]
+    fn key_block_starting_before_the_window_still_redacts_inside_it() {
+        let fixture = Fixture::new("blockwindow");
+        let mut lines: Vec<String> = (1..=210).map(|n| format!("line {n}")).collect();
+        lines[198] = "-----BEGIN RSA PRIVATE KEY-----".to_string();
+        lines[199] = "SECRETBODYLINE".to_string();
+        lines[200] = "-----END RSA PRIVATE KEY-----".to_string();
+        lines[201] = "after".to_string();
+        fixture.write("key.txt", &lines.join("\n"));
+        let executor = fixture.executor();
+
+        let args = serde_json::json!({"path": "key.txt", "start_line": 200}).to_string();
+        let result = executor.execute(&call("read_file", &args));
+
+        assert!(!result.soft_failure);
+        assert!(
+            !result.result_json.contains("SECRETBODYLINE"),
+            "{}",
+            result.result_json
+        );
+        let body = payload(&result);
+        let content = body["content"].as_str().expect("content is a string");
+        assert!(content.contains("200: <redacted>"), "{content}");
+        assert!(content.contains("201: <redacted>"), "{content}");
+        assert!(content.contains("202: after"), "{content}");
+    }
+
+    #[test]
+    fn secret_shaped_file_name_is_redacted_in_the_payload_path() {
+        let token = "ghp_abcdefghij1234567890XY";
+        let fixture = Fixture::new("tokenname");
+        fixture.write(&format!("{token}.txt"), "benign\n");
+        let executor = fixture.executor();
+
+        let result = executor.execute(&call("read_file", &read_args(&format!("{token}.txt"))));
+
+        assert!(!result.soft_failure);
+        assert!(
+            !result.result_json.contains(token),
+            "{}",
+            result.result_json
+        );
+        assert_eq!(payload(&result)["path"], "<redacted>.txt");
     }
 
     #[cfg(unix)]

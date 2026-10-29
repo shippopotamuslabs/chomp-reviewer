@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::confine::normalize_rel_path;
 use super::error::ToolError;
 use super::redaction::redact_line;
+use super::render_record;
 use super::soft_failure;
 use super::RepoToolExecutor;
 
@@ -141,16 +142,7 @@ impl RepoToolExecutor {
             truncated,
             note,
         };
-        let result_json = serde_json::to_string(&payload)
-            .map_err(|error| ToolError::Render(error.to_string()))?;
-        Ok(ToolResultRecord {
-            call_id: call.call_id.clone(),
-            result_json,
-            truncated: payload.truncated,
-            soft_failure: false,
-            activated_tool_names: Vec::new(),
-            result_metadata: None,
-        })
+        render_record(call, &payload, payload.truncated)
     }
 }
 

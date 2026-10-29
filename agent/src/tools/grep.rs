@@ -11,6 +11,7 @@ use crate::snapshot::{LOCKFILES, PRUNED_DIRS};
 use super::confine::normalize_rel_path;
 use super::error::ToolError;
 use super::redaction::redact_line;
+use super::render_record;
 use super::soft_failure;
 use super::RepoToolExecutor;
 use super::MAX_SNIPPET_CHARS;
@@ -120,7 +121,7 @@ impl RepoToolExecutor {
                 })
                 .collect()
         } else {
-            self.walk_grep_scope(candidate.as_path(), &listed)?
+            self.walk_scope(candidate.as_path(), &listed)?
                 .into_iter()
                 .filter(|rel| {
                     matcher.as_ref().is_none_or(|matcher| {
@@ -174,26 +175,20 @@ impl RepoToolExecutor {
             )
         });
         let payload = GrepPayload {
-            pattern: args.pattern.clone(),
-            path: listed,
-            glob: args.glob.clone(),
+            // Echo fields are requester-supplied text: they pass
+            // through the line redactor like every other output, so
+            // searching for a secret does not re-emit it.
+            pattern: redact_line(&args.pattern),
+            path: redact_line(&listed),
+            glob: args.glob.as_deref().map(redact_line),
             hits,
             total_hits,
             truncated,
             note,
         };
-        let result_json = serde_json::to_string(&payload)
-            .map_err(|error| ToolError::Render(error.to_string()))?;
-        Ok(ToolResultRecord {
-            call_id: call.call_id.clone(),
-            result_json,
-            truncated: payload.truncated,
-            soft_failure: false,
-            activated_tool_names: Vec::new(),
-            result_metadata: None,
-        })
+        render_record(call, &payload, payload.truncated)
     }
-    /// Walk a `grep` directory scope and return the candidate
+    /// Walk a directory scope for `grep` and `read_symbol` and return the candidate
     /// repo-relative file paths in ascending order, mirroring the
     /// snapshot walk's discipline: directories named in
     /// [`PRUNED_DIRS`] are never descended (at any depth below the
@@ -206,7 +201,7 @@ impl RepoToolExecutor {
     /// included: only the named lists prune. The scope itself must be
     /// a directory; `scope_rel` is its normalized repo-relative path
     /// (`"."` for the root).
-    pub(super) fn walk_grep_scope(
+    pub(super) fn walk_scope(
         &self,
         scope: &Path,
         scope_rel: &str,
@@ -220,7 +215,13 @@ impl RepoToolExecutor {
         let mut stack: Vec<(PathBuf, String)> = vec![(scope.to_path_buf(), base)];
         while let Some((dir, rel)) = stack.pop() {
             let read_dir = fs::read_dir(&dir).map_err(|error| ToolError::Io {
-                path: dir.to_string_lossy().into_owned(),
+                // Errors speak repo-relative paths like every other
+                // tool error, never the host's absolute checkout path.
+                path: if rel.is_empty() {
+                    scope_rel.to_string()
+                } else {
+                    rel.clone()
+                },
                 message: error.to_string(),
             })?;
             for entry in read_dir {
@@ -583,6 +584,24 @@ mod tests {
         let hits = body["hits"].as_array().expect("hits is an array");
         assert_eq!(hits[0]["path"], "ok.txt");
         assert_eq!(hits[0]["line"], 1);
+    }
+
+    #[test]
+    fn grep_pattern_echo_is_redacted() {
+        let token = "ghp_abcdefghij1234567890XY";
+        let fixture = Fixture::new("greppecho");
+        fixture.write("holder.txt", &format!("the token is {token} ok\n"));
+        let executor = fixture.executor();
+
+        let result = executor.execute(&call("grep", &grep_args(token, None, None)));
+
+        assert!(!result.soft_failure);
+        assert!(
+            !result.result_json.contains(token),
+            "{}",
+            result.result_json
+        );
+        assert_eq!(payload(&result)["pattern"], "<redacted>");
     }
 
     #[cfg(unix)]

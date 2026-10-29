@@ -9,11 +9,20 @@ use regex::Regex;
 /// a bare word that merely names a secret without an assignment
 /// operator is left alone, but any `key`/`=`-style assignment whose key
 /// denotes a secret by meaning loses its value.
+///
+/// Known limit: an *unquoted multi-word* secret value loses only its
+/// first word (`db_password = correct horse battery staple` redacts
+/// `correct` and leaves `horse battery staple`), because the bare-value
+/// shape cannot know where an unquoted value ends. Quoted values are
+/// redacted in full.
 struct Redactor {
     auth_header: Regex,
     jwt: Regex,
     github_token: Regex,
+    github_pat: Regex,
     gitlab_token: Regex,
+    npm_token: Regex,
+    google_api_key: Regex,
     aws_key_id: Regex,
     slack_token: Regex,
     openai_key: Regex,
@@ -37,7 +46,13 @@ impl Redactor {
             jwt: compile(r"eyJ[A-Za-z0-9_\-]*\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
             // GitHub `gh[pousr]_` tokens (at least 20 token chars).
             github_token: compile(r"gh[prous]_[A-Za-z0-9]{20,}"),
+            // GitHub fine-grained personal access tokens.
+            github_pat: compile(r"github_pat_[A-Za-z0-9_]{20,}"),
             gitlab_token: compile(r"glpat-[A-Za-z0-9_\-]+"),
+            // npm access tokens (`npm_` plus 36 token chars).
+            npm_token: compile(r"npm_[A-Za-z0-9]{36}"),
+            // Google API keys (`AIza` plus 35 token chars).
+            google_api_key: compile(r"AIza[A-Za-z0-9_\-]{35}"),
             aws_key_id: compile(r"(AKIA|ASIA)[A-Z0-9]{16}"),
             slack_token: compile(r"xox[baprs]-[A-Za-z0-9\-]+"),
             // `sk-` / `sk-proj-` keys (at least 20 token chars).
@@ -79,7 +94,10 @@ impl Redactor {
         let owned = self.auth_header.replace_all(line, "${1}: <redacted>");
         let owned = self.jwt.replace_all(&owned, "<redacted>");
         let owned = self.github_token.replace_all(&owned, "<redacted>");
+        let owned = self.github_pat.replace_all(&owned, "<redacted>");
         let owned = self.gitlab_token.replace_all(&owned, "<redacted>");
+        let owned = self.npm_token.replace_all(&owned, "<redacted>");
+        let owned = self.google_api_key.replace_all(&owned, "<redacted>");
         let owned = self.aws_key_id.replace_all(&owned, "<redacted>");
         let owned = self.slack_token.replace_all(&owned, "<redacted>");
         let owned = self.openai_key.replace_all(&owned, "<redacted>");
@@ -97,13 +115,15 @@ impl Redactor {
 
     /// Redact the values of candidate assignments whose key denotes a
     /// secret by meaning ([`key_denotes_secret`]), one overlapping
-    /// candidate at a time: a non-secret key advances a single
-    /// character so a secret assignment nested behind it (as in `info:
-    /// session_id = v`, where `session_id` first parses as the value)
-    /// is still examined. Only the value is replaced; the key, any
-    /// closing quote, and the separator are preserved verbatim. Never
-    /// panics on untrusted text: every index is a regex match boundary
-    /// or a `char` boundary derived from one.
+    /// candidate at a time: a non-secret candidate advances the scan
+    /// to just inside its value, so a secret assignment nested behind
+    /// it (as in `info: session_id = v`, where `session_id` first
+    /// parses as the value) is still examined, while a line packed
+    /// with benign assignments is not rescanned a character at a time.
+    /// Only the value is replaced; the key, any closing quote, and
+    /// the separator are preserved verbatim. Never panics on untrusted
+    /// text: every index is a regex match boundary or a `char`
+    /// boundary derived from one.
     fn redact_generic_assignments(&self, line: &str) -> String {
         let mut redacted = String::with_capacity(line.len());
         let mut pos = 0;
@@ -124,12 +144,15 @@ impl Redactor {
                 redacted.push_str(" <redacted>");
                 pos = whole.end();
             } else {
-                let step = line[whole.start()..]
-                    .chars()
-                    .next()
-                    .expect("assignment match is non-empty")
-                    .len_utf8();
-                let next = whole.start() + step;
+                // Skip the key and separator in one hop; resume at
+                // the value's first character so a nested assignment
+                // starting exactly there (`info: session_id = v`,
+                // where `session_id` first parses as `info`'s value)
+                // is still examined as its own candidate.
+                let next = captures
+                    .get(4)
+                    .map(|value| value.start())
+                    .unwrap_or(whole.start() + 1);
                 redacted.push_str(&line[whole.start()..next]);
                 pos = next;
             }
@@ -249,36 +272,66 @@ pub(super) fn redact_line(line: &str) -> String {
     redactor().redact_one_line(line)
 }
 
-/// Redact whole text (a `read_file` / `read_symbol` window) line by
-/// line so line counts and numbers never shift. A line holding
-/// `-----BEGIN ... PRIVATE KEY-----` starts block state: the header
-/// line, every line inside, and the `-----END ...` line are each
-/// replaced by one `<redacted>` line. An unterminated block redacts
-/// through the end of the input (fail closed).
-pub(super) fn redact_text(text: &str) -> String {
-    let mut redacted: Vec<String> = Vec::new();
-    let mut in_block = false;
-    for line in text.lines() {
-        if !in_block && line.contains("-----BEGIN") && line.contains("PRIVATE KEY") {
-            in_block = true;
-            redacted.push("<redacted>".to_string());
-        } else if in_block {
-            redacted.push("<redacted>".to_string());
-            if line.contains("-----END") {
-                in_block = false;
-            }
-        } else {
-            redacted.push(redact_line(line));
-        }
+/// Private-key block state for streaming redaction: feed every line
+/// through [`BlockTracker::classify`] in order, and a line it reports
+/// as block-consumed renders as one `<redacted>` line; any other line
+/// renders through [`redact_line`]. A line holding `-----BEGIN ...
+/// PRIVATE KEY-----` starts block state: the header line, every line
+/// inside, and the `-----END ...` line are each block-consumed. An
+/// unterminated block consumes through the end of the input (fail
+/// closed). Line counts and numbers never shift, and callers only pay
+/// the pattern cost for lines they actually render — the tracker lets
+/// `read_file` / `read_symbol` stream a file and redact just the
+/// returned window while block state still carries across it.
+#[derive(Debug, Default)]
+pub(super) struct BlockTracker {
+    in_block: bool,
+}
+
+impl BlockTracker {
+    pub(super) fn new() -> Self {
+        Self::default()
     }
-    redacted.join("\n")
+
+    /// Advance the block state over `line`; true when the line is
+    /// part of a private-key block (its header, body, or end line)
+    /// and must render as `<redacted>` wholesale.
+    pub(super) fn classify(&mut self, line: &str) -> bool {
+        if !self.in_block && line.contains("-----BEGIN") && line.contains("PRIVATE KEY") {
+            self.in_block = true;
+            return true;
+        }
+        if self.in_block {
+            if line.contains("-----END") {
+                self.in_block = false;
+            }
+            return true;
+        }
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::super::ToolExecutor;
-    use super::{redact_line, redact_text};
+    use super::{redact_line, BlockTracker};
+
+    /// Fold a whole text through the block tracker, the way the
+    /// streaming callers render a full window.
+    fn redact_all(text: &str) -> String {
+        let mut tracker = BlockTracker::new();
+        text.lines()
+            .map(|line| {
+                if tracker.classify(line) {
+                    "<redacted>".to_string()
+                } else {
+                    redact_line(line)
+                }
+            })
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
 
     // -- redaction ------------------------------------------------------------
 
@@ -303,6 +356,18 @@ mod tests {
             (
                 "deploy_key = ghp_abcdefghij1234567890XY",
                 "ghp_abcdefghij1234567890",
+            ),
+            (
+                "leaked github_pat_11ABCDEFG0HqlZ9xK2mN4pQ7rS8tU6v in a comment",
+                "github_pat_11ABCDEFG0",
+            ),
+            (
+                "npm_abcdefghij1234567890ABCDEFGHIJ123456 in a log line",
+                "npm_abcdefghij1234567890",
+            ),
+            (
+                "google AIzaSyA1234567890abcdefghijklmnopqrstuv here",
+                "AIzaSyA1234567890",
             ),
             ("ci_token: glpat-abcdefghij1234567890", "glpat-abcdefghij"),
             ("slack = xoxb-123456789012-abcdefghij", "xoxb-123456789012"),
@@ -340,7 +405,7 @@ mod tests {
             "-----END RSA PRIVATE KEY-----",
         ]
         .join("\n");
-        let redacted = redact_text(&key);
+        let redacted = redact_all(&key);
         let lines: Vec<&str> = redacted.lines().collect();
         assert_eq!(lines.len(), 4, "block redaction preserves line count");
         assert!(lines.iter().all(|line| *line == "<redacted>"), "{redacted}");
@@ -348,7 +413,7 @@ mod tests {
 
         // An unterminated block redacts through the end (fail closed).
         let unterminated = "header\n-----BEGIN EC PRIVATE KEY-----\nQUJDRA==\ntail\n";
-        let redacted = redact_text(unterminated);
+        let redacted = redact_all(unterminated);
         let lines: Vec<&str> = redacted.lines().collect();
         assert_eq!(lines.len(), 4, "{redacted}");
         assert_eq!(lines[0], "header");
@@ -373,7 +438,7 @@ mod tests {
             assert_eq!(redact_line(benign), benign, "{benign} must pass through");
         }
         assert_eq!(
-            redact_text("line one\nline two\n"),
+            redact_all("line one\nline two\n"),
             "line one\nline two",
             "plain multi-line text keeps its lines"
         );

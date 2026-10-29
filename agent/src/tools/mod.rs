@@ -24,7 +24,7 @@
 //! the cache is unbounded by design and entries never need invalidation.
 //!
 //! The settled `read_file` payload shape is `{"path": <repo-relative
-//! path as given>, "start_line": <requested start>, "end_line": <last
+//! path as given, redacted>, "start_line": <requested start>, "end_line": <last
 //! line actually returned, or start_line - 1 when none>, "total_lines":
 //! <usize>, "content": "<n>: <line>" joined by "\n" with no trailing
 //! newline>, "truncated": <bool>, "note": "Returned lines A-B of T.
@@ -43,9 +43,10 @@
 //! is true. `ToolResultRecord.truncated` mirrors the payload's
 //! `truncated`.
 //!
-//! The settled `grep` payload shape is `{"pattern": <as given>,
-//! "path": <normalized scope path ("." for the root)>, "glob": <as
-//! given or null>, "hits": [{"path": <repo-relative path>, "line":
+//! The settled `grep` payload shape is `{"pattern": <as given,
+//! redacted>,
+//! "path": <normalized scope path ("." for the root), redacted>, "glob": <as
+//! given, redacted, or null>, "hits": [{"path": <repo-relative path>, "line":
 //! <1-based line number>, "snippet": <first 200 chars of the line>}],
 //! at most 50 in (path, line) order>, "total_hits": <usize>,
 //! "truncated": <bool>, "note": "Returned first 50 of T hits. Narrow
@@ -54,7 +55,7 @@
 //! payload's `truncated`.
 //!
 //! The settled `read_symbol` payload shape echoes the request as
-//! `{"name": <as given>, "status": "found" | "not_found" |
+//! `{"name": <as given, redacted>, "status": "found" | "not_found" |
 //! "ambiguous", "path": <definition file, found only>, "line":
 //! <definition line, found only>, "start_line": <window start, found
 //! only>, "end_line": <window end, found only>, "total_lines":
@@ -67,13 +68,10 @@
 //! (ambiguous only)>}`. The `name` needle is the last `::`-separated
 //! (then `.`-separated) segment of the input, trimmed and matched as a
 //! whole token against a line-shape definition heuristic (see
-//! `read_symbol::is_symbol_definition`); the payload echoes the original `name`
+//! `symbol_shape::is_symbol_definition`); the payload echoes the original `name`
 //! as given. `ToolResultRecord.truncated` mirrors the payload's
 //! `truncated`: true for a `found` window that does not cover the
 //! whole file, or an `ambiguous` list that was capped at 10.
-//!
-//! The cache and redaction slices have landed, so the executor is
-//! session-safe with respect to secret leakage.
 
 mod cache;
 mod confine;
@@ -84,6 +82,7 @@ mod list_dir;
 mod read_file;
 mod read_symbol;
 mod redaction;
+mod symbol_shape;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -189,6 +188,27 @@ impl ToolExecutor for RepoToolExecutor {
         }
         result
     }
+}
+
+/// Serialize a success payload and stamp its record: the one render
+/// tail every tool shares, so the record's `truncated` mirror of the
+/// payload is single-sourced. Serialization failure is the typed
+/// [`ToolError::Render`] soft failure.
+pub(super) fn render_record<T: Serialize>(
+    call: &ToolCallRecord,
+    payload: &T,
+    truncated: bool,
+) -> Result<ToolResultRecord, ToolError> {
+    let result_json =
+        serde_json::to_string(payload).map_err(|error| ToolError::Render(error.to_string()))?;
+    Ok(ToolResultRecord {
+        call_id: call.call_id.clone(),
+        result_json,
+        truncated,
+        soft_failure: false,
+        activated_tool_names: Vec::new(),
+        result_metadata: None,
+    })
 }
 
 /// The error payload shape shared by every soft failure.
