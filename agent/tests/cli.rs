@@ -1,4 +1,6 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,7 +23,30 @@ impl Fixture {
         let root =
             std::env::temp_dir().join(format!("chomp-cli-{label}-{}-{nonce}", std::process::id()));
         let repo = root.join("repo");
-        fs::create_dir_all(&repo).expect("create fixture repo");
+        fs::create_dir_all(repo.join("src")).expect("create fixture repo");
+        fs::write(repo.join("src/lib.rs"), "pub fn answer() -> u32 { 41 }\n")
+            .expect("write fixture source");
+        // The FRG-19 review path captures a snapshot, which needs a
+        // real git checkout with a HEAD commit.
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", "base"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args([
+                    "-c",
+                    "user.email=fixture@example.com",
+                    "-c",
+                    "user.name=Fixture",
+                ])
+                .args(&args)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?} failed");
+        }
         Self {
             diff: root.join("mr.diff"),
             findings: root.join("findings.json"),
@@ -33,8 +58,19 @@ impl Fixture {
     }
 
     fn write_diff(&self) {
-        fs::write(&self.diff, "diff --git a/src/lib.rs b/src/lib.rs\n")
-            .expect("write fixture diff");
+        fs::write(
+            self.repo.join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .expect("modify fixture source");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["diff", "--no-color"])
+            .output()
+            .expect("git diff runs");
+        assert!(output.status.success());
+        fs::write(&self.diff, &output.stdout).expect("write fixture diff");
     }
 
     fn review_args(&self) -> Vec<String> {
@@ -81,6 +117,62 @@ fn run(args: &[String]) -> Output {
         .expect("run chomp binary")
 }
 
+fn run_with_env(args: &[String], envs: &[(&str, &str)]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_chomp"))
+        .args(args)
+        .envs(envs.iter().copied())
+        .output()
+        .expect("run chomp binary")
+}
+
+/// A one-shot stub for the OpenRouter chat-completions endpoint:
+/// accepts a single connection, drains the request, and answers with
+/// the given body. Returns the base URL to point
+/// `OPENROUTER_BASE_URL` at.
+fn stub_model_server(response_body: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+    let addr = listener.local_addr().expect("stub server addr");
+    let body = response_body.to_string();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut expected: Option<usize> = None;
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    raw.extend_from_slice(&chunk[..n]);
+                    if expected.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&raw[..pos]).to_lowercase();
+                            let length = headers
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            expected = Some(pos + 4 + length);
+                        }
+                    }
+                    if expected.is_some_and(|total| raw.len() >= total) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+    format!("http://{addr}")
+}
+
 #[test]
 fn help_documents_the_full_cli_contract() {
     let output = run(&["--help".to_string()]);
@@ -113,7 +205,18 @@ fn fixture_review_exits_zero_and_writes_all_outputs() {
     let fixture = Fixture::new("success");
     fixture.write_diff();
 
-    let output = run(&fixture.review_args());
+    // The correctness session runs end to end against a stub model
+    // endpoint that answers with an empty findings array.
+    let base_url = stub_model_server(
+        r#"{"choices":[{"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}]}"#,
+    );
+    let output = run_with_env(
+        &fixture.review_args(),
+        &[
+            ("OPENROUTER_API_KEY", "test-key"),
+            ("OPENROUTER_BASE_URL", &base_url),
+        ],
+    );
     assert!(
         output.status.success(),
         "stderr: {}",
