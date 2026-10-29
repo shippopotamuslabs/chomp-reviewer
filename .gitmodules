@@ -1,0 +1,3 @@
+[submodule "contracts/gospel"]
+	path = contracts/gospel
+	url = https://github.com/shippopotamuslabs/gospels.git
