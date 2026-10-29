@@ -6,7 +6,7 @@
 - [x] Implementation
 - [x] Review — rounds: 2/3, result: clean (round 1: one MINOR
   plan-fidelity finding, fixed; round 2: verified, no findings)
-- [ ] Ship — PR: pending creation
+- [ ] Ship — PR: https://github.com/shippopotamuslabs/forge-reviewer/pull/26 (open, awaiting external review/merge)
 
 ## Current Gate
 none
@@ -76,3 +76,7 @@ Ship
   `.forge/`). No architecture questions. Residual risk: structure
   session unreachable from CLI until FRG-24 (by D2 design; proven
   via scripted transport, no live-model run in this ticket).
+- 2026-10-29: Shipped as PR #26
+  (https://github.com/shippopotamuslabs/forge-reviewer/pull/26),
+  commit `0c57708`. No changelog/tag (agent/ precedent). Merge and
+  external (Forge) review happen on the PR.
