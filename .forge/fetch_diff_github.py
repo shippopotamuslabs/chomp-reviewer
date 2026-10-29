@@ -6,8 +6,10 @@ Usage:
     python3 .forge/fetch_diff_github.py <api_url> <owner/repo> <pr_number> <token> --output mr.diff
 
 The GitHub pulls API serves the complete unified diff with the
-application/vnd.github.diff media type, so unlike the GitLab fetcher no
-per-file fragment assembly is needed: the document is written as served.
+application/vnd.github.diff media type — until the diff passes GitHub's
+size limits and the endpoint refuses with HTTP 406. Then
+github_backend.fetch_pull_diff falls back to assembling the same
+document from the paginated pulls files API, like the GitLab fetcher.
 """
 import argparse
 import os

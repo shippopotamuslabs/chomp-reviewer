@@ -92,8 +92,102 @@ def get_pull_request(api_url, repo, number, token):
         "GET", f"{api_url}/repos/{repo}/pulls/{number}", token)
 
 
+def fetch_pull_files(api_url, repo, number, token):
+    """List every file changed in the PR via the pulls files API.
+
+    Paginated like list_issue_comments. Each entry carries the file's
+    status, its previous_filename for renames, and (usually) its patch.
+    """
+    files = []
+    page = 1
+    while True:
+        batch = github_request(
+            "GET",
+            f"{api_url}/repos/{repo}/pulls/{number}/files"
+            f"?per_page=100&page={page}",
+            token,
+        )
+        if not batch:
+            break
+        files.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return files
+
+
+PATCH_UNAVAILABLE_MARKER = (
+    "[forge: no patch served by the GitHub API for this file "
+    "(binary or too large); contents not shown]"
+)
+
+
+def assemble_pull_diff(files):
+    """Assemble pulls-files entries into one unified diff document.
+
+    The fallback twin of fetch_diff.py's assemble_mr_diff: each file's
+    patch is preserved byte-for-byte apart from the synthesized
+    'diff --git' / '---' / '+++' headers (only newline padding is
+    trimmed, never trailing whitespace content, so a hunk's final blank
+    context line survives). A changed file whose patch the API omitted
+    (binary, or too large for the endpoint to serve) gets an explicit
+    marker line in its section — never a silent drop. A pure rename
+    (no patch, zero changes) is headers + rename lines only, exactly
+    as git serves it. Returns "" when there are no files.
+
+    Added/removed files also get git's 'new file mode' / 'deleted
+    file mode' line: diff parsers (unidiff, which pr-agent reads
+    mr.diff with) only treat a section as added/deleted when that
+    line sets the /dev/null side — without it a deletion's
+    '+++ /dev/null' is a parse error. The files API does not report
+    modes, so the standard 100644 is synthesized; no Forge consumer
+    acts on the mode value.
+    """
+    parts = []
+    for entry in files:
+        new_path = entry.get("filename", "")
+        old_path = entry.get("previous_filename") or new_path
+        status = entry.get("status", "modified")
+        lines = [f"diff --git a/{old_path} b/{new_path}"]
+        if status == "added":
+            lines.append("new file mode 100644")
+        elif status == "removed":
+            lines.append("deleted file mode 100644")
+        if status in ("renamed", "copied") and old_path != new_path:
+            verb = "rename" if status == "renamed" else "copy"
+            lines.append(f"{verb} from {old_path}")
+            lines.append(f"{verb} to {new_path}")
+        patch = entry.get("patch")
+        if patch:
+            lines.append(
+                "--- /dev/null" if status == "added" else f"--- a/{old_path}")
+            lines.append(
+                "+++ /dev/null" if status == "removed" else f"+++ b/{new_path}")
+            lines.append(patch.strip("\n"))
+        elif status in ("renamed", "copied") and not entry.get("changes"):
+            pass  # pure rename: the header block above is the whole section
+        else:
+            lines.append(
+                "--- /dev/null" if status == "added" else f"--- a/{old_path}")
+            lines.append(
+                "+++ /dev/null" if status == "removed" else f"+++ b/{new_path}")
+            lines.append(PATCH_UNAVAILABLE_MARKER)
+        parts.append("\n".join(lines))
+
+    if not parts:
+        return ""
+
+    return "\n".join(parts) + "\n"
+
+
 def fetch_pull_diff(api_url, repo, number, token):
-    """Fetch the PR's unified diff (the Accept: ...diff media type).
+    """Fetch the PR's unified diff.
+
+    Fast path: the pulls endpoint with the diff media type serves the
+    complete document in one request. GitHub refuses that endpoint
+    with HTTP 406 once a diff passes its size limits (observed on a
+    770-file PR, where the review died unfetched), so on 406 the same
+    document is assembled from the paginated files API instead.
 
     Returns the diff text. An empty diff means nothing to review; the
     caller treats that like fetch_diff.py's no-diffs error.
@@ -110,9 +204,18 @@ def fetch_pull_diff(api_url, repo, number, token):
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        if e.code != 406:
+            print(f"ERROR: could not fetch PR diff: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            "WARNING: PR diff endpoint returned 406 (diff too large); "
+            "assembling the diff from the pulls files API instead.",
+            file=sys.stderr)
     except Exception as e:
         print(f"ERROR: could not fetch PR diff: {e}", file=sys.stderr)
         sys.exit(1)
+    return assemble_pull_diff(fetch_pull_files(api_url, repo, number, token))
 
 
 def fetch_file_at_ref(api_url, repo, path, ref, token):
