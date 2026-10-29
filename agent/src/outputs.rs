@@ -1,31 +1,73 @@
-//! Writers for Chomp's findings JSON and synthesis decision log.
+//! Writers for Chomp's findings JSON and synthesis decision log, plus
+//! the [`Finding`] type: the findings output contract (proposal §8.5),
+//! shared by every lens and consumed downstream by synthesis (FRG-26).
 
 use std::fs;
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// Finding severity, exactly the four values the output contract
+/// allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Severity {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+/// One review finding in the §8.5 output contract. Field names and
+/// shapes are the contract — synthesis (FRG-26) and the renderers
+/// consume this JSON — so deserialization denies unknown fields: a
+/// session emitting anything else has not produced a valid finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Finding {
+    pub file: String,
+    pub line_start: u64,
+    pub line_end: u64,
+    pub severity: Severity,
+    pub category: String,
+    pub title: String,
+    pub description: String,
+    pub evidence: String,
+    pub fix_focus_areas: Vec<String>,
+    pub recommended_fix: String,
+    /// `path:line` locations the session actually read in support of
+    /// relational claims (callers, callees, consumers). Optional in
+    /// the contract; synthesis treats uncited relational claims as
+    /// unverified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<Vec<String>>,
+}
 
 /// Versioned synthesis decision log.
 ///
-/// FRG-15 emits an empty log. FRG-25 and FRG-26 evolve the entry schema and
-/// populate dispositions for producer findings.
+/// The log stays empty until FRG-25/FRG-26 populate dispositions for
+/// producer findings.
 #[derive(Debug, Serialize)]
 struct DecisionLog {
     version: u32,
     entries: Vec<serde_json::Value>,
 }
 
-/// Write the three scaffold review outputs.
+/// Write the three review outputs.
 ///
-/// Findings are an empty JSON array (a legitimately empty review), the
-/// decision log is the minimal versioned empty object, and the PR-Agent guide
-/// is an empty file until FRG-23 captures a real one.
+/// Findings are the session's validated findings (an empty slice is
+/// a legitimately empty review and writes `[]`), the decision log is
+/// the minimal versioned empty object, and the PR-Agent guide is an
+/// empty file until FRG-23 captures a real one.
 pub fn write_outputs(
+    findings: &[Finding],
     findings_path: &Path,
     decisions_path: &Path,
     pr_agent_path: &Path,
 ) -> Result<(), String> {
-    write_file(findings_path, b"[]\n", "findings")?;
+    let mut findings_json = serde_json::to_string_pretty(findings)
+        .map_err(|error| format!("failed to serialize Chomp findings: {error}"))?;
+    findings_json.push('\n');
+    write_file(findings_path, findings_json.as_bytes(), "findings")?;
 
     let decision_log = DecisionLog {
         version: 1,
@@ -49,20 +91,25 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn writes_the_scaffold_output_shapes() {
+    fn temp_dir() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock after epoch")
             .as_nanos();
-        let dir: PathBuf =
+        let dir =
             std::env::temp_dir().join(format!("chomp-outputs-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn writes_the_empty_output_shapes() {
+        let dir = temp_dir();
         let findings = dir.join("findings.json");
         let decisions = dir.join("decisions.json");
         let pr_agent = dir.join("pr-agent.md");
 
-        write_outputs(&findings, &decisions, &pr_agent).expect("write outputs");
+        write_outputs(&[], &findings, &decisions, &pr_agent).expect("write outputs");
 
         assert_eq!(
             fs::read_to_string(&findings).expect("read findings"),
@@ -77,6 +124,41 @@ mod tests {
             fs::read(&pr_agent).expect("read pr-agent guide"),
             Vec::<u8>::new()
         );
+        fs::remove_dir_all(dir).expect("clean temp dir");
+    }
+
+    #[test]
+    fn writes_findings_with_citations() {
+        let dir = temp_dir();
+        let findings_path = dir.join("findings.json");
+        let decisions = dir.join("decisions.json");
+        let pr_agent = dir.join("pr-agent.md");
+        let finding = Finding {
+            file: "src/parse.rs".to_string(),
+            line_start: 2,
+            line_end: 2,
+            severity: Severity::High,
+            category: "Correctness".to_string(),
+            title: "parse_port panics on non-numeric input".to_string(),
+            description: "The strict parse panics.".to_string(),
+            evidence: "The caller passes an empty default.".to_string(),
+            fix_focus_areas: vec!["src/parse.rs[2-2]".to_string()],
+            recommended_fix: "Return a Result.".to_string(),
+            citations: Some(vec!["src/main.rs:5".to_string()]),
+        };
+
+        write_outputs(
+            std::slice::from_ref(&finding),
+            &findings_path,
+            &decisions,
+            &pr_agent,
+        )
+        .expect("write outputs");
+
+        let written: Vec<Finding> =
+            serde_json::from_str(&fs::read_to_string(&findings_path).expect("read findings"))
+                .expect("findings round-trip");
+        assert_eq!(written, vec![finding]);
         fs::remove_dir_all(dir).expect("clean temp dir");
     }
 }

@@ -1,8 +1,9 @@
 //! Chomp: a repo-aware agentic code-review host built on `agent_core`.
 //!
 //! This binary is a host for `agent_core`, an owner of repository tools, and
-//! nothing else. FRG-15 scaffolds the CLI, configuration loading, and output
-//! contract; the review stages land in their own tickets.
+//! nothing else. FRG-15 scaffolded the CLI, configuration loading, and
+//! output contract; FRG-19 runs the correctness lens end to end. Fan-out,
+//! synthesis, and the remaining lenses land in their own tickets.
 
 mod contract;
 mod host;
@@ -16,6 +17,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_ORCHESTRATION_FAILURE: i32 = 2;
@@ -220,11 +222,48 @@ fn validate_inputs(args: &ReviewArgs) -> Result<(), String> {
 }
 
 fn run_review(args: &ReviewArgs) -> Result<(), String> {
-    // The scaffold validates and loads the real configuration even though no
-    // producer stages consume it yet; later stages inherit this exact flow.
-    let _config = contract::load_config(args.config.as_deref(), &args.repo)?;
+    // Composition root: configuration, snapshot, executor, and
+    // transport are constructed here and passed down; the session
+    // layer depends on the ports, never on these concrete types
+    // beyond construction.
+    let config = contract::load_config(args.config.as_deref(), &args.repo)?;
     validate_inputs(args)?;
-    outputs::write_outputs(&args.out_findings, &args.out_decisions, &args.out_pr_agent)
+    let diff_text = std::fs::read_to_string(&args.diff)
+        .map_err(|error| format!("cannot read diff file {}: {error}", args.diff.display()))?;
+    let snapshot = chomp::snapshot::Snapshot::capture(&args.repo, &args.diff)
+        .map_err(|error| error.to_string())?;
+    let executor: Arc<dyn chomp::tools::ToolExecutor + Send + Sync> = Arc::new(
+        chomp::tools::RepoToolExecutor::new(snapshot.root.clone(), snapshot.head_sha.clone())
+            .map_err(|error| {
+                format!(
+                    "cannot open tool executor at {}: {error}",
+                    snapshot.root.display()
+                )
+            })?,
+    );
+    let transport =
+        chomp::transport::OpenRouterTransport::from_env().map_err(|error| error.to_string())?;
+    match sessions::run_correctness_session(
+        &snapshot,
+        &diff_text,
+        &config.entry_file,
+        &transport,
+        &executor,
+        agent_core::session::AgentConfig::default(),
+    ) {
+        sessions::LensOutcome::Completed(findings) => outputs::write_outputs(
+            &findings,
+            &args.out_findings,
+            &args.out_decisions,
+            &args.out_pr_agent,
+        ),
+        sessions::LensOutcome::ProducerFailure { reason } => {
+            Err(format!("correctness session failed: {reason}"))
+        }
+        sessions::LensOutcome::BudgetExhausted { reason } => Err(format!(
+            "correctness session exhausted its budget: {reason}"
+        )),
+    }
 }
 
 fn run() -> i32 {
