@@ -1,8 +1,8 @@
 //! Lens session construction: prompts, budgets, and catalog/schema
 //! JSON for each review lens.
 //!
-//! The correctness lens lands here (FRG-19); the structure and
-//! contract lenses follow in FRG-21 and FRG-22 on the same
+//! The correctness and structure lenses land here (FRG-19 and
+//! FRG-21); the contract lens follows in FRG-22 on the same
 //! construction: one `agent_core` session per lens, built by
 //! [`run_correctness_session`]'s shape — system prompt from
 //! `agent/prompts/`, opening context assembled from the snapshot,
@@ -41,6 +41,11 @@ use crate::outputs::Finding;
 /// shipped binary cannot rely on a source-tree-relative path).
 const CORRECTNESS_PROMPT: &str = include_str!("../prompts/correctness.md");
 
+/// The structure system prompt, authored at
+/// `agent/prompts/structure.md` and embedded at build time (a
+/// shipped binary cannot rely on a source-tree-relative path).
+const STRUCTURE_PROMPT: &str = include_str!("../prompts/structure.md");
+
 /// Provider label and context window the sessions are constructed
 /// with, per the ticket's construction sketch.
 const PROVIDER: &str = "openrouter";
@@ -72,6 +77,52 @@ pub fn run_correctness_session(
     executor: &Arc<dyn ToolExecutor + Send + Sync>,
     agent_config: AgentConfig,
 ) -> LensOutcome {
+    run_lens_session(
+        CORRECTNESS_PROMPT,
+        snapshot,
+        diff_text,
+        contract,
+        transport,
+        executor,
+        agent_config,
+    )
+}
+
+/// Run the structure lens over one snapshot and diff.
+///
+/// `agent_config` carries the caller's budgets (the engine's turn
+/// and retry guardrails); the tool semantics are filled in here from
+/// the FRG-18 catalog.
+// Wired into main by FRG-24 fan-out (plan D2: main stays correctness-only in this ticket).
+#[allow(dead_code)]
+pub fn run_structure_session(
+    snapshot: &Snapshot,
+    diff_text: &str,
+    contract: &ContractResolution,
+    transport: &dyn ModelTransport,
+    executor: &Arc<dyn ToolExecutor + Send + Sync>,
+    agent_config: AgentConfig,
+) -> LensOutcome {
+    run_lens_session(
+        STRUCTURE_PROMPT,
+        snapshot,
+        diff_text,
+        contract,
+        transport,
+        executor,
+        agent_config,
+    )
+}
+
+fn run_lens_session(
+    prompt: &'static str,
+    snapshot: &Snapshot,
+    diff_text: &str,
+    contract: &ContractResolution,
+    transport: &dyn ModelTransport,
+    executor: &Arc<dyn ToolExecutor + Send + Sync>,
+    agent_config: AgentConfig,
+) -> LensOutcome {
     let opening = assemble_opening_context(snapshot, diff_text, contract, executor);
 
     let mut config = agent_config;
@@ -87,7 +138,7 @@ pub fn run_correctness_session(
         PROVIDER.to_string(),
         CONTEXT_WINDOW_TOKENS,
         TOOLS_SCHEMA_JSON.to_string(),
-        system_prompt(),
+        system_prompt(prompt),
     ) {
         Ok(params) => params,
         Err(error) => {
@@ -159,8 +210,8 @@ pub fn run_correctness_session(
 
 /// The authored prompt with its leading HTML provenance comment
 /// stripped — the comment is for the repo, not the model.
-fn system_prompt() -> String {
-    let trimmed = CORRECTNESS_PROMPT.trim_start();
+fn system_prompt(prompt: &str) -> String {
+    let trimmed = prompt.trim_start();
     let body = match trimmed.strip_prefix("<!--") {
         Some(rest) => match rest.find("-->") {
             Some(end) => &rest[end + 3..],
@@ -832,8 +883,190 @@ mod tests {
 
     #[test]
     fn system_prompt_strips_the_provenance_comment() {
-        let prompt = system_prompt();
+        let prompt = system_prompt(CORRECTNESS_PROMPT);
         assert!(!prompt.contains("Provenance"));
         assert!(prompt.contains("correctness"));
+    }
+
+    // -- structure lens (FRG-21) --------------------------------------------------
+
+    /// The structure-lens duplication fixture: `src/util.rs` carries the
+    /// canonical slug helper (committed at base, untouched by the diff,
+    /// so its body is NOT in the opening context — the repo map lists
+    /// the path only); the diff adds `src/feature.rs` with the given
+    /// body. The util.rs content is pinned so `slugify` sits on line 2.
+    fn structure_fixture(label: &str, feature_body: &str) -> RepoFixture {
+        let fixture = RepoFixture::new(label);
+        fixture.write("AGENTS.md", "# Fixture repo notes\n");
+        fixture.write(
+            "src/util.rs",
+            "// canonical slug helper\npub fn slugify(value: &str) -> String {\n    value.to_lowercase().replace(' ', \"-\")\n}\n",
+        );
+        fixture.commit_all("base");
+        fixture.write("src/feature.rs", feature_body);
+        fixture.write_diff();
+        fixture
+    }
+
+    const STRUCTURE_DUP_FINDING: &str = r#"[{
+        "file": "src/feature.rs",
+        "line_start": 1,
+        "line_end": 3,
+        "severity": "High",
+        "category": "Duplication",
+        "title": "Reimplements the existing slugify helper",
+        "description": "make_slug duplicates the canonical slugify helper in src/util.rs line for line under a new name. A second slug implementation will drift from the canonical one and doubles the surface future changes must touch.",
+        "evidence": "src/feature.rs lines 1-3 lowercase and dash-join exactly as src/util.rs line 2 does; the pulled helper at src/util.rs:2 confirms the existing canonical implementation.",
+        "fix_focus_areas": ["src/feature.rs[1-3]"],
+        "recommended_fix": "Delete make_slug and call the existing slugify helper from src/util.rs instead, keeping one canonical slug implementation.",
+        "citations": ["src/util.rs:2"]
+    }]"#;
+
+    #[test]
+    fn structure_duplication_pulled_and_cited() {
+        let fixture = structure_fixture(
+            "struct-dup",
+            "pub fn make_slug(value: &str) -> String {\n    value.to_lowercase().replace(' ', \"-\")\n}\n",
+        );
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        let transport = ScriptedTransport::new(
+            vec![
+                tool_call_response("grep", "{\"pattern\": \"slugify\"}"),
+                tool_call_response("read_file", "{\"path\": \"src/util.rs\"}"),
+                text_response(STRUCTURE_DUP_FINDING),
+            ],
+            text_response("[]"),
+        );
+
+        let outcome = run_structure_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &governing_notes(),
+            &transport,
+            &executor,
+            AgentConfig::default(),
+        );
+
+        let LensOutcome::Completed(findings) = outcome else {
+            panic!("expected completed findings, got {outcome:?}");
+        };
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].citations.as_deref(),
+            Some(&["src/util.rs:2".to_string()][..])
+        );
+
+        // The helper body was NOT in the opening context (util.rs is
+        // unchanged, so only the repo map names it): the session had to
+        // pull it. The opening is host-assembled, never templated.
+        let opening = transport.request_text(0);
+        assert!(!opening.contains("canonical slug helper"));
+        assert!(!opening.contains("{file_contents}"));
+
+        // A later turn saw the pulled helper body flow in as a tool result.
+        let pulled = transport.request_text(1).contains("canonical slug helper")
+            || transport.request_text(2).contains("canonical slug helper");
+        assert!(pulled, "tool result carried the helper body");
+    }
+
+    #[test]
+    fn structure_clean_call_returns_empty_findings() {
+        let fixture = structure_fixture(
+            "struct-clean",
+            "pub fn title_slug(value: &str) -> String {\n    crate::util::slugify(value)\n}\n",
+        );
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        let transport = ScriptedTransport::new(vec![text_response("[]")], text_response("[]"));
+
+        let outcome = run_structure_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &absent_contract(),
+            &transport,
+            &executor,
+            AgentConfig::default(),
+        );
+
+        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+    }
+
+    #[test]
+    fn structure_uncited_claim_still_parses() {
+        let fixture = structure_fixture(
+            "struct-uncited",
+            "pub fn make_slug(value: &str) -> String {\n    value.to_lowercase().replace(' ', \"-\")\n}\n",
+        );
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        let uncited =
+            STRUCTURE_DUP_FINDING.replace(",\n        \"citations\": [\"src/util.rs:2\"]", "");
+        assert!(!uncited.contains("citations"));
+        let transport = ScriptedTransport::new(vec![text_response(&uncited)], text_response("[]"));
+
+        let outcome = run_structure_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &absent_contract(),
+            &transport,
+            &executor,
+            AgentConfig::default(),
+        );
+
+        // D3: absent citations parse — rejection of unverified claims is
+        // synthesis's job (FRG-26), not the validator's.
+        let LensOutcome::Completed(findings) = outcome else {
+            panic!("expected completed findings, got {outcome:?}");
+        };
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].citations, None);
+    }
+
+    #[test]
+    fn structure_tiny_turn_budget_is_a_budget_outcome() {
+        let fixture = structure_fixture(
+            "struct-budget",
+            "pub fn make_slug(value: &str) -> String {\n    value.to_lowercase().replace(' ', \"-\")\n}\n",
+        );
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        // The fallback answers every turn with another tool call; the
+        // engine's turn budget must end the session as a recorded
+        // budget outcome, not a hang.
+        let transport = ScriptedTransport::new(
+            Vec::new(),
+            tool_call_response("read_file", "{\"path\": \"src/util.rs\"}"),
+        );
+
+        let outcome = run_structure_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &absent_contract(),
+            &transport,
+            &executor,
+            AgentConfig {
+                max_turns: 1,
+                ..AgentConfig::default()
+            },
+        );
+
+        assert!(
+            matches!(outcome, LensOutcome::BudgetExhausted { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn structure_system_prompt_shape() {
+        let prompt = system_prompt(STRUCTURE_PROMPT);
+        assert!(!prompt.contains("Provenance"));
+        for token in ["{diff}", "{file_contents}", "{ticket}"] {
+            assert!(!prompt.contains(token), "prompt leaks {token}");
+        }
+        for token in ["citations", "grep", "read_file", "list_dir", "read_symbol"] {
+            assert!(prompt.contains(token), "prompt names {token}");
+        }
+        assert!(prompt.contains("structure"));
     }
 }
