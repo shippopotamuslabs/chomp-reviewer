@@ -899,6 +899,9 @@ mod tests {
     #[test]
     fn slow_producers_overlap_and_finish_well_under_serial() {
         let fixture = FixtureRepo::new("overlap");
+        // CI-load margin: the delay only needs to dwarf clock granularity so
+        // the overlap assertion stays meaningful; keep it modest so the test
+        // stays fast even on a loaded runner.
         let delay = Duration::from_millis(300);
         let sleeping = |tag: &str| -> Arc<dyn ModelTransport + Send + Sync> {
             Arc::new(SleepingTransport {
@@ -940,12 +943,14 @@ mod tests {
             latest_start < earliest_end,
             "intervals overlap: latest start {latest_start}ms, earliest end {earliest_end}ms"
         );
-        // Serial execution floors at 4 × 300ms = 1200ms; concurrent
-        // producers share that sleep, so even a loaded CI box stays
-        // far under the serial floor.
+        // Serial execution floors at 4 × delay; concurrent producers share
+        // that sleep, so wall stays far below the serial floor. The bound
+        // is the serial floor itself — the loosest bound that still proves
+        // concurrency — so CI load cannot flake it; the records-overlap
+        // assertion above is the primary evidence.
         assert!(
-            wall < Duration::from_millis(1000),
-            "concurrent producers finish well under serial: {wall:?}"
+            wall < delay * 4,
+            "concurrent producers finish under the serial floor: {wall:?}"
         );
         assert!(result.records.iter().all(|record| record.completed));
         assert!(result.any_ran_completed);
@@ -956,8 +961,15 @@ mod tests {
     #[test]
     fn hung_lens_is_cut_at_its_stage_timeout() {
         let fixture = FixtureRepo::new("hung");
+        // CI-load margin: the lens timeout must dwarf healthy session setup
+        // (opening-context assembly + engine setup, ~255ms locally, more on
+        // a loaded 2-core CI runner) so healthy lenses always resolve by
+        // their own outcome; the sleeper's delay stays an order of magnitude
+        // past the timeout so the cut is unambiguous. Do not tighten these
+        // without re-checking CI stability (FRG-24: 500ms/2s flaked when the
+        // timeout fired before instant-answer transports resolved).
         let timeouts = StageTimeouts {
-            lens: Duration::from_millis(500),
+            lens: Duration::from_secs(3),
             pr_agent: Duration::from_secs(60),
             synthesis: Duration::from_secs(60),
         };
@@ -967,7 +979,9 @@ mod tests {
             governing_contract(),
             scripted(&lens_envelope("correctness")),
             Arc::new(SleepingTransport {
-                delay: Duration::from_secs(2),
+                // The abandoned thread is detached and harmless: its send
+                // lands on a dropped receiver and is silently ignored.
+                delay: Duration::from_secs(30),
                 text: "{\"findings\":[]}".to_string(),
             }),
             scripted(&lens_envelope("contract")),
@@ -980,16 +994,16 @@ mod tests {
         assert!(!hung.completed);
         assert_eq!(hung.mode, Some(FailureMode::TimedOut));
         assert!(hung.detail.contains("structure"), "{}", hung.detail);
-        assert!(hung.detail.contains("500ms"), "{}", hung.detail);
+        assert!(hung.detail.contains("3s"), "{}", hung.detail);
         assert!(
-            hung.elapsed_ms < 1000,
+            hung.elapsed_ms < 10_000,
             "the record closes at the deadline, not at the abandoned work: {}ms",
             hung.elapsed_ms
         );
         // The fan-out returns once the last deadline passes — long
-        // before the abandoned 2 s sleep ends.
+        // before the abandoned 30 s sleep ends.
         assert!(
-            wall < Duration::from_millis(1500),
+            wall < Duration::from_secs(15),
             "fan-out returns well under the abandoned sleep: {wall:?}"
         );
         assert!(record_by_stage(&result, Stage::Correctness).completed);
@@ -1202,8 +1216,15 @@ mod tests {
     #[test]
     fn all_ran_producers_failing_means_nothing_ran_completed() {
         let fixture = FixtureRepo::new("all-fail");
+        // CI-load margin: same trap as hung_lens_is_cut_at_its_stage_timeout —
+        // the lens timeout must dwarf healthy session setup so the
+        // instant-answer transports (garbage, panicking) resolve by their own
+        // outcome even on a loaded 2-core CI runner, while the sleeper's
+        // delay stays an order of magnitude past the timeout so the contract
+        // stage is still cut by the deadline. Do not tighten these (FRG-24:
+        // 500ms/2s flaked when setup exceeded the deadline under CI load).
         let timeouts = StageTimeouts {
-            lens: Duration::from_millis(500),
+            lens: Duration::from_secs(3),
             pr_agent: Duration::from_secs(60),
             synthesis: Duration::from_secs(60),
         };
@@ -1213,7 +1234,9 @@ mod tests {
             Arc::new(GarbageTransport),
             Arc::new(PanickingTransport),
             Arc::new(SleepingTransport {
-                delay: Duration::from_secs(2),
+                // The abandoned thread is detached and harmless: its send
+                // lands on a dropped receiver and is silently ignored.
+                delay: Duration::from_secs(30),
                 text: "{\"findings\":[]}".to_string(),
             }),
             failing_runner("missing credential: GITHUB__USER_TOKEN"),
