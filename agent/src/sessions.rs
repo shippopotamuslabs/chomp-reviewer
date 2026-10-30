@@ -29,6 +29,7 @@ use agent_core::tool_semantics::{ToolCatalogConfig, ToolSemanticsConfig};
 use chomp::model_transport::ModelTransport;
 use chomp::snapshot::{ChangeKind, Snapshot};
 use chomp::tools::{tool_specs, ToolExecutor, TOOLS_SCHEMA_JSON};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::contract::ContractResolution;
@@ -58,14 +59,28 @@ const CONTEXT_WINDOW_TOKENS: u32 = 200_000;
 /// How a lens session ended, in the caller's vocabulary.
 ///
 /// Only [`LensOutcome::Completed`] carries findings fit to write.
-/// The other two are recorded outcomes, never findings: `main` maps
-/// them to an orchestration failure with the reason on stderr, so a
-/// broken or starved session never masquerades as an empty review.
+/// The rest are recorded outcomes, never findings: `main` maps them
+/// to an orchestration failure with the reason on stderr, so a
+/// broken, starved, unparseable, or over-deadline session never
+/// masquerades as an empty review.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LensOutcome {
-    Completed(Vec<Finding>),
-    ProducerFailure { reason: String },
-    BudgetExhausted { reason: String },
+    Completed {
+        findings: Vec<Finding>,
+        note: Option<String>,
+    },
+    ProducerFailure {
+        reason: String,
+    },
+    BudgetExhausted {
+        reason: String,
+    },
+    InvalidOutput {
+        reason: String,
+    },
+    TimedOut {
+        reason: String,
+    },
 }
 
 /// Run the correctness lens over one snapshot and diff.
@@ -80,6 +95,7 @@ pub fn run_correctness_session(
     transport: &dyn ModelTransport,
     executor: &Arc<dyn ToolExecutor + Send + Sync>,
     agent_config: AgentConfig,
+    deadline: Option<std::time::Instant>,
 ) -> LensOutcome {
     run_lens_session(
         CORRECTNESS_PROMPT,
@@ -89,6 +105,7 @@ pub fn run_correctness_session(
         transport,
         executor,
         agent_config,
+        deadline,
     )
 }
 
@@ -97,8 +114,6 @@ pub fn run_correctness_session(
 /// `agent_config` carries the caller's budgets (the engine's turn
 /// and retry guardrails); the tool semantics are filled in here from
 /// the FRG-18 catalog.
-// Wired into main by FRG-24 fan-out (plan D2: main stays correctness-only in this ticket).
-#[allow(dead_code)]
 pub fn run_structure_session(
     snapshot: &Snapshot,
     diff_text: &str,
@@ -106,6 +121,7 @@ pub fn run_structure_session(
     transport: &dyn ModelTransport,
     executor: &Arc<dyn ToolExecutor + Send + Sync>,
     agent_config: AgentConfig,
+    deadline: Option<std::time::Instant>,
 ) -> LensOutcome {
     run_lens_session(
         STRUCTURE_PROMPT,
@@ -115,6 +131,7 @@ pub fn run_structure_session(
         transport,
         executor,
         agent_config,
+        deadline,
     )
 }
 
@@ -131,8 +148,6 @@ pub fn run_structure_session(
 /// `agent_config` carries the caller's budgets (the engine's turn
 /// and retry guardrails); the tool semantics are filled in here from
 /// the FRG-18 catalog.
-// Wired into main by FRG-24 fan-out (plan D2: main stays correctness-only in this ticket).
-#[allow(dead_code)]
 pub fn run_contract_session(
     snapshot: &Snapshot,
     diff_text: &str,
@@ -140,9 +155,13 @@ pub fn run_contract_session(
     transport: &dyn ModelTransport,
     executor: &Arc<dyn ToolExecutor + Send + Sync>,
     agent_config: AgentConfig,
+    deadline: Option<std::time::Instant>,
 ) -> LensOutcome {
     if matches!(contract, ContractResolution::Absent { .. }) {
-        return LensOutcome::Completed(Vec::new());
+        return LensOutcome::Completed {
+            findings: Vec::new(),
+            note: None,
+        };
     }
     run_lens_session(
         CONTRACT_PROMPT,
@@ -152,9 +171,14 @@ pub fn run_contract_session(
         transport,
         executor,
         agent_config,
+        deadline,
     )
 }
 
+// Eight parameters by plan D8 (the three public runners forward
+// their full argument list plus the lens prompt); the arity is the
+// seam, not a smell.
+#[allow(clippy::too_many_arguments)]
 fn run_lens_session(
     prompt: &'static str,
     snapshot: &Snapshot,
@@ -163,8 +187,14 @@ fn run_lens_session(
     transport: &dyn ModelTransport,
     executor: &Arc<dyn ToolExecutor + Send + Sync>,
     agent_config: AgentConfig,
+    deadline: Option<std::time::Instant>,
 ) -> LensOutcome {
     let opening = assemble_opening_context(snapshot, diff_text, contract, executor);
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return LensOutcome::TimedOut {
+            reason: "stage deadline exceeded before the session started".to_string(),
+        };
+    }
 
     let mut config = agent_config;
     config.tool_semantics = ToolSemanticsConfig {
@@ -211,7 +241,7 @@ fn run_lens_session(
         }
     };
 
-    match drive_session(&engine, &handle, transport, executor) {
+    match drive_session(&engine, &handle, transport, executor, deadline) {
         DriveOutcome::Finished { budget_signaled } => {
             let snapshot = engine.export_snapshot(&handle);
             let Some(final_text) = snapshot
@@ -226,14 +256,14 @@ fn run_lens_session(
                     reason: "session finished without producing any assistant output".to_string(),
                 };
             };
-            match parse_findings(&final_text) {
-                Ok(findings) => LensOutcome::Completed(findings),
+            match parse_lens_output(&final_text) {
+                Ok((findings, note)) => LensOutcome::Completed { findings, note },
                 Err(reason) if budget_signaled => LensOutcome::BudgetExhausted {
                     reason: format!(
                         "turn budget exhausted before the session produced findings ({reason})"
                     ),
                 },
-                Err(reason) => LensOutcome::ProducerFailure { reason },
+                Err(reason) => LensOutcome::InvalidOutput { reason },
             }
         }
         DriveOutcome::Failed {
@@ -246,6 +276,7 @@ fn run_lens_session(
                 LensOutcome::ProducerFailure { reason }
             }
         }
+        DriveOutcome::TimedOut { reason } => LensOutcome::TimedOut { reason },
     }
 }
 
@@ -365,13 +396,26 @@ fn read_full_file(executor: &Arc<dyn ToolExecutor + Send + Sync>, path: &str) ->
     }
 }
 
-/// Parse and validate a session's final text against the findings
-/// output contract. Anything but a bare JSON array of well-formed
-/// findings is an error — the caller turns it into a producer
-/// failure, never a silent empty result.
-fn parse_findings(text: &str) -> Result<Vec<Finding>, String> {
-    let findings: Vec<Finding> = serde_json::from_str(text.trim())
-        .map_err(|error| format!("session output is not a valid findings array: {error}"))?;
+/// The session output envelope: every lens's final assistant text
+/// must parse as this object. `findings` is required; `note` is the
+/// stand-down channel (absent, null, or empty-after-trim all mean no
+/// note). Unknown keys are rejected, matching [`Finding`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LensEnvelope {
+    findings: Vec<Finding>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Parse and validate a session's final text against the lens output
+/// contract. Anything but a JSON envelope object holding a
+/// well-formed findings array is an error — the caller turns it
+/// into an invalid-output outcome, never a silent empty result.
+fn parse_lens_output(text: &str) -> Result<(Vec<Finding>, Option<String>), String> {
+    let envelope: LensEnvelope = serde_json::from_str(text.trim())
+        .map_err(|error| format!("session output is not a valid findings envelope: {error}"))?;
+    let findings = envelope.findings;
     for finding in &findings {
         if finding.line_start < 1 || finding.line_end < finding.line_start {
             return Err(format!(
@@ -408,7 +452,11 @@ fn parse_findings(text: &str) -> Result<Vec<Finding>, String> {
             }
         }
     }
-    Ok(findings)
+    let note = envelope
+        .note
+        .map(|note| note.trim().to_string())
+        .filter(|note| !note.is_empty());
+    Ok((findings, note))
 }
 
 #[cfg(test)]
@@ -480,6 +528,13 @@ mod tests {
             provider_reasoning_content: None,
         }
     }
+
+    /// Wrap a bare findings array in the lens output envelope.
+    fn envelope(inner_array: &str) -> String {
+        format!("{{\"findings\":{inner_array}}}")
+    }
+
+    const EMPTY_ENVELOPE: &str = "{\"findings\":[]}";
 
     fn tool_call_response(name: &str, arguments_json: &str) -> ModelResponse {
         ModelResponse {
@@ -647,9 +702,9 @@ mod tests {
         let transport = ScriptedTransport::new(
             vec![
                 tool_call_response("read_file", "{\"path\": \"src/main.rs\"}"),
-                text_response(CLASS1_FINDING),
+                text_response(&envelope(CLASS1_FINDING)),
             ],
-            text_response("[]"),
+            text_response(EMPTY_ENVELOPE),
         );
 
         let outcome = run_correctness_session(
@@ -659,11 +714,13 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
-        let LensOutcome::Completed(findings) = outcome else {
+        let LensOutcome::Completed { findings, note } = outcome else {
             panic!("expected completed findings, got {outcome:?}");
         };
+        assert_eq!(note, None, "no stand-down note on a completed review");
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].citations.as_deref(),
@@ -712,7 +769,10 @@ mod tests {
         fixture.write_diff();
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
-        let transport = ScriptedTransport::new(vec![text_response("[]")], text_response("[]"));
+        let transport = ScriptedTransport::new(
+            vec![text_response(EMPTY_ENVELOPE)],
+            text_response(EMPTY_ENVELOPE),
+        );
 
         let outcome = run_correctness_session(
             &snapshot,
@@ -721,9 +781,16 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
-        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+        assert_eq!(
+            outcome,
+            LensOutcome::Completed {
+                findings: Vec::new(),
+                note: None
+            }
+        );
         let opening = transport.request_text(0);
         assert!(
             opening.contains("MARKER_DEEP_LINE"),
@@ -736,7 +803,10 @@ mod tests {
         let fixture = class1_fixture();
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
-        let transport = ScriptedTransport::new(vec![text_response("[]")], text_response("[]"));
+        let transport = ScriptedTransport::new(
+            vec![text_response(EMPTY_ENVELOPE)],
+            text_response(EMPTY_ENVELOPE),
+        );
 
         let outcome = run_correctness_session(
             &snapshot,
@@ -745,19 +815,26 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
-        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+        assert_eq!(
+            outcome,
+            LensOutcome::Completed {
+                findings: Vec::new(),
+                note: None
+            }
+        );
     }
 
     #[test]
-    fn prose_output_is_a_producer_failure() {
+    fn prose_output_is_an_invalid_output() {
         let fixture = class1_fixture();
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
         let transport = ScriptedTransport::new(
             vec![text_response("The change looks correct to me.")],
-            text_response("[]"),
+            text_response(EMPTY_ENVELOPE),
         );
 
         let outcome = run_correctness_session(
@@ -767,10 +844,11 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
         assert!(
-            matches!(outcome, LensOutcome::ProducerFailure { .. }),
+            matches!(outcome, LensOutcome::InvalidOutput { .. }),
             "{outcome:?}"
         );
     }
@@ -798,6 +876,113 @@ mod tests {
                 max_turns: 1,
                 ..AgentConfig::default()
             },
+            None,
+        );
+
+        assert!(
+            matches!(outcome, LensOutcome::BudgetExhausted { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn bad_envelopes_are_invalid_outputs_not_empty_reviews() {
+        let fixture = class1_fixture();
+        for (label, final_text) in [
+            ("bare array", CLASS1_FINDING.to_string()),
+            ("malformed json", "{\"findings\": [".to_string()),
+            (
+                "unknown key",
+                "{\"findings\":[],\"note\":null,\"extra\":1}".to_string(),
+            ),
+            (
+                "invalid finding",
+                envelope(&CLASS1_FINDING.replace("\"line_start\": 5", "\"line_start\": 9")),
+            ),
+        ] {
+            let snapshot = fixture.snapshot();
+            let executor = executor_for(&snapshot);
+            let transport = ScriptedTransport::new(
+                vec![text_response(&final_text)],
+                text_response(EMPTY_ENVELOPE),
+            );
+
+            let outcome = run_correctness_session(
+                &snapshot,
+                &fixture.diff_text(),
+                &absent_contract(),
+                &transport,
+                &executor,
+                AgentConfig::default(),
+                None,
+            );
+
+            assert!(
+                matches!(outcome, LensOutcome::InvalidOutput { .. }),
+                "{label}: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn past_deadline_times_out_without_a_model_turn() {
+        let fixture = class1_fixture();
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        let transport = ScriptedTransport::new(
+            vec![text_response(&envelope(CLASS1_FINDING))],
+            text_response(&envelope(CLASS1_FINDING)),
+        );
+
+        let outcome = run_correctness_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &absent_contract(),
+            &transport,
+            &executor,
+            AgentConfig::default(),
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        );
+
+        assert!(
+            matches!(outcome, LensOutcome::TimedOut { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            transport.requests.lock().expect("requests lock").len(),
+            0,
+            "a past deadline drives zero model turns"
+        );
+    }
+
+    #[test]
+    fn budget_signaled_finish_with_garbage_text_is_a_budget_outcome() {
+        let fixture = class1_fixture();
+        let snapshot = fixture.snapshot();
+        let executor = executor_for(&snapshot);
+        // The first turn spends the single allowed tool call; the
+        // second turn is budget-disallowed, so the garbage final text
+        // must still map to budget exhaustion, never to a finding or
+        // an invalid-output outage.
+        let transport = ScriptedTransport::new(
+            vec![
+                tool_call_response("read_file", "{\"path\": \"src/main.rs\"}"),
+                text_response("not json, just fallback prose {{{"),
+            ],
+            tool_call_response("read_file", "{\"path\": \"src/main.rs\"}"),
+        );
+
+        let outcome = run_correctness_session(
+            &snapshot,
+            &fixture.diff_text(),
+            &absent_contract(),
+            &transport,
+            &executor,
+            AgentConfig {
+                max_turns: 1,
+                ..AgentConfig::default()
+            },
+            None,
         );
 
         assert!(
@@ -809,18 +994,53 @@ mod tests {
     #[test]
     fn findings_validation_rejects_bad_shapes() {
         // Unknown severity value.
-        let bad = CLASS1_FINDING.replace("\"High\"", "\"Blocker\"");
-        assert!(parse_findings(&bad).is_err());
+        let bad = envelope(&CLASS1_FINDING.replace("\"High\"", "\"Blocker\""));
+        assert!(parse_lens_output(&bad).is_err());
         // Malformed citation.
-        let bad = CLASS1_FINDING.replace("src/main.rs:5", "src/main.rs");
-        assert!(parse_findings(&bad).is_err());
+        let bad = envelope(&CLASS1_FINDING.replace("src/main.rs:5", "src/main.rs"));
+        assert!(parse_lens_output(&bad).is_err());
         // Inverted line range.
-        let bad = CLASS1_FINDING.replace("\"line_start\": 5", "\"line_start\": 9");
-        assert!(parse_findings(&bad).is_err());
-        // The well-formed fixture finding parses, citations intact.
-        let findings = parse_findings(CLASS1_FINDING).expect("valid findings");
+        let bad = envelope(&CLASS1_FINDING.replace("\"line_start\": 5", "\"line_start\": 9"));
+        assert!(parse_lens_output(&bad).is_err());
+        // The well-formed fixture finding parses, citations intact, no note.
+        let (findings, note) =
+            parse_lens_output(&envelope(CLASS1_FINDING)).expect("valid findings");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].file, "src/parse.rs");
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn lens_output_rejects_non_envelopes() {
+        // A bare array is no longer a valid session output.
+        assert!(parse_lens_output(CLASS1_FINDING).is_err());
+        // Malformed JSON.
+        assert!(parse_lens_output("{\"findings\": [").is_err());
+        // Unknown envelope keys are rejected.
+        assert!(parse_lens_output("{\"findings\":[],\"extra\":1}").is_err());
+        // A finding with an empty title fails Finding validation.
+        let bad = envelope(&CLASS1_FINDING.replace(
+            "\"title\": \"parse_port panics on non-numeric input\"",
+            "\"title\": \"\"",
+        ));
+        assert!(parse_lens_output(&bad).is_err());
+    }
+
+    #[test]
+    fn lens_output_trims_and_drops_blank_notes() {
+        let (findings, note) =
+            parse_lens_output("{\"findings\":[],\"note\":\"  governing note  \"}")
+                .expect("valid envelope");
+        assert!(findings.is_empty());
+        assert_eq!(note.as_deref(), Some("governing note"));
+        for blank in [
+            "{\"findings\":[]}",
+            "{\"findings\":[],\"note\":null}",
+            "{\"findings\":[],\"note\":\"   \"}",
+        ] {
+            let (_, note) = parse_lens_output(blank).expect("valid envelope");
+            assert_eq!(note, None, "blank note means no note: {blank}");
+        }
     }
 
     /// FRG-20's channel separation, at the session boundary: the PR
@@ -843,7 +1063,10 @@ mod tests {
         fixture.write_diff();
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
-        let transport = ScriptedTransport::new(vec![text_response("[]")], text_response("[]"));
+        let transport = ScriptedTransport::new(
+            vec![text_response(EMPTY_ENVELOPE)],
+            text_response(EMPTY_ENVELOPE),
+        );
         let resolution = ContractResolution::Governing {
             entry_file: "AGENTS.md".to_string(),
             content: "BASE RULE: correctness first.\n".to_string(),
@@ -857,8 +1080,15 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
-        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+        assert_eq!(
+            outcome,
+            LensOutcome::Completed {
+                findings: Vec::new(),
+                note: None
+            }
+        );
 
         let opening = transport.request_text(0);
         // The governing copy is the base branch's, labeled as such.
@@ -899,7 +1129,10 @@ mod tests {
         let fixture = class1_fixture();
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
-        let transport = ScriptedTransport::new(vec![text_response("[]")], text_response("[]"));
+        let transport = ScriptedTransport::new(
+            vec![text_response(EMPTY_ENVELOPE)],
+            text_response(EMPTY_ENVELOPE),
+        );
         let resolution = ContractResolution::Governing {
             entry_file: "AGENTS.md".to_string(),
             content: "rule one\nrule two\nrule three\n".to_string(),
@@ -913,8 +1146,15 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
-        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+        assert_eq!(
+            outcome,
+            LensOutcome::Completed {
+                findings: Vec::new(),
+                note: None
+            }
+        );
         let opening = transport.request_text(0);
         assert!(
             opening.contains("truncated to its first 3 of 10 lines"),
@@ -975,9 +1215,9 @@ mod tests {
             vec![
                 tool_call_response("grep", "{\"pattern\": \"slugify\"}"),
                 tool_call_response("read_file", "{\"path\": \"src/util.rs\"}"),
-                text_response(STRUCTURE_DUP_FINDING),
+                text_response(&envelope(STRUCTURE_DUP_FINDING)),
             ],
-            text_response("[]"),
+            text_response(EMPTY_ENVELOPE),
         );
 
         let outcome = run_structure_session(
@@ -987,11 +1227,13 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
-        let LensOutcome::Completed(findings) = outcome else {
+        let LensOutcome::Completed { findings, note } = outcome else {
             panic!("expected completed findings, got {outcome:?}");
         };
+        assert_eq!(note, None, "no stand-down note on a completed review");
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].citations.as_deref(),
@@ -1019,7 +1261,10 @@ mod tests {
         );
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
-        let transport = ScriptedTransport::new(vec![text_response("[]")], text_response("[]"));
+        let transport = ScriptedTransport::new(
+            vec![text_response(EMPTY_ENVELOPE)],
+            text_response(EMPTY_ENVELOPE),
+        );
 
         let outcome = run_structure_session(
             &snapshot,
@@ -1028,9 +1273,16 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
-        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+        assert_eq!(
+            outcome,
+            LensOutcome::Completed {
+                findings: Vec::new(),
+                note: None
+            }
+        );
     }
 
     #[test]
@@ -1044,7 +1296,10 @@ mod tests {
         let uncited =
             STRUCTURE_DUP_FINDING.replace(",\n        \"citations\": [\"src/util.rs:2\"]", "");
         assert!(!uncited.contains("citations"));
-        let transport = ScriptedTransport::new(vec![text_response(&uncited)], text_response("[]"));
+        let transport = ScriptedTransport::new(
+            vec![text_response(&envelope(&uncited))],
+            text_response(EMPTY_ENVELOPE),
+        );
 
         let outcome = run_structure_session(
             &snapshot,
@@ -1053,13 +1308,15 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
         // D3: absent citations parse — rejection of unverified claims is
         // synthesis's job (FRG-26), not the validator's.
-        let LensOutcome::Completed(findings) = outcome else {
+        let LensOutcome::Completed { findings, note } = outcome else {
             panic!("expected completed findings, got {outcome:?}");
         };
+        assert_eq!(note, None, "no stand-down note on a completed review");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].citations, None);
     }
@@ -1090,6 +1347,7 @@ mod tests {
                 max_turns: 1,
                 ..AgentConfig::default()
             },
+            None,
         );
 
         assert!(
@@ -1165,8 +1423,8 @@ mod tests {
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
         let transport = ScriptedTransport::new(
-            vec![text_response(CONTRACT_VIOLATION_FINDING)],
-            text_response("[]"),
+            vec![text_response(&envelope(CONTRACT_VIOLATION_FINDING))],
+            text_response(EMPTY_ENVELOPE),
         );
         let entry = "# Fixture repo notes\n\nNever call std::env::var outside src/config.rs.\n";
 
@@ -1177,11 +1435,13 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
-        let LensOutcome::Completed(findings) = outcome else {
+        let LensOutcome::Completed { findings, note } = outcome else {
             panic!("expected completed findings, got {outcome:?}");
         };
+        assert_eq!(note, None, "no stand-down note on a completed review");
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].description.contains(CONTRACT_RULE)
@@ -1239,9 +1499,9 @@ mod tests {
         let transport = ScriptedTransport::new(
             vec![
                 tool_call_response("read_file", "{\"path\": \"docs/rules.md\"}"),
-                text_response(ROUTED_FINDING),
+                text_response(&envelope(ROUTED_FINDING)),
             ],
-            text_response("[]"),
+            text_response(EMPTY_ENVELOPE),
         );
         let entry = "# Fixture repo notes\n\nSee docs/rules.md for the widget rules.\n";
 
@@ -1252,11 +1512,13 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
-        let LensOutcome::Completed(findings) = outcome else {
+        let LensOutcome::Completed { findings, note } = outcome else {
             panic!("expected completed findings, got {outcome:?}");
         };
+        assert_eq!(note, None, "no stand-down note on a completed review");
         assert_eq!(findings.len(), 1);
         let citations = findings[0].citations.clone().expect("citations");
         assert!(
@@ -1321,8 +1583,8 @@ mod tests {
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
         let transport = ScriptedTransport::new(
-            vec![text_response(CONTRACT_EDIT_FINDINGS)],
-            text_response("[]"),
+            vec![text_response(&envelope(CONTRACT_EDIT_FINDINGS))],
+            text_response(EMPTY_ENVELOPE),
         );
 
         let outcome = run_contract_session(
@@ -1332,11 +1594,13 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
-        let LensOutcome::Completed(findings) = outcome else {
+        let LensOutcome::Completed { findings, note } = outcome else {
             panic!("expected completed findings, got {outcome:?}");
         };
+        assert_eq!(note, None, "no stand-down note on a completed review");
         assert_eq!(findings.len(), 2);
         let mut categories: Vec<&str> = findings
             .iter()
@@ -1359,7 +1623,10 @@ mod tests {
         fixture.write_diff();
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
-        let transport = ScriptedTransport::new(vec![text_response("[]")], text_response("[]"));
+        let transport = ScriptedTransport::new(
+            vec![text_response(EMPTY_ENVELOPE)],
+            text_response(EMPTY_ENVELOPE),
+        );
 
         let outcome = run_contract_session(
             &snapshot,
@@ -1368,11 +1635,18 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
         // No stated rule covers `.unwrap()`; the lens must not stretch
         // an unrelated rule to flag it.
-        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+        assert_eq!(
+            outcome,
+            LensOutcome::Completed {
+                findings: Vec::new(),
+                note: None
+            }
+        );
     }
 
     #[test]
@@ -1381,10 +1655,11 @@ mod tests {
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
         // The script is empty: the fallback finding would surface as a
-        // completed finding if any model turn ran, so Completed([])
-        // plus zero recorded requests proves the host-side
+        // completed finding if any model turn ran, so an empty
+        // Completed plus zero recorded requests proves the host-side
         // short-circuit.
-        let transport = ScriptedTransport::new(Vec::new(), text_response(CLASS1_FINDING));
+        let transport =
+            ScriptedTransport::new(Vec::new(), text_response(&envelope(CLASS1_FINDING)));
 
         let outcome = run_contract_session(
             &snapshot,
@@ -1393,9 +1668,16 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
-        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+        assert_eq!(
+            outcome,
+            LensOutcome::Completed {
+                findings: Vec::new(),
+                note: None
+            }
+        );
         assert_eq!(
             transport.requests.lock().expect("requests lock").len(),
             0,
@@ -1404,11 +1686,14 @@ mod tests {
     }
 
     #[test]
-    fn contract_uncheckable_governing_returns_empty_findings() {
+    fn contract_uncheckable_governing_returns_note_with_empty_findings() {
         let fixture = class1_fixture();
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
-        let transport = ScriptedTransport::new(vec![text_response("[]")], text_response("[]"));
+        let noted =
+            "{\"findings\":[],\"note\":\"governing copy states nothing checkable\"}".to_string();
+        let transport =
+            ScriptedTransport::new(vec![text_response(&noted)], text_response(EMPTY_ENVELOPE));
 
         let outcome = run_contract_session(
             &snapshot,
@@ -1417,9 +1702,16 @@ mod tests {
             &transport,
             &executor,
             AgentConfig::default(),
+            None,
         );
 
-        assert_eq!(outcome, LensOutcome::Completed(Vec::new()));
+        assert_eq!(
+            outcome,
+            LensOutcome::Completed {
+                findings: Vec::new(),
+                note: Some("governing copy states nothing checkable".to_string())
+            }
+        );
         // The session ran (contrast with the absent short-circuit):
         // exactly the opening turn, no tool pulls needed.
         assert_eq!(
@@ -1455,6 +1747,7 @@ mod tests {
                 max_turns: 1,
                 ..AgentConfig::default()
             },
+            None,
         );
 
         assert!(

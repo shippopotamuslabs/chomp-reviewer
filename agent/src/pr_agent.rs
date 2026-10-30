@@ -31,13 +31,15 @@
 //! empty), and `GITHUB_WORKSPACE` pinned to the run dir (plan D6) so
 //! `ARTIFACT_PATH` satisfies upstream's under-workspace rule.
 //!
-//! Every failure is a [`PrAgentOutcome::ProducerFailure`] value —
-//! never an error, never a retry. Secrets never appear in `reason`
-//! strings. Wiring into `main` (parallel fan-out, stage timeouts,
-//! outage recording, `write_outputs`) lands in FRG-24; until then
-//! this module is standalone-testable and its public items are
-//! `#[allow(dead_code)]` by the same convention as
-//! `run_structure_session`.
+//! Every failure is a [`PrAgentOutcome`] outage value — never an
+//! error, never a retry: [`PrAgentOutcome::ProducerFailure`] for
+//! spawn, nonzero-exit, credential, and run-dir failures,
+//! [`PrAgentOutcome::TimedOut`] for the timeout kill, and
+//! [`PrAgentOutcome::InvalidOutput`] for review.json
+//! content-validation failures. Secrets never appear in `reason`
+//! strings. The composition root (`main`) runs this adapter on its
+//! own fan-out thread under the configured stage timeout and records
+//! the typed outcome in the decision log.
 
 use std::fs;
 use std::io::Read;
@@ -55,8 +57,6 @@ use chomp::transport::DEFAULT_MODEL;
 
 /// Request for one PR-Agent producer run.
 #[derive(Debug, Clone)]
-// Wired into main by FRG-24 fan-out; standalone-testable until then.
-#[allow(dead_code)]
 pub struct PrAgentRequest {
     /// The real PR URL, passed as `--pr_url`.
     pub pr_url: String,
@@ -75,15 +75,19 @@ pub struct PrAgentRequest {
 /// The adapter outcome, mirroring the lens outcome discipline: a
 /// producer failure is a value, not a `Result` error.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Wired into main by FRG-24 fan-out; standalone-testable until then.
-#[allow(dead_code)]
 pub enum PrAgentOutcome {
     /// PR-Agent exited 0 and its JSON held a `review` object; `json`
     /// is the file's exact bytes.
     Completed { json: String },
-    /// Anything else: missing env (no spawn), spawn failure, nonzero
-    /// exit, timeout kill, or an unreadable/invalid output file.
+    /// Spawn failure, poll failure, nonzero exit, or missing
+    /// credentials / run-dir / repo-map write failures (no spawn).
     ProducerFailure { reason: String },
+    /// The child ran past `timeout` and was killed and reaped.
+    TimedOut { reason: String },
+    /// The child exited 0 but review.json failed content
+    /// validation: missing/unreadable, empty, non-UTF-8, invalid
+    /// JSON, or no `review` object.
+    InvalidOutput { reason: String },
 }
 
 /// Run one PR-Agent producer invocation against the real PR URL.
@@ -91,8 +95,6 @@ pub enum PrAgentOutcome {
 /// Reads the D5 environment itself; absent credentials fail before any
 /// spawn. The run dir is removed on every path (cleanup failure is
 /// not a producer failure).
-// Wired into main by FRG-24 fan-out; standalone-testable until then.
-#[allow(dead_code)]
 pub fn run_pr_agent(request: &PrAgentRequest) -> PrAgentOutcome {
     run_pr_agent_with_env(request, &|name| std::env::var(name).ok())
 }
@@ -389,7 +391,7 @@ fn run_invocation(invocation: &Invocation, timeout: Duration) -> PrAgentOutcome 
         let _ = child.wait();
         drop(stdout_reader);
         drop(stderr_reader);
-        return PrAgentOutcome::ProducerFailure {
+        return PrAgentOutcome::TimedOut {
             reason: format!(
                 "pr-agent timed out after {}ms; killed subprocess",
                 timeout.as_millis()
@@ -418,7 +420,7 @@ fn run_invocation(invocation: &Invocation, timeout: Duration) -> PrAgentOutcome 
     let bytes = match fs::read(&invocation.review_json) {
         Ok(bytes) => bytes,
         Err(error) => {
-            return PrAgentOutcome::ProducerFailure {
+            return PrAgentOutcome::InvalidOutput {
                 reason: format!(
                     "pr-agent succeeded but wrote no review JSON at {}: {error}",
                     invocation.review_json.display()
@@ -427,7 +429,7 @@ fn run_invocation(invocation: &Invocation, timeout: Duration) -> PrAgentOutcome 
         }
     };
     if bytes.is_empty() {
-        return PrAgentOutcome::ProducerFailure {
+        return PrAgentOutcome::InvalidOutput {
             reason: format!(
                 "pr-agent review JSON at {} is empty",
                 invocation.review_json.display()
@@ -437,7 +439,7 @@ fn run_invocation(invocation: &Invocation, timeout: Duration) -> PrAgentOutcome 
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(_) => {
-            return PrAgentOutcome::ProducerFailure {
+            return PrAgentOutcome::InvalidOutput {
                 reason: format!(
                     "pr-agent review JSON at {} is not valid UTF-8 JSON",
                     invocation.review_json.display()
@@ -448,7 +450,7 @@ fn run_invocation(invocation: &Invocation, timeout: Duration) -> PrAgentOutcome 
     let parsed: serde_json::Value = match serde_json::from_str(&text) {
         Ok(parsed) => parsed,
         Err(error) => {
-            return PrAgentOutcome::ProducerFailure {
+            return PrAgentOutcome::InvalidOutput {
                 reason: format!(
                     "pr-agent review JSON at {} is not valid JSON: {error}",
                     invocation.review_json.display()
@@ -460,7 +462,7 @@ fn run_invocation(invocation: &Invocation, timeout: Duration) -> PrAgentOutcome 
         .get("review")
         .is_some_and(serde_json::Value::is_object)
     {
-        return PrAgentOutcome::ProducerFailure {
+        return PrAgentOutcome::InvalidOutput {
             reason: format!(
                 "pr-agent review JSON at {} has no `review` object",
                 invocation.review_json.display()
@@ -571,7 +573,8 @@ mod tests {
     /// argv and selected env to `$FAKE_RECORD`, copies the artifact
     /// to `$FAKE_ARTIFACT_COPY`, then behaves per `$FAKE_MODE` —
     /// `ok` (copy `$FAKE_CANNED` to the `--json-output` path),
-    /// `exit3`, `sleep`, `nofile`, `empty`, `nonjson`, `noreview`.
+    /// `exit3`, `sleep`, `nofile`, `empty`, `nonjson`, `nonutf8`,
+    /// `noreview`.
     fn write_fake(dir: &Path) -> PathBuf {
         let fake = dir.join("fake-python");
         let script = r#"#!/bin/sh
@@ -609,6 +612,7 @@ case "$FAKE_MODE" in
   nofile) : ;;
   empty) : > "$out" ;;
   nonjson) printf 'not json at all{{{' > "$out" ;;
+  nonutf8) printf '\377\376{invalid utf-8}' > "$out" ;;
   noreview) printf '{"usage":{"tokens":1}}' > "$out" ;;
 esac
 "#;
@@ -915,8 +919,8 @@ esac
         let started = Instant::now();
         let outcome = run_pr_agent(&request);
         let elapsed = started.elapsed();
-        let PrAgentOutcome::ProducerFailure { reason } = outcome else {
-            panic!("expected ProducerFailure, got {outcome:?}");
+        let PrAgentOutcome::TimedOut { reason } = outcome else {
+            panic!("expected TimedOut, got {outcome:?}");
         };
         assert!(reason.contains("timed out"), "{reason}");
         assert!(
@@ -932,24 +936,48 @@ esac
         let dir = fixture_dir("bad-output");
         let fake = write_fake(&dir);
         let mut reasons = Vec::new();
-        for mode in ["nofile", "empty", "nonjson", "noreview"] {
+        for mode in ["nofile", "empty", "nonjson", "nonutf8", "noreview"] {
             let (_restore, _record, _artifact) = use_fake_env(&dir, &fake, mode, None);
             let outcome = run_pr_agent(&test_request());
-            let PrAgentOutcome::ProducerFailure { reason } = outcome else {
-                panic!("mode {mode}: expected ProducerFailure, got {outcome:?}");
+            let PrAgentOutcome::InvalidOutput { reason } = outcome else {
+                panic!("mode {mode}: expected InvalidOutput, got {outcome:?}");
             };
             reasons.push(reason);
         }
         assert!(reasons[0].contains("no review JSON"), "{}", reasons[0]);
         assert!(reasons[1].contains("is empty"), "{}", reasons[1]);
         assert!(reasons[2].contains("not valid JSON"), "{}", reasons[2]);
-        assert!(reasons[3].contains("no `review` object"), "{}", reasons[3]);
+        assert!(reasons[3].contains("not valid UTF-8"), "{}", reasons[3]);
+        assert!(reasons[4].contains("no `review` object"), "{}", reasons[4]);
         let unique: std::collections::HashSet<_> = reasons.iter().collect();
         assert_eq!(
             unique.len(),
-            4,
+            5,
             "each bad-output mode needs a distinct reason"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_failure_stays_producer_failure() {
+        let _lock = env_lock();
+        let dir = fixture_dir("nospawn-binary");
+        let fake = write_fake(&dir);
+        let (restore, _record, _artifact) = use_fake_env(&dir, &fake, "ok", None);
+        // Point at a binary that cannot exist, so the spawn itself
+        // fails before any child runs.
+        std::env::set_var(
+            "FORGE_PR_AGENT_PYTHON",
+            dir.join("no-such-interpreter")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let outcome = run_pr_agent(&test_request());
+        drop(restore);
+        let PrAgentOutcome::ProducerFailure { reason } = outcome else {
+            panic!("expected ProducerFailure, got {outcome:?}");
+        };
+        assert!(reason.contains("failed to spawn"), "{reason}");
         fs::remove_dir_all(&dir).ok();
     }
 

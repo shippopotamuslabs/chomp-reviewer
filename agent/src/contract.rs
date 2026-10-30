@@ -18,6 +18,10 @@ use serde::Deserialize;
 
 const DEFAULT_ENTRY_FILE: &str = "AGENTS.md";
 const DEFAULT_ENTRY_MAX_LINES: usize = 2_000;
+const DEFAULT_DEEP_REVIEW: bool = true;
+const DEFAULT_LENS_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_PR_AGENT_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_SYNTHESIS_TIMEOUT_SECS: u64 = 600;
 
 /// The `[forge]` section of a repository's `.pr_agent.toml` file.
 ///
@@ -33,6 +37,16 @@ pub struct ForgeConfig {
     /// decision D3). An entry file past the ceiling is truncated at
     /// resolution, with the truncation recorded.
     pub entry_max_lines: usize,
+    /// Full fan-out runs when true. Reserved: the reduced mode is not
+    /// available in Forge 2.0 v1; the fan-out owns the ignore-with-record
+    /// behavior, not the parser.
+    pub deep_review: bool,
+    /// Per-lens stage timeout, in seconds.
+    pub lens_timeout_secs: u64,
+    /// PR-Agent stage timeout, in seconds.
+    pub pr_agent_timeout_secs: u64,
+    /// Reserved for FRG-26 synthesis; unused by any stage in this ticket.
+    pub synthesis_timeout_secs: u64,
 }
 
 impl Default for ForgeConfig {
@@ -42,6 +56,10 @@ impl Default for ForgeConfig {
             pr_agent_context_files: vec![entry_file.clone()],
             entry_file,
             entry_max_lines: DEFAULT_ENTRY_MAX_LINES,
+            deep_review: DEFAULT_DEEP_REVIEW,
+            lens_timeout_secs: DEFAULT_LENS_TIMEOUT_SECS,
+            pr_agent_timeout_secs: DEFAULT_PR_AGENT_TIMEOUT_SECS,
+            synthesis_timeout_secs: DEFAULT_SYNTHESIS_TIMEOUT_SECS,
         }
     }
 }
@@ -56,6 +74,10 @@ struct ForgeSection {
     entry_file: Option<String>,
     pr_agent_context_files: Option<Vec<String>>,
     entry_max_lines: Option<usize>,
+    deep_review: Option<bool>,
+    lens_timeout_secs: Option<u64>,
+    pr_agent_timeout_secs: Option<u64>,
+    synthesis_timeout_secs: Option<u64>,
 }
 
 impl From<ForgeSection> for ForgeConfig {
@@ -70,6 +92,16 @@ impl From<ForgeSection> for ForgeConfig {
             entry_file,
             pr_agent_context_files,
             entry_max_lines: section.entry_max_lines.unwrap_or(DEFAULT_ENTRY_MAX_LINES),
+            deep_review: section.deep_review.unwrap_or(DEFAULT_DEEP_REVIEW),
+            lens_timeout_secs: section
+                .lens_timeout_secs
+                .unwrap_or(DEFAULT_LENS_TIMEOUT_SECS),
+            pr_agent_timeout_secs: section
+                .pr_agent_timeout_secs
+                .unwrap_or(DEFAULT_PR_AGENT_TIMEOUT_SECS),
+            synthesis_timeout_secs: section
+                .synthesis_timeout_secs
+                .unwrap_or(DEFAULT_SYNTHESIS_TIMEOUT_SECS),
         }
     }
 }
@@ -83,7 +115,20 @@ pub fn parse_config_str(contents: &str, source: &Path) -> Result<ForgeConfig, St
             source.display()
         )
     })?;
-    Ok(parsed.forge.map(ForgeConfig::from).unwrap_or_default())
+    let config = parsed.forge.map(ForgeConfig::from).unwrap_or_default();
+    for (key, value) in [
+        ("lens_timeout_secs", config.lens_timeout_secs),
+        ("pr_agent_timeout_secs", config.pr_agent_timeout_secs),
+        ("synthesis_timeout_secs", config.synthesis_timeout_secs),
+    ] {
+        if value == 0 {
+            return Err(format!(
+                "invalid Chomp configuration {}: {key} must be greater than 0",
+                source.display()
+            ));
+        }
+    }
+    Ok(config)
 }
 
 /// Load the effective configuration for a review.
@@ -404,6 +449,68 @@ mod tests {
         .expect("foreign content ignored");
         assert_eq!(config.entry_file, "GUIDE.md");
         assert_eq!(config.pr_agent_context_files, vec!["GUIDE.md".to_string()]);
+    }
+
+    #[test]
+    fn timeout_keys_default_when_absent() {
+        let config = parse_config_str("", Path::new("fixture.toml")).expect("parse empty");
+        assert_eq!(config.lens_timeout_secs, 600);
+        assert_eq!(config.pr_agent_timeout_secs, 900);
+        assert_eq!(config.synthesis_timeout_secs, 600);
+        assert!(config.deep_review);
+    }
+
+    #[test]
+    fn all_four_keys_land_verbatim() {
+        let config = parse_config_str(
+            "[forge]\ndeep_review = false\nlens_timeout_secs = 30\npr_agent_timeout_secs = 45\nsynthesis_timeout_secs = 60\n",
+            Path::new("fixture.toml"),
+        )
+        .expect("parse four keys");
+        assert!(!config.deep_review);
+        assert_eq!(config.lens_timeout_secs, 30);
+        assert_eq!(config.pr_agent_timeout_secs, 45);
+        assert_eq!(config.synthesis_timeout_secs, 60);
+    }
+
+    #[test]
+    fn zero_lens_timeout_is_an_error_naming_the_key() {
+        let error = parse_config_str(
+            "[forge]\nlens_timeout_secs = 0\n",
+            Path::new("fixture.toml"),
+        )
+        .expect_err("zero lens timeout must fail");
+        assert!(error.contains("lens_timeout_secs"), "{error}");
+    }
+
+    #[test]
+    fn zero_pr_agent_timeout_is_an_error_naming_the_key() {
+        let error = parse_config_str(
+            "[forge]\npr_agent_timeout_secs = 0\n",
+            Path::new("fixture.toml"),
+        )
+        .expect_err("zero pr_agent timeout must fail");
+        assert!(error.contains("pr_agent_timeout_secs"), "{error}");
+    }
+
+    #[test]
+    fn zero_synthesis_timeout_is_an_error_naming_the_key() {
+        let error = parse_config_str(
+            "[forge]\nsynthesis_timeout_secs = 0\n",
+            Path::new("fixture.toml"),
+        )
+        .expect_err("zero synthesis timeout must fail");
+        assert!(error.contains("synthesis_timeout_secs"), "{error}");
+    }
+
+    #[test]
+    fn deep_review_false_is_preserved() {
+        let config = parse_config_str("[forge]\ndeep_review = false\n", Path::new("fixture.toml"))
+            .expect("parse deep_review=false");
+        assert!(!config.deep_review);
+        assert_eq!(config.lens_timeout_secs, 600);
+        assert_eq!(config.pr_agent_timeout_secs, 900);
+        assert_eq!(config.synthesis_timeout_secs, 600);
     }
 
     /// A git repo on branch `main` with one base commit; tests stage

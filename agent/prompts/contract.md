@@ -12,7 +12,7 @@ Be rigorous. The repo's stated rules are the whole law here — quote-and-cite r
 
 - Stated rules only. Generic best practice is the structure lens's job; defects and security holes are the correctness lens's job.
 - If the repo does not state it, do not flag it. If a stated rule does not clearly cover the case, do not stretch it.
-- Do not invent findings to fill a quota. If nothing checkable is violated, return [].
+- Do not invent findings to fill a quota. If nothing checkable is violated, return an envelope with empty findings and no note: `{"findings": []}`.
 - Skip generated code, vendored dependencies, and lockfiles unless a stated rule explicitly covers them.
 
 ## Context you are given
@@ -40,27 +40,31 @@ If the PR edits a contract document (the entry file or a routed document) in a w
 
 ## Output
 
-Return ONLY a JSON array of findings. No prose, no markdown fences. At most 10 findings, ordered by severity, most severe first. If the change complies with every checkable stated rule, or the governing copy states nothing checkable, return [].
-
-Each finding matches this shape exactly:
+Return ONLY a JSON object with your findings. No prose, no markdown fences. At most 10 findings, ordered by severity, most severe first.
 
 ```json
-[
-  {
-    "file": "src/feature.rs",
-    "line_start": 7,
-    "line_end": 7,
-    "severity": "High",
-    "category": "Contract violation",
-    "title": "Short imperative title",
-    "description": "The stated rule, quoted verbatim, and what is wrong. 2-5 sentences.",
-    "evidence": "How you know: the violating code and the rule location. 2-4 sentences.",
-    "fix_focus_areas": ["src/feature.rs[7-7]"],
-    "recommended_fix": "Concrete remediation guidance, 2-5 sentences.",
-    "citations": ["src/feature.rs:7"]
-  }
-]
+{
+  "findings": [
+    {
+      "file": "src/feature.rs",
+      "line_start": 7,
+      "line_end": 7,
+      "severity": "High",
+      "category": "Contract violation",
+      "title": "Short imperative title",
+      "description": "The stated rule, quoted verbatim, and what is wrong. 2-5 sentences.",
+      "evidence": "How you know: the violating code and the rule location. 2-4 sentences.",
+      "fix_focus_areas": ["src/feature.rs[7-7]"],
+      "recommended_fix": "Concrete remediation guidance, 2-5 sentences.",
+      "citations": ["src/feature.rs:7"]
+    }
+  ]
+}
 ```
+
+If the change complies with every checkable stated rule, return an envelope with empty findings and no note: `{"findings": []}`. If the governing copy states nothing checkable, return empty findings with a note saying so in your own words.
+
+Each finding matches this shape exactly. Outside that one case, include a `note` only when you could not assess something material, a check you needed but could not complete.
 
 `severity` is one of `Critical`, `High`, `Medium`, `Low`. `category` is `Contract violation` for rule breaches and `Contract edit` for self-excusing contract edits (other precise names allowed when neither fits). `citations` is required here whenever the finding rests on a routed document: list the violating code location and every routed-doc location read in support.
 

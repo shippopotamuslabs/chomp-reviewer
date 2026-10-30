@@ -2,11 +2,15 @@
 //!
 //! This binary is a host for `agent_core`, an owner of repository tools, and
 //! nothing else. FRG-15 scaffolded the CLI, configuration loading, and
-//! output contract; FRG-19 runs the correctness lens end to end; FRG-20
-//! resolves the contract entry file from the base branch. Fan-out,
-//! synthesis, and the remaining lenses land in their own tickets.
+//! output contract; FRG-19/FRG-21/FRG-22 run the three lens sessions end
+//! to end; FRG-20 resolves the contract entry file from the base branch;
+//! FRG-23 adapts the PR-Agent subprocess. FRG-24 fans the three lenses
+//! and the adapter out concurrently and records every producer's
+//! outcome in the decision log. Synthesis lands in its own ticket
+//! (FRG-26).
 
 mod contract;
+mod fan_out;
 mod host;
 mod outputs;
 mod pr_agent;
@@ -19,6 +23,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+
+use agent_core::session::AgentConfig;
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_ORCHESTRATION_FAILURE: i32 = 2;
@@ -239,11 +245,18 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
     // resolves to a recorded stand-down and the review proceeds.
     let resolution = contract::resolve_contract(&args.repo, &args.base_ref, &config)
         .map_err(|error| error.to_string())?;
-    let decision_entries: Vec<serde_json::Value> = resolution
+    let mut decision_entries: Vec<serde_json::Value> = resolution
         .recorded_event()
         .map(|(event, detail)| outputs::host_event("contract", event, &detail))
         .into_iter()
         .collect();
+    if !config.deep_review {
+        decision_entries.push(outputs::host_event(
+            "config",
+            "deep_review_ignored",
+            "reduced mode requested (deep_review = false); not available in Forge 2.0 v1, full fan-out ran",
+        ));
+    }
     let executor: Arc<dyn chomp::tools::ToolExecutor + Send + Sync> = Arc::new(
         chomp::tools::RepoToolExecutor::new(snapshot.root.clone(), snapshot.head_sha.clone())
             .map_err(|error| {
@@ -253,30 +266,95 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
                 )
             })?,
     );
-    let transport =
-        chomp::transport::OpenRouterTransport::from_env().map_err(|error| error.to_string())?;
-    match sessions::run_correctness_session(
-        &snapshot,
-        &diff_text,
-        &resolution,
-        &transport,
-        &executor,
-        agent_core::session::AgentConfig::default(),
-    ) {
-        sessions::LensOutcome::Completed(findings) => outputs::write_outputs(
-            &findings,
-            &decision_entries,
-            &args.out_findings,
-            &args.out_decisions,
-            &args.out_pr_agent,
-        ),
-        sessions::LensOutcome::ProducerFailure { reason } => {
-            Err(format!("correctness session failed: {reason}"))
-        }
-        sessions::LensOutcome::BudgetExhausted { reason } => Err(format!(
-            "correctness session exhausted its budget: {reason}"
-        )),
+    let transport: Arc<chomp::transport::OpenRouterTransport> = Arc::new(
+        chomp::transport::OpenRouterTransport::from_env().map_err(|error| error.to_string())?,
+    );
+    decision_entries.push(outputs::host_event(
+        "run",
+        "fan_out",
+        "one AgentEngine per lens session, constructed inside its driver thread; one shared model transport and tool executor across driver threads",
+    ));
+    let timeouts = fan_out::StageTimeouts::from_config(&config);
+    let snapshot = Arc::new(snapshot);
+    let pr_agent_request = pr_agent::PrAgentRequest {
+        pr_url: args.pr_url.clone(),
+        context_files: config.pr_agent_context_files.clone(),
+        repo_map: snapshot.repo_map.render(),
+        entry_max_lines: config.entry_max_lines,
+        timeout: timeouts.pr_agent,
+    };
+    let pr_agent_runner: fan_out::PrAgentRunner = Arc::new(pr_agent::run_pr_agent);
+    let result = fan_out::run_fan_out(fan_out::FanOutInputs {
+        snapshot,
+        diff_text,
+        contract: resolution,
+        executor,
+        transports: fan_out::LensTransports {
+            correctness: transport.clone(),
+            structure: transport.clone(),
+            contract: transport.clone(),
+        },
+        agent_config: AgentConfig::default(),
+        pr_agent_request,
+        pr_agent_runner,
+        timeouts,
+    });
+    for record in &result.records {
+        decision_entries.push(stage_entry(record));
     }
+    let combined: Vec<outputs::Finding> = result
+        .lens_findings
+        .iter()
+        .flat_map(|(_, findings)| findings.clone())
+        .collect();
+    outputs::write_findings(&combined, &args.out_findings)?;
+    for (stage, findings) in &result.lens_findings {
+        outputs::write_findings(
+            findings,
+            &outputs::lens_findings_path(&args.out_findings, stage.as_str()),
+        )?;
+    }
+    outputs::write_decision_log(&decision_entries, &args.out_decisions)?;
+    outputs::write_pr_agent(result.pr_agent_json.as_deref(), &args.out_pr_agent)?;
+    if !result.any_ran_completed {
+        let failed: Vec<String> = result
+            .records
+            .iter()
+            .filter(|record| !record.completed)
+            .map(|record| {
+                format!(
+                    "{} ({})",
+                    record.stage.as_str(),
+                    record
+                        .mode
+                        .map(fan_out::FailureMode::as_str)
+                        .unwrap_or("unknown")
+                )
+            })
+            .collect();
+        return Err(format!(
+            "all review producers failed: {}",
+            failed.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// One stage record as a decision-log entry (plan D4): the run's
+/// per-producer account — completion or outage with its failure
+/// mode, stand-down note, finding count, and host-side timing.
+fn stage_entry(record: &fan_out::StageRecord) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "stage",
+        "stage": record.stage.as_str(),
+        "status": if record.completed { "completed" } else { "producer_outage" },
+        "mode": record.mode.map(fan_out::FailureMode::as_str),
+        "detail": record.detail,
+        "note": record.note,
+        "findings": record.findings,
+        "started_offset_ms": record.started_offset_ms as u64,
+        "elapsed_ms": record.elapsed_ms as u64,
+    })
 }
 
 fn run() -> i32 {

@@ -43,17 +43,31 @@ pub enum DriveOutcome {
         reason: String,
         budget_signaled: bool,
     },
+    /// The stage deadline passed before the session reached a
+    /// terminal action. The host records this; the lens maps it to
+    /// its own typed timed-out outcome.
+    TimedOut { reason: String },
 }
 
 /// Drive one session to a terminal action, servicing model and tool
 /// requests through the given port and executor.
+///
+/// `deadline` is the stage's cooperative stop: when it has passed at
+/// the top of a pull-loop iteration, the drive ends as
+/// [`DriveOutcome::TimedOut`] instead of servicing another action.
 pub fn drive_session(
     engine: &AgentEngine,
     handle: &SessionHandle,
     transport: &dyn ModelTransport,
     executor: &Arc<dyn ToolExecutor + Send + Sync>,
+    deadline: Option<std::time::Instant>,
 ) -> DriveOutcome {
     for _ in 0..MAX_DRIVE_STEPS {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return DriveOutcome::TimedOut {
+                reason: "stage deadline exceeded before the session finished".to_string(),
+            };
+        }
         match engine.next_action(handle) {
             AgentAction::CallModel(request) => match transport.complete_model_turn(&request) {
                 Ok(response) => engine.submit_model_response(handle, response),
@@ -167,12 +181,60 @@ mod tests {
             )
             .expect("session");
 
-        let outcome = drive_session(&engine, &handle, &DeadTransport, &executor);
+        let outcome = drive_session(&engine, &handle, &DeadTransport, &executor, None);
         match outcome {
             DriveOutcome::Failed { reason, .. } => {
                 assert!(!reason.is_empty(), "failure carries a reason");
             }
             other => panic!("expected a failed drive, got {other:?}"),
+        }
+        fs::remove_dir_all(dir).expect("clean temp dir");
+    }
+
+    #[test]
+    fn past_deadline_times_out_before_any_action() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("chomp-host-timeout-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let executor: Arc<dyn ToolExecutor + Send + Sync> =
+            Arc::new(RepoToolExecutor::new(dir.clone(), "abc123".to_string()).expect("executor"));
+
+        let engine = AgentEngine::new();
+        let handle = engine
+            .create_session(
+                vec![AgentMessage {
+                    id: "u1".to_string(),
+                    role: AgentRole::User,
+                    content: "review this".to_string(),
+                    metadata: MessageMeta::new(),
+                }],
+                AgentConfig::default(),
+                SessionCapabilities {
+                    summarization_allowed: false,
+                    ..Default::default()
+                },
+                Value::Null,
+                SessionIoParams::new(
+                    "openrouter".to_string(),
+                    200_000,
+                    "[]".to_string(),
+                    "sys".to_string(),
+                )
+                .expect("io params"),
+            )
+            .expect("session");
+
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let outcome = drive_session(&engine, &handle, &DeadTransport, &executor, Some(past));
+        match outcome {
+            DriveOutcome::TimedOut { reason } => {
+                assert!(!reason.is_empty(), "timeout carries a reason");
+            }
+            other => panic!("expected a timed-out drive, got {other:?}"),
         }
         fs::remove_dir_all(dir).expect("clean temp dir");
     }

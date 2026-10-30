@@ -34,27 +34,31 @@ Any claim about a caller, callee, or consumer must be pulled and cited before it
 
 ## Output
 
-Return ONLY a JSON array of findings. No prose, no markdown fences. At most 10 findings, ordered by severity, most severe first. If the code is clean, return [].
-
-Each finding matches this shape exactly:
+Return ONLY a JSON object with your findings. No prose, no markdown fences. At most 10 findings, ordered by severity, most severe first.
 
 ```json
-[
-  {
-    "file": "path/to/file.rs",
-    "line_start": 120,
-    "line_end": 134,
-    "severity": "High",
-    "category": "Correctness",
-    "title": "Short imperative title",
-    "description": "What is wrong and why it matters. 2-5 sentences.",
-    "evidence": "How you know: data flow, call sites, docs. 2-4 sentences.",
-    "fix_focus_areas": ["path/to/file.rs[120-134]"],
-    "recommended_fix": "Concrete remediation guidance, 2-5 sentences.",
-    "citations": ["path/to/caller.rs:57"]
-  }
-]
+{
+  "findings": [
+    {
+      "file": "path/to/file.rs",
+      "line_start": 120,
+      "line_end": 134,
+      "severity": "High",
+      "category": "Correctness",
+      "title": "Short imperative title",
+      "description": "What is wrong and why it matters. 2-5 sentences.",
+      "evidence": "How you know: data flow, call sites, docs. 2-4 sentences.",
+      "fix_focus_areas": ["path/to/file.rs[120-134]"],
+      "recommended_fix": "Concrete remediation guidance, 2-5 sentences.",
+      "citations": ["path/to/caller.rs:57"]
+    }
+  ]
+}
 ```
+
+If the code is clean, return an envelope with an empty findings array and no note: `{"findings": []}`.
+
+Each finding matches this shape exactly. Include a `note` alongside `findings` only when you could not assess something material, a check you needed but could not complete. A note stands down that check. It is never a summary, and it never softens a clean review.
 
 `severity` is one of `Critical`, `High`, `Medium`, `Low`. `category` names the defect class (e.g. `Bug`, `Security`, `Correctness`, `Data integrity`, `Concurrency`). `citations` is optional; include it whenever the finding rests on code outside the changed lines, listing every location you read in support.
 
