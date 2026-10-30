@@ -4,9 +4,16 @@ Forge posts one code review per pull request. Three reviewers run first, each on
 
 Forge runs as a reusable GitHub Actions workflow inside a project's own repository. A project adds one small caller workflow, sets two secrets, and gets a review on every pull request. Reviews run once per pull request. Pushes after the first review get verification: Forge checks its open review threads against the new code and resolves the ones the push fixed.
 
-## Where Forge is headed
+## Forge 2.0 (opt-in)
 
-Forge 2.0 is planned, ratified on 2026-10-26, and tracked as tickets in Linear. The full architectural proposal is checked in at [docs/forge-2.0-architectural-proposal.md](docs/forge-2.0-architectural-proposal.md). In short: the reviewer gets the full repository instead of only the diff. A Rust orchestration host built on the agent_core crate runs one agent session per review lens, each session reads the repository's own agent file first and pulls the code and contract documents it needs with read-only tools, and a final session verifies and synthesizes every producer's findings into the single consolidated review. PR-Agent stays in the lineup as an unmodified producer. Everything below this section describes the current released behavior (v1.x), and it stays accurate until the 2.0 work lands.
+Forge 2.0 gives the reviewer the full repository instead of only the diff. A Rust orchestration host (`chomp`, built on the agent_core crate) runs one agent session per review lens in parallel; each session reads the repository's own agent file first and pulls the code and contract documents it needs with read-only tools. Producer findings pass through deterministic pre-dedup clustering, then a final synthesizer session verifies and adjudicates every finding — with read-only follow-up tools, a recorded decision log, and a bounded number of PR-Agent re-runs — and posts the single consolidated review. PR-Agent stays in the lineup as an unmodified producer. The full architectural proposal is checked in at [docs/forge-2.0-architectural-proposal.md](docs/forge-2.0-architectural-proposal.md).
+
+2.0 is merged on `main` but gated behind the `forge_agent` workflow input (default `off`): the 1.x path below remains the default behavior. Opt in per caller:
+
+- `forge_agent: "on"` — the 2.0 path runs the review and posts it.
+- `forge_agent: "shadow"` — the 2.0 path runs alongside the 1.x review, posts nothing, and uploads its findings plus the decision log as run artifacts for comparison.
+
+2.0 needs a `forge_ref` that contains the Rust host (any ref at or after the 2.0 merge; the `v2.0.0` tag once cut). The reusable workflow checks out Forge at that ref, builds `chomp`, and fetches the PR's base branch so the contract lens can check the diff against the governing contract — no extra setup on the consumer side. Status and caveats, stated plainly: the proof-suite live evaluation has not run yet, shadow measurements and tuning are pending, per-lens model overrides are not implemented, and the 1.x verify loop is unchanged on both paths. Everything below this section describes the default 1.x path, and it stays accurate.
 
 ## How a review runs
 
@@ -86,6 +93,7 @@ jobs:
     with:
       forge_ref: v1.1.0   # the release this repo runs
       forge_app_id: 1234567   # your Forge app's ID - see "Your own Forge app" below
+      # forge_agent: "on"   # opt-in: run reviews through the 2.0 agent path (see "Forge 2.0")
     secrets:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       FORGE_APP_PRIVATE_KEY: ${{ secrets.FORGE_APP_PRIVATE_KEY }}
@@ -97,7 +105,7 @@ Set these secrets on the consuming project:
 
 | Secret | Required | Purpose |
 |--------|----------|---------|
-| `OPENROUTER_API_KEY` | Yes | OpenRouter key for the Thermos lenses, the master dedup, and verification. |
+| `OPENROUTER_API_KEY` | Yes | OpenRouter key for the Thermos lenses, the master dedup, and verification — and, on the 2.0 path, for every lens and synthesis session. |
 | `FORGE_APP_PRIVATE_KEY` | Yes | Private key of your Forge GitHub App. The workflow mints a short-lived token from it, and your app's identity posts the reviews. |
 | `LINEAR_API_KEY` | No | Forge's ticket step fetches linked Linear issues with it and forwards it to the PR-Agent producer step. Absence changes nothing: GitHub-issue linking still works, Linear tickets just are not fetched. |
 
@@ -122,6 +130,8 @@ Reviews post under a GitHub App identity, not a user account. The workflow's `fo
 
 Rotating the identity later is the same shape: generate a new key, replace the secret, delete the old key on the app page.
 
+Forge 2.0 changes nothing in the list above: same app, same permissions, same two secrets, same `model` input. The 2.0-specific wiring is inside the reusable workflow — it builds `chomp`, fetches the PR's base branch, and keeps the credentials separated: the Forge app token can only touch the consumer repo (base fetch, PR-Agent via the GitHub provider, posting), while the `OPENROUTER_API_KEY` secret only ever reaches the model API. A consumer opting into `forge_agent` adds the one input and needs nothing else.
+
 ## Linked tickets & conformance
 
 Forge links PRs to Linear tickets and GitHub issues deterministically - no LLM involved. The ticket step extracts refs with a strict cascade: head branch name, then PR title, then PR body, then commit messages. The first source that yields a match wins per provider; multiple distinct tickets in that source are all checked. No match is normal: the review proceeds and the rollup notes no linked ticket.
@@ -135,6 +145,36 @@ Forge links PRs to Linear tickets and GitHub issues deterministically - no LLM i
 To get linking: name the branch or PR after the ticket key, or reference it in the title, body, or commits. For Linear ticket fetching, set the optional `LINEAR_API_KEY` secret; GitHub issues need no new secret (Forge app token).
 
 The ticket step writes `ticket.md` / `ticket.json` beside `mr.diff` and passes them to PR-Agent, both Thermos lenses, and master as delimited untrusted quoted context - ticket text is data, never instructions. The master rollup gains a `## Ticket conformance` section: resolved tickets with links, per-criterion addressed / not evident / contradicted verdicts with file/line evidence, a neutral unrelated-changes list, and one overall line (`conforms`, `partially conforms`, `does not conform`, or `no linked ticket`). On re-push, verify re-evaluates open criteria and posts a summary re-check comment. Advisory only, never a merge gate. Sparse tickets produce sparse verdicts.
+
+## Forge 2.0: configuration reference
+
+Every adopter-visible setting on the 2.0 path, defaults verified against the shipped `chomp` (`agent/src/contract.rs`) and the reusable workflow. The workflow inputs are the whole consumer surface in v1: `chomp` also reads an optional `--config` file for the remaining knobs, but the workflow does not pass one yet, so those run at their compiled-in defaults.
+
+| Setting | Shipped default | Set by | Meaning |
+|---------|----------------|--------|---------|
+| `forge_agent` | `off` | workflow input | `off`: 1.x behavior. `on`: 2.0 runs and posts. `shadow`: 2.0 runs, 1.x posts, 2.0 findings + decision log upload as artifacts. |
+| `model` | `openrouter/meta/muse-spark-1.3-contributor` | workflow input (empty = default) | Review model for every 2.0 session and for PR-Agent. The `openrouter/` prefix is stripped before direct API calls. Per-lens model overrides are not implemented. |
+| `pr_agent_version` | `0.49.0` | workflow input | PR-Agent version installed unmodified from PyPI. |
+| `forge_ref` | `main` | caller (pinned per repo) | Forge ref the workflow checks out and builds `chomp` from. For 2.0 it must contain the Rust host. |
+| `entry_file` | `AGENTS.md` | compiled default | The agent file every session reads first. |
+| `entry_max_lines` | `2000` | compiled default | Lines of the entry file kept before the session sees the routing table instead. |
+| `pr_agent_context_files` | `[entry_file]` | compiled default | Extra context files front-loaded into the PR-Agent producer. |
+| `deep_review` | on | compiled default | Per-producer deep review inside `chomp`. |
+| `lens_timeout_secs` | `600` | compiled default | Wall-clock budget per lens session. |
+| `pr_agent_timeout_secs` | `900` | compiled default | Wall-clock budget for the PR-Agent producer run. |
+| `synthesis_timeout_secs` | `600` | compiled default | Wall-clock budget for the synthesizer session. |
+| `pr_agent_followups` | `2` | compiled default | How many times the synthesizer may re-run PR-Agent with focused follow-up guidance. `0` disables the tool. |
+
+Deliberately not knobs: Forge always runs the full fan-out (every lens, every review), the workflow ceiling stays 45 minutes, and the per-stage budgets above sit under it with room for the `chomp` build. Tuning of these defaults against shadow measurements is pending — the values above are the as-shipped ones, not tuned recommendations.
+
+## Writing a contract Forge can use
+
+The 2.0 contract lens reads the consumer repo's agent file the way a new team member would: entry file first (`AGENTS.md` by default), routing table when the file is long, then the linked contract documents. What makes a repo review well:
+
+- **Stated rules beat implied ones.** A checkable statement ("every migration has a down path", "no new `unwrap()` outside tests") is something the lens can verify against the diff; a vibe ("keep it clean") is something it will either ignore or hallucinate into findings.
+- **Say where things live.** The lens finds documents through the entry file's routing, so keep the routes current: which file governs the architecture, where the testing rules are, what the review gates are.
+- **The base branch governs.** The lens always reads the contract documents at the PR's base revision, never at the PR head — a PR cannot smuggle in a weakened contract and then comply with it. Keep `main`'s contract documents authoritative and review changes to them as carefully as code.
+- **Absent is degraded, not fatal.** A repo with no agent file still gets reviewed: the lens says so in its output and the review leans on the diff, the code, and the generic lenses. Adding even a short agent file with pointers gives the contract lens something checkable to work with.
 
 The PR-Agent producer step also sets `PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT=true` (the dynaconf env override for `pr_reviewer.check_pr_additional_content`), intended to flag changes unrelated to the stated intent. Note: in the pinned pr-agent 0.49.0 plain-diff mode that flag and the forwarded `LINEAR_API_KEY` are not consumed upstream; Forge's own ticket artifact and conformance section provide the ticket awareness today.
 
@@ -193,11 +233,11 @@ The full flow runs in GitHub Actions. Master and verify read pull request state,
 
 Forge runs on GitHub. This repo lives in the `shippopotamuslabs` org, and a GitHub App named Shippopotamus Forge holds the review identity there: pull request and check permissions, with contents read-only. The reusable workflow ships from this repo, and consuming repos pin a release tag. Stratum is the first consumer: a proof pull request with deliberate defects caught every planted defect class before the port landed. The v1.1.0 tag lands on the port's merge commit.
 
-Forge came out of the Stratum project's CI in September 2026 and has reviewed its changes since v1.0.0. The current release line stands at v1.0.12, dated October 4, 2026.
+Forge came out of the Stratum project's CI in September 2026 and has reviewed its changes since v1.0.0. The 1.x release line stands at v1.1.8. The 2.0 agent path is merged on `main` behind the `forge_agent` flag (default `off`) and is described in `CHANGELOG.md` under `v2.0.0`; the tag and release follow once the proof-suite evaluation and shadow measurements report.
 
 ## Versioning and upgrades
 
-Releases are Git tags: `v1.0.0` through `v1.0.12` at the time of writing. There is no version file. `CHANGELOG.md` carries one entry per tag, and the entries describe the failure each fix addresses.
+Releases are Git tags: `v1.0.0` through `v1.1.8` at the time of writing, plus an unreleased `v2.0.0` changelog entry for the flag-gated 2.0 path. There is no version file. `CHANGELOG.md` carries one entry per tag, and the entries describe the failure each fix addresses.
 
 To upgrade a consuming project, check the changelog, then change the pinned ref in the caller workflow and the `forge_ref` input to the same new value. Projects pin their own ref; nothing upgrades underneath a consumer.
 
