@@ -26,7 +26,7 @@ The workflow checks out the `.forge/` scripts and prompts from this repo at the 
 
 ## The three producers
 
-**PR-Agent.** Qodo's PR-Agent, installed from PyPI at the pinned version 0.46.0 and run unmodified, reviews `mr.diff` in plain-diff mode with posting turned off. Its markdown review becomes one of the three master inputs.
+**PR-Agent.** Qodo's PR-Agent, installed from PyPI at the pinned version 0.49.0 and run unmodified, reviews `mr.diff` in plain-diff mode with posting turned off. Its markdown review becomes one of the three master inputs.
 
 **Thermos correctness lens.** An LLM prompt scoped to defects: bugs, crashes, security holes, data integrity, API misuse, concurrency hazards. It stays out of style and structure. A clean diff gets an empty result.
 
@@ -136,7 +136,7 @@ To get linking: name the branch or PR after the ticket key, or reference it in t
 
 The ticket step writes `ticket.md` / `ticket.json` beside `mr.diff` and passes them to PR-Agent, both Thermos lenses, and master as delimited untrusted quoted context - ticket text is data, never instructions. The master rollup gains a `## Ticket conformance` section: resolved tickets with links, per-criterion addressed / not evident / contradicted verdicts with file/line evidence, a neutral unrelated-changes list, and one overall line (`conforms`, `partially conforms`, `does not conform`, or `no linked ticket`). On re-push, verify re-evaluates open criteria and posts a summary re-check comment. Advisory only, never a merge gate. Sparse tickets produce sparse verdicts.
 
-The PR-Agent producer step also sets `PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT=true` (the dynaconf env override for `pr_reviewer.check_pr_additional_content`), intended to flag changes unrelated to the stated intent. Note: in the pinned pr-agent 0.46.0 plain-diff mode that flag and the forwarded `LINEAR_API_KEY` are not consumed upstream; Forge's own ticket artifact and conformance section provide the ticket awareness today.
+The PR-Agent producer step also sets `PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT=true` (the dynaconf env override for `pr_reviewer.check_pr_additional_content`), intended to flag changes unrelated to the stated intent. Note: in the pinned pr-agent 0.49.0 plain-diff mode that flag and the forwarded `LINEAR_API_KEY` are not consumed upstream; Forge's own ticket artifact and conformance section provide the ticket awareness today.
 
 ## Run the pieces yourself
 

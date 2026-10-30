@@ -65,7 +65,7 @@ on:
       pr_agent_version:
         description: "Pinned PR-Agent version (installed unmodified from PyPI)"
         type: string
-        default: "0.46.0"
+        default: "0.49.0"
     secrets:
       OPENROUTER_API_KEY:
         required: true
@@ -206,7 +206,7 @@ jobs:
           fi
           MODEL="${FORGE_MODEL:-openrouter/meta/muse-spark-1.3-contributor}"
           if ! ( python3 -m venv /tmp/pr-agent-venv \
-              && /tmp/pr-agent-venv/bin/pip install -q "pr-agent==${{ inputs.pr_agent_version }}" \
+              && /tmp/pr-agent-venv/bin/pip install -q "pr-agent[github]==${{ inputs.pr_agent_version }}" \
               && CONFIG__MODEL="$MODEL" \
                  OPENROUTER__KEY="$OPENROUTER_API_KEY" \
                  CONFIG__CUSTOM_MODEL_MAX_TOKENS="1000000" \
