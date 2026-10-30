@@ -24,12 +24,22 @@ name: Forge Review
 # hands this workflow every secret the caller repo holds.
 #
 # Required secrets in the CALLER repo:
-#   OPENROUTER_API_KEY:     Thermos lenses + master dedup + verify.
+#   OPENROUTER_API_KEY:     Thermos lenses + master dedup + verify
+#                           (and the chomp transport when forge_agent
+#                           is on or shadow).
 #   FORGE_APP_PRIVATE_KEY:  Private key of the caller's Forge GitHub
 #                           App (input forge_app_id; the default is the
 #                           Shippopotamus Forge App, ID 5455197). The
 #                           review posts as that app's [bot] identity
 #                           via an installation token minted here.
+#
+# Forge 2.0 (chomp) runs behind the `forge_agent` input (default
+# "off": byte-for-byte 1.x behavior). "on" replaces the three 1.x
+# producer steps with one chomp invocation and posts its final
+# findings through the unchanged Python posting layer. "shadow" runs
+# chomp alongside the normal 1.x review and records its
+# findings/decision log as run artifacts without posting anything
+# from 2.0 — the field check FRG-30 compares against.
 #
 # Optional secrets in the CALLER repo:
 #   LINEAR_API_KEY:         Forwarded to the PR-Agent producer step only,
@@ -66,6 +76,10 @@ on:
         description: "Pinned PR-Agent version (installed unmodified from PyPI)"
         type: string
         default: "0.49.0"
+      forge_agent:
+        description: 'Forge 2.0 agent ("off": 1.x behavior; "on": chomp posts; "shadow": chomp runs, 1.x posts)'
+        type: string
+        default: "off"
     secrets:
       OPENROUTER_API_KEY:
         required: true
@@ -178,8 +192,71 @@ jobs:
           print("Existing consolidated review:", "yes" if found else "no")
           PY
 
+      - name: Fetch base branch for the contract channel
+        # Forge 2.0 only (flag on or shadow): the contract lens resolves
+        # the entry file from the base branch via `git show` in repo/,
+        # so the base ref must resolve there. Targeted depth-1 fetch
+        # (D8): no full unshallow, no history beyond the base tip.
+        if: steps.marker.outputs.exists != 'yes' && inputs.forge_agent != 'off'
+        working-directory: repo
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git fetch --no-tags --depth 1 origin "+refs/heads/$BASE_REF:refs/heads/$BASE_REF"
+          git rev-parse --verify "$BASE_REF^{commit}" --quiet || {
+            echo "::error::Base ref $BASE_REF did not resolve after targeted fetch"
+            exit 1
+          }
+
+      - name: Install Rust toolchain
+        if: steps.marker.outputs.exists != 'yes' && inputs.forge_agent != 'off'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore chomp build cache
+        # Keyed on the agent workspace lockfile (which pins the agent_core
+        # revision) plus the workspace sources: cold on a fresh pin, a
+        # cache restore at steady state.
+        if: steps.marker.outputs.exists != 'yes' && inputs.forge_agent != 'off'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "forge/agent -> target"
+
+      - name: Build chomp (release)
+        if: steps.marker.outputs.exists != 'yes' && inputs.forge_agent != 'off'
+        working-directory: forge/agent
+        run: cargo build --release
+
+      - name: Chomp review (2.0 producers + synthesis)
+        # An orchestration failure here fails the job visibly (proposal
+        # principle 7) — except in shadow mode, where the 1.x review
+        # below must post regardless of what 2.0 does.
+        if: steps.marker.outputs.exists != 'yes' && inputs.forge_agent != 'off'
+        continue-on-error: ${{ inputs.forge_agent == 'shadow' }}
+        working-directory: forge
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          FORGE_MODEL: ${{ inputs.model }}
+          # GitHub provider credential for the PR-Agent producer and
+          # follow-up runs inside chomp (FRG-23 adapter).
+          GITHUB__USER_TOKEN: ${{ steps.app-token.outputs.token }}
+          FORGE_PR_AGENT_PYTHON: /tmp/pr-agent-venv/bin/python
+          PR_URL: https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          python3 -m venv /tmp/pr-agent-venv
+          /tmp/pr-agent-venv/bin/pip install -q "pr-agent[github]==${{ inputs.pr_agent_version }}"
+          ./agent/target/release/chomp review \
+            --repo ../repo \
+            --diff mr.diff \
+            --base-ref "$BASE_REF" \
+            --pr-url "$PR_URL" \
+            --ticket-file ticket.md \
+            --out-findings chomp-findings.json \
+            --out-decisions chomp-decisions.json \
+            --out-pr-agent chomp-pr-agent.md
+
       - name: PR-Agent producer (silent, plain-diff)
-        if: steps.marker.outputs.exists != 'yes'
+        if: steps.marker.outputs.exists != 'yes' && (inputs.forge_agent == 'off' || inputs.forge_agent == 'shadow')
         working-directory: repo
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -221,7 +298,7 @@ jobs:
           fi
 
       - name: Thermos correctness lens
-        if: steps.marker.outputs.exists != 'yes'
+        if: steps.marker.outputs.exists != 'yes' && (inputs.forge_agent == 'off' || inputs.forge_agent == 'shadow')
         working-directory: forge
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -235,7 +312,7 @@ jobs:
           fi
 
       - name: Thermos structure lens
-        if: steps.marker.outputs.exists != 'yes'
+        if: steps.marker.outputs.exists != 'yes' && (inputs.forge_agent == 'off' || inputs.forge_agent == 'shadow')
         working-directory: forge
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -284,6 +361,12 @@ jobs:
             echo "Consolidated review already exists; running verification."
             python3 .forge/verify.py --iid "$PR_NUMBER" --sha "$HEAD_SHA" \
               --diff mr.diff
+          elif [ "${{ inputs.forge_agent }}" = "on" ]; then
+            echo "Forge 2.0 path: posting chomp's final findings."
+            python3 .forge/master.py --iid "$PR_NUMBER" --sha "$HEAD_SHA" \
+              --final-findings chomp-findings.json \
+              --decisions chomp-decisions.json --diff mr.diff \
+              --ticket ticket.md
           else
             echo "No existing review; running full review."
             python3 .forge/master.py --iid "$PR_NUMBER" --sha "$HEAD_SHA" \
@@ -293,6 +376,19 @@ jobs:
               --diff mr.diff \
               --ticket ticket.md
           fi
+
+      - name: Upload Forge 2.0 shadow outputs
+        # Shadow mode only: chomp's findings + decision log as run
+        # artifacts. Nothing from 2.0 is posted; the 1.x review above
+        # is the PR's review.
+        if: always() && inputs.forge_agent == 'shadow'
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-agent-shadow
+          path: |
+            forge/chomp-findings.json
+            forge/chomp-decisions.json
+          if-no-files-found: ignore
 
       - name: Upload Forge run record
         if: always()

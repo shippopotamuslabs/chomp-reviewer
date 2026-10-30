@@ -122,6 +122,62 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
         self.assertIsNotNone(
             conc, "jobs.review must carry the per-PR concurrency block")
 
+    def test_forge_agent_flag_defaults_off(self):
+        """The 2.0 flag is opt-in: default "off" pins byte-for-byte 1.x behavior."""
+        text = _read(WORKFLOW)
+        _, _, tail = text.partition("forge_agent:")
+        block, _, _ = tail.partition("\njobs:")
+        self.assertIn("type: string", block)
+        self.assertIn('default: "off"', block)
+
+    def test_two_dot_zero_steps_run_only_behind_the_flag(self):
+        """Fetch, toolchain, cache, build, and chomp steps are all
+        marker-gated and flag-gated; producers keep running for off
+        and shadow, and chomp fails visibly except in shadow."""
+        steps = dict(_steps(_read(WORKFLOW)))
+        for name in (
+            "Fetch base branch for the contract channel",
+            "Install Rust toolchain",
+            "Restore chomp build cache",
+            "Build chomp (release)",
+            "Chomp review (2.0 producers + synthesis)",
+        ):
+            body = steps[name]
+            self.assertIn(
+                "steps.marker.outputs.exists != 'yes'", body, name)
+            self.assertIn("inputs.forge_agent != 'off'", body, name)
+        for name in (
+            "PR-Agent producer (silent, plain-diff)",
+            "Thermos correctness lens",
+            "Thermos structure lens",
+        ):
+            body = steps[name]
+            self.assertIn("inputs.forge_agent == 'off'", body, name)
+            self.assertIn("inputs.forge_agent == 'shadow'", body, name)
+        chomp = steps["Chomp review (2.0 producers + synthesis)"]
+        self.assertIn("continue-on-error: ${{ inputs.forge_agent == 'shadow' }}", chomp)
+
+    def test_master_posts_chomp_outputs_when_flag_on(self):
+        """The Master step keeps its name and re-check routing, and
+        branches to the post-only mode when the flag is on."""
+        steps = dict(_steps(_read(WORKFLOW)))
+        names = list(steps)
+        idx_recheck = names.index("Re-check for an existing consolidated review")
+        self.assertTrue(names[idx_recheck + 1].startswith("Master"))
+        master_body = steps[names[idx_recheck + 1]]
+        self.assertIn("${{ inputs.forge_agent }}", master_body)
+        self.assertIn("--final-findings chomp-findings.json", master_body)
+        self.assertIn("--decisions chomp-decisions.json", master_body)
+
+    def test_shadow_upload_records_but_never_posts(self):
+        """Shadow mode uploads chomp's outputs as artifacts on every
+        outcome; nothing else references the chomp files."""
+        steps = dict(_steps(_read(WORKFLOW)))
+        upload = steps["Upload Forge 2.0 shadow outputs"]
+        self.assertIn("if: always() && inputs.forge_agent == 'shadow'", upload)
+        self.assertIn("forge/chomp-findings.json", upload)
+        self.assertIn("forge/chomp-decisions.json", upload)
+
     def test_marker_recheck_step_order_and_routing(self):
         # FRG-11: a marker re-check immediately before Master routes the
         # queued run to verify; producers keep gating on the first check.

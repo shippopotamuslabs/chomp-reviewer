@@ -387,6 +387,11 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
             // stripped in order) and the log says what fired and why.
             let (union, entry) = synthesis::synthesis_fallback(&clustered, &reason);
             decision_entries.push(entry);
+            decision_entries.push(outputs::host_event(
+                "synthesis",
+                "summary",
+                &synthesis::fallback_summary(&reason),
+            ));
             outputs::write_findings(&union, &args.out_findings)?;
             None
         }
