@@ -74,14 +74,39 @@ pub fn write_findings(findings: &[Finding], findings_path: &Path) -> Result<(), 
     write_json(findings, findings_path, "findings")
 }
 
-/// Write the clustered combined findings: each member carries its
-/// pre-dedup cluster tag (FRG-25) for the synthesizer (FRG-26).
-/// Same byte-shape convention as [`write_findings`].
-pub fn write_clustered_findings(
-    clustered: &[crate::synthesis::ClusteredFinding],
-    findings_path: &Path,
-) -> Result<(), String> {
-    write_json(clustered, findings_path, "clustered findings")
+/// One reconciled synthesizer disposition for the decision log
+/// (FRG-26, principle 6): the producer number, its FRG-25 cluster,
+/// the raw disposition string, and the kept/merged target or the
+/// downgrade/drop grounds — whichever the disposition carries.
+pub fn synthesis_disposition(entry: &crate::synthesis::DecisionEntry) -> serde_json::Value {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "kind".to_string(),
+        serde_json::json!("synthesis_disposition"),
+    );
+    fields.insert("producer".to_string(), serde_json::json!(entry.producer));
+    fields.insert("cluster".to_string(), serde_json::json!(entry.cluster_id));
+    fields.insert(
+        "disposition".to_string(),
+        serde_json::json!(entry.disposition),
+    );
+    if let Some(final_index) = entry.final_index {
+        fields.insert("final".to_string(), serde_json::json!(final_index));
+    }
+    if let Some(reason) = &entry.reason {
+        fields.insert("reason".to_string(), serde_json::json!(reason));
+    }
+    serde_json::Value::Object(fields)
+}
+
+/// The synthesizer's ticket-conformance object for the decision log
+/// (FRG-26): recorded opaquely — the Python posting layer owns the
+/// conformance shape, the log just preserves what the session said.
+pub fn synthesis_conformance(conformance: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "synthesis_conformance",
+        "conformance": conformance,
+    })
 }
 
 fn write_json<T: serde::Serialize + ?Sized>(

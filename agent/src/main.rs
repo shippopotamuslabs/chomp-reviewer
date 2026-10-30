@@ -23,6 +23,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use agent_core::session::AgentConfig;
 
@@ -284,11 +285,15 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
         timeout: timeouts.pr_agent,
     };
     let pr_agent_runner: fan_out::PrAgentRunner = Arc::new(pr_agent::run_pr_agent);
+    // Synthesis inputs captured before the fan-out move: the rendered
+    // repo map, and clones of the diff, contract, and executor the
+    // synthesizer session needs after the producers report.
+    let synthesis_repo_map = snapshot.repo_map.render();
     let result = fan_out::run_fan_out(fan_out::FanOutInputs {
         snapshot,
-        diff_text,
-        contract: resolution,
-        executor,
+        diff_text: diff_text.clone(),
+        contract: resolution.clone(),
+        executor: executor.clone(),
         transports: fan_out::LensTransports {
             correctness: transport.clone(),
             structure: transport.clone(),
@@ -308,10 +313,73 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
         .flat_map(|(_, findings)| findings.clone())
         .collect();
     // Deterministic pre-dedup (FRG-25, proposal §8.8): the combined
-    // producer findings are clustered for the synthesizer (FRG-26).
-    // Annotation only — every member is still written out.
+    // producer findings are clustered for the synthesizer below.
+    // Annotation only — every member reaches the session.
     let clustered = synthesis::cluster_findings(&combined);
-    outputs::write_clustered_findings(&clustered, &args.out_findings)?;
+    // Synthesis (FRG-26, proposal §8.8): the synthesizer adjudicates
+    // the clustered findings with repository tools and emits the
+    // final findings plus one decision entry per producer finding.
+    let ticket_text = synthesis::read_ticket_text(args.ticket_file.as_deref());
+    let synthesis_inputs = synthesis::SynthesisInputs {
+        clustered: &clustered,
+        pr_agent_guide: result.pr_agent_json.as_deref(),
+        ticket_text: ticket_text.as_deref(),
+        diff_text: &diff_text,
+        repo_map: &synthesis_repo_map,
+        contract: &resolution,
+    };
+    let synthesis_deadline = Instant::now() + Duration::from_secs(config.synthesis_timeout_secs);
+    let synthesis_error = match synthesis::run_synthesis_session(
+        &synthesis_inputs,
+        transport.as_ref(),
+        &executor,
+        Some(synthesis_deadline),
+    ) {
+        synthesis::SynthesisOutcome::Completed {
+            findings,
+            summary,
+            conformance,
+            decisions,
+        } => {
+            decision_entries.push(outputs::host_event(
+                "synthesis",
+                "completed",
+                &format!(
+                    "{} final finding(s) with {} reconciled disposition(s)",
+                    findings.len(),
+                    decisions.len()
+                ),
+            ));
+            decision_entries.push(outputs::host_event("synthesis", "summary", &summary));
+            if let Some(conformance) = &conformance {
+                decision_entries.push(outputs::synthesis_conformance(conformance));
+            }
+            for decision in &decisions {
+                decision_entries.push(outputs::synthesis_disposition(decision));
+            }
+            outputs::write_findings(&findings, &args.out_findings)?;
+            None
+        }
+        synthesis::SynthesisOutcome::BudgetExhausted { reason } => {
+            // The recorded fallback: a worse review is posted, never
+            // no review. The union is deterministic (FRG-25 tags
+            // stripped in order) and the log says what fired and why.
+            let (union, entry) = synthesis::synthesis_fallback(&clustered, &reason);
+            decision_entries.push(entry);
+            outputs::write_findings(&union, &args.out_findings)?;
+            None
+        }
+        synthesis::SynthesisOutcome::ProducerFailure { reason }
+        | synthesis::SynthesisOutcome::InvalidOutput { reason }
+        | synthesis::SynthesisOutcome::TimedOut { reason } => {
+            // A broken synthesizer is a visible orchestration failure
+            // (proposal principle 7): the outage is recorded and the
+            // empty findings file is explicit, never disguised.
+            decision_entries.push(outputs::host_event("synthesis", "outage", &reason));
+            outputs::write_findings(&[], &args.out_findings)?;
+            Some(reason)
+        }
+    };
     for (stage, findings) in &result.lens_findings {
         outputs::write_findings(
             findings,
@@ -340,6 +408,9 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
             "all review producers failed: {}",
             failed.join(", ")
         ));
+    }
+    if let Some(reason) = synthesis_error {
+        return Err(format!("synthesis failed: {reason}"));
     }
     Ok(())
 }

@@ -281,8 +281,10 @@ fn run_lens_session(
 }
 
 /// The authored prompt with its leading HTML provenance comment
-/// stripped — the comment is for the repo, not the model.
-fn system_prompt(prompt: &str) -> String {
+/// stripped — the comment is for the repo, not the model. Shared
+/// with the synthesizer (FRG-26): system prompts are static, and the
+/// opening message carries the per-run inputs.
+pub(crate) fn system_prompt(prompt: &str) -> String {
     let trimmed = prompt.trim_start();
     let body = match trimmed.strip_prefix("<!--") {
         Some(rest) => match rest.find("-->") {
@@ -334,6 +336,17 @@ fn assemble_opening_context(
         snapshot.head_sha
     ));
     out.push_str(&snapshot.repo_map.render());
+    if let Some(section) = contract_section(contract) {
+        out.push_str(&section);
+    }
+    out
+}
+
+/// The contract section of an opening message: the governing copy
+/// when one exists, nothing when the channel stands down. Shared
+/// with the synthesizer (FRG-26), which adds its own absent note —
+/// the lens simply omits the section.
+pub(crate) fn contract_section(contract: &ContractResolution) -> Option<String> {
     if let ContractResolution::Governing {
         entry_file,
         content,
@@ -341,22 +354,23 @@ fn assemble_opening_context(
     } = contract
     {
         if !content.is_empty() {
-            out.push_str(&format!(
+            let mut section = format!(
                 "\n# Contract entry ({entry_file}) — governing copy from the base branch\n\n"
-            ));
-            out.push_str(content);
+            );
+            section.push_str(content);
             if !content.ends_with('\n') {
-                out.push('\n');
+                section.push('\n');
             }
             if let Some(total) = truncated_from_lines {
-                out.push_str(&format!(
+                section.push_str(&format!(
                     "\n> Forge note: this entry file was truncated to its first {} of {total} lines by the size guard.\n",
                     content.lines().count()
                 ));
             }
+            return Some(section);
         }
     }
-    out
+    None
 }
 
 /// Read one file's full contents through the executor, paging the
