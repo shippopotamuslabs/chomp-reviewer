@@ -3,7 +3,7 @@
 //! shared by every lens and consumed downstream by synthesis (FRG-26).
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -65,24 +65,24 @@ pub fn host_event(kind: &str, event: &str, detail: &str) -> serde_json::Value {
     })
 }
 
-/// Write the three review outputs.
+/// Write one findings array (combined or per-lens) to a path.
 ///
-/// Findings are the session's validated findings (an empty slice is
-/// a legitimately empty review and writes `[]`), the decision log
-/// carries the run's recorded entries (possibly none), and the
-/// PR-Agent guide is an empty file until FRG-23 captures a real one.
-pub fn write_outputs(
-    findings: &[Finding],
-    decision_entries: &[serde_json::Value],
-    findings_path: &Path,
-    decisions_path: &Path,
-    pr_agent_path: &Path,
-) -> Result<(), String> {
+/// An empty slice is a legitimately empty review and writes `[]`.
+/// Serialization byte-shape is the established pretty-printed array
+/// plus a trailing newline.
+pub fn write_findings(findings: &[Finding], findings_path: &Path) -> Result<(), String> {
     let mut findings_json = serde_json::to_string_pretty(findings)
         .map_err(|error| format!("failed to serialize Chomp findings: {error}"))?;
     findings_json.push('\n');
-    write_file(findings_path, findings_json.as_bytes(), "findings")?;
+    write_file(findings_path, findings_json.as_bytes(), "findings")
+}
 
+/// Write the decision log: the run's recorded entries under
+/// `DecisionLog{version:1}`.
+pub fn write_decision_log(
+    decision_entries: &[serde_json::Value],
+    decisions_path: &Path,
+) -> Result<(), String> {
     let decision_log = DecisionLog {
         version: 1,
         entries: decision_entries.to_vec(),
@@ -90,8 +90,36 @@ pub fn write_outputs(
     let mut decisions = serde_json::to_string_pretty(&decision_log)
         .map_err(|error| format!("failed to serialize Chomp decision log: {error}"))?;
     decisions.push('\n');
-    write_file(decisions_path, decisions.as_bytes(), "decision log")?;
-    write_file(pr_agent_path, b"", "PR-Agent guide")
+    write_file(decisions_path, decisions.as_bytes(), "decision log")
+}
+
+/// Write the PR-Agent payload: the adapter's review JSON on
+/// completion, an empty file otherwise (today's behavior when the
+/// producer fails closed before spawn).
+pub fn write_pr_agent(payload: Option<&str>, pr_agent_path: &Path) -> Result<(), String> {
+    match payload {
+        Some(review_json) => write_file(pr_agent_path, review_json.as_bytes(), "PR-Agent guide"),
+        None => write_file(pr_agent_path, b"", "PR-Agent guide"),
+    }
+}
+
+/// Derive a per-lens findings path from the combined `--out-findings`
+/// path (plan D6): when the file name ends in `.json`, insert
+/// `.<stage>` before it (`findings.json` →
+/// `findings.correctness.json`); otherwise append `.<stage>.json`.
+pub fn lens_findings_path(out_findings: &Path, stage: &str) -> PathBuf {
+    if out_findings.extension().is_some_and(|ext| ext == "json") {
+        let stem = out_findings
+            .file_stem()
+            .expect("a file name with an extension has a stem");
+        let mut name = stem.to_os_string();
+        name.push(format!(".{stage}.json"));
+        out_findings.with_file_name(name)
+    } else {
+        let mut path = out_findings.as_os_str().to_owned();
+        path.push(format!(".{stage}.json"));
+        PathBuf::from(path)
+    }
 }
 
 fn write_file(path: &Path, contents: &[u8], label: &str) -> Result<(), String> {
@@ -123,7 +151,9 @@ mod tests {
         let decisions = dir.join("decisions.json");
         let pr_agent = dir.join("pr-agent.md");
 
-        write_outputs(&[], &[], &findings, &decisions, &pr_agent).expect("write outputs");
+        write_findings(&[], &findings).expect("write findings");
+        write_decision_log(&[], &decisions).expect("write decision log");
+        write_pr_agent(None, &pr_agent).expect("write pr-agent guide");
 
         assert_eq!(
             fs::read_to_string(&findings).expect("read findings"),
@@ -145,8 +175,6 @@ mod tests {
     fn writes_findings_with_citations() {
         let dir = temp_dir();
         let findings_path = dir.join("findings.json");
-        let decisions = dir.join("decisions.json");
-        let pr_agent = dir.join("pr-agent.md");
         let finding = Finding {
             file: "src/parse.rs".to_string(),
             line_start: 2,
@@ -161,14 +189,7 @@ mod tests {
             citations: Some(vec!["src/main.rs:5".to_string()]),
         };
 
-        write_outputs(
-            std::slice::from_ref(&finding),
-            &[],
-            &findings_path,
-            &decisions,
-            &pr_agent,
-        )
-        .expect("write outputs");
+        write_findings(std::slice::from_ref(&finding), &findings_path).expect("write findings");
 
         let written: Vec<Finding> =
             serde_json::from_str(&fs::read_to_string(&findings_path).expect("read findings"))
@@ -180,16 +201,14 @@ mod tests {
     #[test]
     fn decision_entries_are_written_into_the_log() {
         let dir = temp_dir();
-        let findings = dir.join("findings.json");
         let decisions = dir.join("decisions.json");
-        let pr_agent = dir.join("pr-agent.md");
         let entries = vec![host_event(
             "contract",
             "entry_absent",
             "no entry file at AGENTS.md on the base ref; contract channel empty",
         )];
 
-        write_outputs(&[], &entries, &findings, &decisions, &pr_agent).expect("write outputs");
+        write_decision_log(&entries, &decisions).expect("write decision log");
 
         let written: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&decisions).expect("read decisions"))
@@ -197,5 +216,52 @@ mod tests {
         assert_eq!(written["version"], 1);
         assert_eq!(written["entries"], serde_json::json!(entries));
         fs::remove_dir_all(dir).expect("clean temp dir");
+    }
+
+    #[test]
+    fn pr_agent_payload_round_trips_verbatim() {
+        let dir = temp_dir();
+        let pr_agent = dir.join("pr-agent.md");
+        let review_json = "{\"review\":{\"summary\":\"looks fine\"}}";
+
+        write_pr_agent(Some(review_json), &pr_agent).expect("write pr-agent guide");
+
+        assert_eq!(
+            fs::read_to_string(&pr_agent).expect("read pr-agent guide"),
+            review_json
+        );
+        fs::remove_dir_all(dir).expect("clean temp dir");
+    }
+
+    #[test]
+    fn lens_paths_insert_the_stage_before_a_json_suffix() {
+        assert_eq!(
+            lens_findings_path(Path::new("out/findings.json"), "correctness"),
+            PathBuf::from("out/findings.correctness.json")
+        );
+        assert_eq!(
+            lens_findings_path(Path::new("out/findings.json"), "pr_agent"),
+            PathBuf::from("out/findings.pr_agent.json")
+        );
+    }
+
+    #[test]
+    fn lens_paths_append_the_stage_without_a_json_suffix() {
+        assert_eq!(
+            lens_findings_path(Path::new("out/findings"), "structure"),
+            PathBuf::from("out/findings.structure.json")
+        );
+    }
+
+    #[test]
+    fn lens_paths_keep_nested_dirs_and_multi_dot_names() {
+        assert_eq!(
+            lens_findings_path(Path::new("out/nested/my.findings.json"), "contract"),
+            PathBuf::from("out/nested/my.findings.contract.json")
+        );
+        assert_eq!(
+            lens_findings_path(Path::new("out/nested/my.findings"), "contract"),
+            PathBuf::from("out/nested/my.findings.contract.json")
+        );
     }
 }
