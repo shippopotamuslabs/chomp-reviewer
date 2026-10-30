@@ -307,7 +307,11 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
         .iter()
         .flat_map(|(_, findings)| findings.clone())
         .collect();
-    outputs::write_findings(&combined, &args.out_findings)?;
+    // Deterministic pre-dedup (FRG-25, proposal §8.8): the combined
+    // producer findings are clustered for the synthesizer (FRG-26).
+    // Annotation only — every member is still written out.
+    let clustered = synthesis::cluster_findings(&combined);
+    outputs::write_clustered_findings(&clustered, &args.out_findings)?;
     for (stage, findings) in &result.lens_findings {
         outputs::write_findings(
             findings,

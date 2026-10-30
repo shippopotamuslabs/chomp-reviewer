@@ -71,10 +71,28 @@ pub fn host_event(kind: &str, event: &str, detail: &str) -> serde_json::Value {
 /// Serialization byte-shape is the established pretty-printed array
 /// plus a trailing newline.
 pub fn write_findings(findings: &[Finding], findings_path: &Path) -> Result<(), String> {
-    let mut findings_json = serde_json::to_string_pretty(findings)
-        .map_err(|error| format!("failed to serialize Chomp findings: {error}"))?;
-    findings_json.push('\n');
-    write_file(findings_path, findings_json.as_bytes(), "findings")
+    write_json(findings, findings_path, "findings")
+}
+
+/// Write the clustered combined findings: each member carries its
+/// pre-dedup cluster tag (FRG-25) for the synthesizer (FRG-26).
+/// Same byte-shape convention as [`write_findings`].
+pub fn write_clustered_findings(
+    clustered: &[crate::synthesis::ClusteredFinding],
+    findings_path: &Path,
+) -> Result<(), String> {
+    write_json(clustered, findings_path, "clustered findings")
+}
+
+fn write_json<T: serde::Serialize + ?Sized>(
+    value: &T,
+    path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let mut serialized = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("failed to serialize Chomp {label}: {error}"))?;
+    serialized.push('\n');
+    write_file(path, serialized.as_bytes(), label)
 }
 
 /// Write the decision log: the run's recorded entries under
