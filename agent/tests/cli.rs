@@ -217,21 +217,32 @@ fn stub_model_server(response_body: &str) -> String {
     format!("http://{addr}")
 }
 
-/// A per-lens stub: routes on the lens marker in the system prompt
-/// (`Lens A` correctness, `Lens B` structure, `Lens C` contract), so
-/// concurrent lenses deterministically receive their own script even
-/// though their requests overlap in time.
-fn stub_model_server_per_lens(correctness: &str, structure: &str, contract: &str) -> String {
+/// A per-producer stub: routes on the lens markers in the system
+/// prompt (`Lens A` correctness, `Lens B` structure, `Lens C`
+/// contract) plus the synthesizer session (FRG-26, `# Synthesizer`
+/// marker), so concurrent producers deterministically receive their
+/// own script even though their requests overlap in time. Every
+/// stubbed review must script synthesis: an empty body means the
+/// synthesizer receives the lens body (garbage-in tests only).
+fn stub_model_server_with_synthesis(
+    correctness: &str,
+    structure: &str,
+    contract: &str,
+    synthesis: &str,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub server");
     let addr = listener.local_addr().expect("stub server addr");
-    let (correctness, structure, contract) = (
+    let (correctness, structure, contract, synthesis) = (
         correctness.to_string(),
         structure.to_string(),
         contract.to_string(),
+        synthesis.to_string(),
     );
     serve_stub(listener, move |request| {
         let text = String::from_utf8_lossy(request);
-        if text.contains("Lens C") {
+        if text.contains("Synthesizer") && !synthesis.is_empty() {
+            synthesis.clone()
+        } else if text.contains("Lens C") {
             contract.clone()
         } else if text.contains("Lens B") {
             structure.clone()
@@ -258,6 +269,42 @@ fn lens_finding(tag: &str) -> serde_json::Value {
         "recommended_fix": format!("Address the {tag} concern before merging."),
         "citations": ["src/lib.rs:1"],
     })
+}
+
+/// A chat-completions body whose assistant text is the synthesis
+/// envelope (FRG-26): summary, final findings, and one decision entry
+/// per producer.
+fn chat_body_for_synthesis(
+    summary: &str,
+    findings: &[serde_json::Value],
+    decisions: &[serde_json::Value],
+) -> String {
+    let content = serde_json::to_string(&serde_json::json!({
+        "summary": summary,
+        "findings": findings,
+        "decisions": decisions,
+    }))
+    .expect("synthesis envelope serializes");
+    serde_json::to_string(&serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]
+    }))
+    .expect("chat body serializes")
+}
+
+/// One synthesis decision entry: producer N, raw disposition string,
+/// and the kept/merged target when the disposition carries one.
+fn synthesis_decision(
+    producer: usize,
+    disposition: &str,
+    final_index: Option<usize>,
+) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("producer".to_string(), serde_json::json!(producer));
+    entry.insert("disposition".to_string(), serde_json::json!(disposition));
+    if let Some(final_index) = final_index {
+        entry.insert("final".to_string(), serde_json::json!(final_index));
+    }
+    serde_json::Value::Object(entry)
 }
 
 /// A chat-completions body whose assistant text is the given findings
@@ -314,11 +361,12 @@ fn fixture_review_exits_zero_and_writes_all_outputs() {
     let fixture = Fixture::new("success");
     fixture.write_diff();
 
-    // The correctness session runs end to end against a stub model
-    // endpoint that answers with an empty findings array.
-    let base_url = stub_model_server(
-        r#"{"choices":[{"message":{"role":"assistant","content":"{\"findings\":[]}"},"finish_reason":"stop"}]}"#,
-    );
+    // Every producer runs end to end against a stub model endpoint
+    // that answers with empty findings; the synthesizer answers the
+    // clean bill.
+    let empty = chat_body_for(&[], None);
+    let clean_bill = chat_body_for_synthesis("No findings.", &[], &[]);
+    let base_url = stub_model_server_with_synthesis(&empty, &empty, &empty, &clean_bill);
     let output = run_with_env(
         &fixture.review_args(),
         &[
@@ -344,6 +392,17 @@ fn fixture_review_exits_zero_and_writes_all_outputs() {
     // absence degrades the review, it never fails it.
     assert_eq!(decisions["entries"][0]["kind"], "contract");
     assert_eq!(decisions["entries"][0]["event"], "entry_absent");
+    // The synthesizer completed over zero producers and recorded the
+    // completion plus the rollup summary.
+    let synthesis: Vec<&serde_json::Value> = decisions["entries"]
+        .as_array()
+        .expect("entries is an array")
+        .iter()
+        .filter(|entry| entry["kind"] == "synthesis")
+        .collect();
+    assert_eq!(synthesis.len(), 2, "{decisions}");
+    assert_eq!(synthesis[0]["event"], "completed");
+    assert_eq!(synthesis[1]["event"], "summary");
     assert_eq!(
         fs::read(&fixture.pr_agent).expect("pr-agent guide written"),
         Vec::<u8>::new()
@@ -361,9 +420,9 @@ fn oversized_entry_file_records_its_truncation() {
     fixture.commit_extra(".pr_agent.toml", "[forge]\nentry_max_lines = 3\n");
     fixture.write_diff();
 
-    let base_url = stub_model_server(
-        r#"{"choices":[{"message":{"role":"assistant","content":"{\"findings\":[]}"},"finish_reason":"stop"}]}"#,
-    );
+    let empty = chat_body_for(&[], None);
+    let clean_bill = chat_body_for_synthesis("No findings.", &[], &[]);
+    let base_url = stub_model_server_with_synthesis(&empty, &empty, &empty, &clean_bill);
     let output = run_with_env(
         &fixture.review_args(),
         &[
@@ -464,10 +523,23 @@ fn fan_out_success_writes_combined_and_per_lens_findings() {
     fixture.commit_extra("AGENTS.md", "# Fixture rules\n\nAlways handle errors.\n");
     fixture.write_diff();
 
-    let base_url = stub_model_server_per_lens(
+    let base_url = stub_model_server_with_synthesis(
         &chat_body_for(&[lens_finding("correctness")], None),
         &chat_body_for(&[lens_finding("structure")], None),
         &chat_body_for(&[lens_finding("contract")], None),
+        &chat_body_for_synthesis(
+            "One merged finding.",
+            &[lens_finding("merged")],
+            &[
+                synthesis_decision(1, "kept", Some(1)),
+                synthesis_decision(2, "merged-into:1", None),
+                synthesis_decision(
+                    3,
+                    "dropped:false-positive; already addressed on the base branch",
+                    None,
+                ),
+            ],
+        ),
     );
     let output = run_with_env(
         &fixture.review_args(),
@@ -482,7 +554,9 @@ fn fan_out_success_writes_combined_and_per_lens_findings() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Combined findings in canonical lens order.
+    // The combined file carries the synthesizer's final findings, not
+    // the pre-dedup union: the stubbed session merged all three
+    // producers into one.
     let combined: Vec<serde_json::Value> =
         serde_json::from_str(&fs::read_to_string(&fixture.findings).expect("findings written"))
             .expect("findings are JSON");
@@ -491,11 +565,7 @@ fn fan_out_success_writes_combined_and_per_lens_findings() {
             .iter()
             .map(|finding| finding["title"].as_str().expect("title is text"))
             .collect::<Vec<_>>(),
-        vec![
-            "correctness lens finding",
-            "structure lens finding",
-            "contract lens finding",
-        ]
+        vec!["merged lens finding"]
     );
 
     // Each completed lens keeps its own findings in its own file.
@@ -512,13 +582,31 @@ fn fan_out_success_writes_combined_and_per_lens_findings() {
     }
 
     // Decision log: run entry naming the engine choice, then four
-    // stage entries — three completions and the PR-Agent outage.
+    // stage entries — three completions and the PR-Agent outage —
+    // then the synthesis completion, the rollup summary, and one
+    // disposition per producer finding.
     let decisions = read_decisions(&fixture);
     assert_eq!(decisions["version"], 1);
     let entries = decisions["entries"]
         .as_array()
         .expect("entries is an array");
-    assert_eq!(entries.len(), 5, "{decisions}");
+    assert_eq!(entries.len(), 10, "{decisions}");
+    let dispositions: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|entry| entry["kind"] == "synthesis_disposition")
+        .collect();
+    assert_eq!(dispositions.len(), 3, "{decisions}");
+    assert_eq!(dispositions[0]["producer"], 1, "{decisions}");
+    assert_eq!(dispositions[0]["disposition"], "kept", "{decisions}");
+    assert_eq!(dispositions[0]["final"], 1, "{decisions}");
+    assert_eq!(
+        dispositions[1]["disposition"], "merged-into:1",
+        "{decisions}"
+    );
+    assert_eq!(
+        dispositions[2]["reason"], "false-positive; already addressed on the base branch",
+        "{decisions}"
+    );
     assert_eq!(entries[0]["kind"], "run");
     assert_eq!(entries[0]["event"], "fan_out");
     assert!(
@@ -552,7 +640,7 @@ fn fan_out_success_writes_combined_and_per_lens_findings() {
 fn fan_out_all_lenses_garbage_exits_two_with_outage_records() {
     let fixture = Fixture::new("fanout-garbage");
     // Governing so every producer runs; the stub answers garbage for
-    // every lens, so all four producers fail.
+    // every lens and the synthesizer, so all five producers fail.
     fixture.commit_extra("AGENTS.md", "# Fixture rules\n\nAlways handle errors.\n");
     fixture.write_diff();
 
@@ -571,12 +659,20 @@ fn fan_out_all_lenses_garbage_exits_two_with_outage_records() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // The decision log still exists with four outage records.
+    // The decision log still exists with five outage records: the
+    // four fan-out producers plus the synthesizer, whose garbage
+    // output is a visible outage, never a disguised empty review.
     let decisions = read_decisions(&fixture);
     let entries = decisions["entries"]
         .as_array()
         .expect("entries is an array");
-    assert_eq!(entries.len(), 5, "{decisions}");
+    assert_eq!(entries.len(), 6, "{decisions}");
+    let synthesis: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|entry| entry["kind"] == "synthesis")
+        .collect();
+    assert_eq!(synthesis.len(), 1, "{decisions}");
+    assert_eq!(synthesis[0]["event"], "outage", "{decisions}");
     for stage in ["correctness", "structure", "contract"] {
         let entry = stage_entry(&decisions, stage);
         assert_eq!(entry["status"], "producer_outage", "{entry}");
@@ -624,10 +720,18 @@ fn fan_out_governing_but_uncheckable_contract_records_note() {
     fixture.write_diff();
 
     let note = "the governing copy states nothing checkable";
-    let base_url = stub_model_server_per_lens(
+    let base_url = stub_model_server_with_synthesis(
         &chat_body_for(&[lens_finding("correctness")], None),
         &chat_body_for(&[lens_finding("structure")], None),
         &chat_body_for(&[], Some(note)),
+        &chat_body_for_synthesis(
+            "One merged finding.",
+            &[lens_finding("merged")],
+            &[
+                synthesis_decision(1, "kept", Some(1)),
+                synthesis_decision(2, "merged-into:1", None),
+            ],
+        ),
     );
     let output = run_with_env(
         &fixture.review_args(),
@@ -649,12 +753,17 @@ fn fan_out_governing_but_uncheckable_contract_records_note() {
     assert_eq!(contract["findings"], 0, "{contract}");
     assert_eq!(contract["note"], note, "{contract}");
 
-    // Combined findings hold only the two checking lenses; the
-    // contract per-lens file is an honest empty array.
+    // The combined file holds the synthesizer's merge of the two
+    // checking lenses; the contract per-lens file is an honest empty
+    // array.
     let combined: Vec<serde_json::Value> =
         serde_json::from_str(&fs::read_to_string(&fixture.findings).expect("findings written"))
             .expect("findings are JSON");
-    assert_eq!(combined.len(), 2);
+    assert_eq!(combined.len(), 1);
+    assert_eq!(
+        combined[0]["title"].as_str().expect("title is text"),
+        "merged lens finding"
+    );
     assert_eq!(
         fs::read_to_string(lens_path(&fixture, "contract")).expect("contract per-lens written"),
         "[]\n"
@@ -676,10 +785,18 @@ fn fan_out_absent_contract_records_a_single_stand_down() {
     // No entry file on the base branch: the contract lens stands down.
     fixture.write_diff();
 
-    let base_url = stub_model_server_per_lens(
+    let base_url = stub_model_server_with_synthesis(
         &chat_body_for(&[lens_finding("correctness")], None),
         &chat_body_for(&[lens_finding("structure")], None),
         &chat_body_for(&[], None),
+        &chat_body_for_synthesis(
+            "One merged finding.",
+            &[lens_finding("merged")],
+            &[
+                synthesis_decision(1, "kept", Some(1)),
+                synthesis_decision(2, "merged-into:1", None),
+            ],
+        ),
     );
     let output = run_with_env(
         &fixture.review_args(),
@@ -720,10 +837,18 @@ fn fan_out_deep_review_false_still_fans_out_with_record() {
     .expect("write repo config");
     fixture.write_diff();
 
-    let base_url = stub_model_server_per_lens(
+    let base_url = stub_model_server_with_synthesis(
         &chat_body_for(&[lens_finding("correctness")], None),
         &chat_body_for(&[lens_finding("structure")], None),
         &chat_body_for(&[lens_finding("contract")], None),
+        &chat_body_for_synthesis(
+            "One merged finding.",
+            &[lens_finding("merged")],
+            &[
+                synthesis_decision(1, "kept", Some(1)),
+                synthesis_decision(2, "merged-into:1", None),
+            ],
+        ),
     );
     let output = run_with_env(
         &fixture.review_args(),
@@ -739,12 +864,13 @@ fn fan_out_deep_review_false_still_fans_out_with_record() {
     );
 
     // The full fan-out still ran (four stage entries) and the reduced
-    // mode was recorded, not honored.
+    // mode was recorded, not honored; then the synthesizer merged the
+    // two checking lenses (completion, summary, two dispositions).
     let decisions = read_decisions(&fixture);
     let entries = decisions["entries"]
         .as_array()
         .expect("entries is an array");
-    assert_eq!(entries.len(), 7, "{decisions}");
+    assert_eq!(entries.len(), 11, "{decisions}");
     assert_eq!(entries[0]["kind"], "contract");
     assert_eq!(entries[0]["event"], "entry_absent");
     assert_eq!(entries[1]["kind"], "config");
