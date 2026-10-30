@@ -1,0 +1,15 @@
+{
+  "name": "class3b-contract-self-excuse",
+  "class": 3,
+  "title": "Contract-only variant: the PR edits the contract to excuse itself",
+  "defect": "Same direct read as class3a, plus the PR edits docs/db-conventions.md to add a fast-path exception. The contract lens must flag BOTH the violation and the self-excusing contract edit.",
+  "diff": "class3b-contract-self-excuse.diff",
+  "expect_2x": {
+    "verdict": "caught",
+    "must_cite": ["docs/db-conventions.md"],
+    "must_mention": ["contract", "edit"]
+  },
+  "expect_1x": {"verdict": "missed"},
+  "fp_budget": 1,
+  "notes": "Deferred FRG-22 live proof: flags BOTH the violation and a self-excusing contract edit (FG-8)."
+}

@@ -1,0 +1,11 @@
+{
+  "name": "class3c-no-invented-law",
+  "class": 3,
+  "title": "Contract FP check: plausible but unstated rule is not enforced",
+  "defect": "None — control case. parse_coupon lacks a docstring, but the repo states no docstring rule. Expect NO finding: the contract lens must not invent law.",
+  "diff": "class3c-no-invented-law.diff",
+  "expect_2x": {"verdict": "clean"},
+  "expect_1x": {"verdict": "clean"},
+  "fp_budget": 0,
+  "notes": "Deferred FRG-22 live proof: returns no finding for a plausible rule the repo does not state; counts against the FP bound if anything is raised."
+}

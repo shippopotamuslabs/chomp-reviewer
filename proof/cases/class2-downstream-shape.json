@@ -1,0 +1,15 @@
+{
+  "name": "class2-downstream-shape",
+  "class": 2,
+  "title": "Downstream-invisible: wrapped return vs the dashboard consumer",
+  "defect": "fetch_order now nests the mapping under 'order', but src/consumer.py still indexes order['id']/order['total'], so the dashboard raises KeyError. The diff itself reads as a fine shape change.",
+  "diff": "class2-downstream-shape.diff",
+  "expect_2x": {
+    "verdict": "caught",
+    "must_cite": ["src/consumer.py"],
+    "must_mention": ["order"]
+  },
+  "expect_1x": {"verdict": "missed"},
+  "fp_budget": 1,
+  "notes": "The breakage appears only in the consumer elsewhere in the tree."
+}

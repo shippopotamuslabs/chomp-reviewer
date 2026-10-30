@@ -1,0 +1,12 @@
+diff --git a/src/store.py b/src/store.py
+index 1111111..2222222 100644
+--- a/src/store.py
++++ b/src/store.py
+@@ -21,5 +21,5 @@ def _read_order(order_id):
+ 
+ 
+ def fetch_order(order_id):
+-    """Fetch one order by id. Returns the order mapping."""
+-    return with_retry(lambda: _read_order(order_id))
++    """Fetch one order by id. Returns the order mapping under "order"."""
++    return {"order": with_retry(lambda: _read_order(order_id))}

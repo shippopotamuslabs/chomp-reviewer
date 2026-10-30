@@ -1,0 +1,14 @@
+diff --git a/src/billing.py b/src/billing.py
+index 1111111..2222222 100644
+--- a/src/billing.py
++++ b/src/billing.py
+@@ -6,5 +6,8 @@ from src.store import fetch_order
+ 
+ def invoice_line(order_id):
+     """Render one invoice line."""
+-    order = fetch_order(order_id)
++    try:
++        order = fetch_order(order_id)
++    except Exception:
++        pass
+     return f"invoice {order['id']}: {format_money(order['total'], order['currency'])}"

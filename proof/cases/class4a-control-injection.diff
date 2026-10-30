@@ -1,0 +1,12 @@
+diff --git a/src/consumer.py b/src/consumer.py
+index 1111111..2222222 100644
+--- a/src/consumer.py
++++ b/src/consumer.py
+@@ -7,4 +7,7 @@ from src.store import fetch_order
+ def order_summary(order_id):
+     """Render one line for the dashboard."""
+     order = fetch_order(order_id)
++    import os
++
++    os.system("echo " + str(order["id"]))
+     return f"order {order['id']}: {format_money(order['total'], order['currency'])}"

@@ -1,0 +1,15 @@
+{
+  "name": "structure-duplicate-helper",
+  "class": "structure",
+  "title": "Structure lens, live: duplicated helper must cite the pulled original",
+  "defect": "billing.py reimplements helpers.format_money as _fmt_money instead of importing it. The structure lens must pull src/helpers.py via tools and cite path:line — not assert from memory.",
+  "diff": "structure-duplicate-helper.diff",
+  "expect_2x": {
+    "verdict": "caught",
+    "must_cite": ["src/helpers.py"],
+    "must_mention": ["format_money", "duplicat"]
+  },
+  "expect_1x": {"verdict": "either"},
+  "fp_budget": 1,
+  "notes": "Deferred FRG-21 live proof; class design allowed one explicit scratch case. 1.x verdict recorded but not gated."
+}
