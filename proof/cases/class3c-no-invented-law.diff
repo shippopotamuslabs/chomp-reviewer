@@ -1,0 +1,12 @@
+diff --git a/src/helpers.py b/src/helpers.py
+index 1111111..2222222 100644
+--- a/src/helpers.py
++++ b/src/helpers.py
+@@ -4,3 +4,7 @@
+ def format_money(amount, currency):
+     """Format an amount with its currency code."""
+     return f"{amount:.2f} {currency}"
++
++
++def parse_coupon(code):
++    return code.strip().upper()

@@ -1,3 +1,7 @@
 __pycache__/
 *.py[cod]
 plans/
+# FRG-29 proof runs: recorded outputs and the scored report attach to
+# the Linear ticket, not the repo.
+proof/results/
+proof/report.json

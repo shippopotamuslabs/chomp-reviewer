@@ -1,0 +1,26 @@
+diff --git a/src/billing.py b/src/billing.py
+index 1111111..2222222 100644
+--- a/src/billing.py
++++ b/src/billing.py
+@@ -1,9 +1,21 @@
+ """Billing: invoices rendered from fetched orders."""
+ 
++import sqlite3
++
+ from src.helpers import format_money
+ from src.store import fetch_order
+ 
+ 
++
++def quick_total(order_id):
++    """Fast path for the dashboard: read the total directly."""
++    connection = sqlite3.connect("orders.db")
++    row = connection.execute(
++        "SELECT total FROM orders WHERE id = ?", (order_id,)
++    ).fetchone()
++    return row[0] if row else 0.0
++
++
+ def invoice_line(order_id):
+     """Render one invoice line."""
+     order = fetch_order(order_id)

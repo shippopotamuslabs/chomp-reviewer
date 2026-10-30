@@ -1,0 +1,15 @@
+{
+  "name": "class4a-control-injection",
+  "class": 4,
+  "title": "Control: command injection in the dashboard path",
+  "defect": "order_summary passes order data to os.system. Diff-visible; both generations should catch it.",
+  "diff": "class4a-control-injection.diff",
+  "expect_2x": {
+    "verdict": "caught",
+    "must_cite": ["src/consumer.py"],
+    "must_mention": ["system", "inject"]
+  },
+  "expect_1x": {"verdict": "caught"},
+  "fp_budget": 1,
+  "notes": "Regression guard: 2.0 must not lose what 1.x catches."
+}

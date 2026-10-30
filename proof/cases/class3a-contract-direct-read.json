@@ -1,0 +1,15 @@
+{
+  "name": "class3a-contract-direct-read",
+  "class": 3,
+  "title": "Contract-only: direct DB read bypassing with_retry",
+  "defect": "quick_total reads sqlite directly, violating the routed rule that all database reads go through src/store.py::with_retry. Generically fine Python.",
+  "diff": "class3a-contract-direct-read.diff",
+  "expect_2x": {
+    "verdict": "caught",
+    "must_cite": ["docs/db-conventions.md"],
+    "must_mention": ["with_retry"]
+  },
+  "expect_1x": {"verdict": "missed"},
+  "fp_budget": 1,
+  "notes": "Deferred FRG-22 live proof: rule quoted and code cited; routed doc pulled at head and enforced from it."
+}

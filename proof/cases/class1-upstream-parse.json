@@ -1,0 +1,15 @@
+{
+  "name": "class1-upstream-parse",
+  "class": 1,
+  "title": "Upstream-invisible: strict parse vs the empty-default caller",
+  "defect": "parse_port becomes strict, but the existing caller src/main.py passes '' when PORT is unset, so the service crashes at startup. The diff itself reads as a fine strictness improvement.",
+  "diff": "class1-upstream-parse.diff",
+  "expect_2x": {
+    "verdict": "caught",
+    "must_cite": ["src/main.py"],
+    "must_mention": ["empty", "PORT"]
+  },
+  "expect_1x": {"verdict": "missed"},
+  "fp_budget": 1,
+  "notes": "Phase-1 exit behavior: the correctness session must pull the caller and cite it."
+}
