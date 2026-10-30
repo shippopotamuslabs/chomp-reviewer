@@ -5,7 +5,7 @@
 - [x] Plan
 - [x] Implementation
 - [x] Review — rounds: 2/3, result: clean (round 1: 2 MINORs, fixed; round 2: verified)
-- [ ] Ship — PR: none
+- [ ] Ship — PR: https://github.com/shippopotamuslabs/forge-reviewer/pull/28 (open, awaiting external review/merge); tag v1.1.8 pushed
 
 ## Current Gate
 none
@@ -181,3 +181,11 @@ Ship
   question: Chunk 1 pin sits on the released workflow surface
   — changelog + tag per AGENTS.md release process, or defer
   to the next 1.x release (agent/ FRG precedent skipped both)?
+- 2026-10-29: Shipped on the human's ask. Commits: 91357e8
+  feat(agent) adapter + plans, 9accf24 chore(pr-agent) pin
+  0.49.0, dd61407 docs changelog v1.1.8 (changelog approved by
+  the human; agent/ no-changelog precedent overridden because
+  the pin sits on the released surface). Tag v1.1.8 on dd61407
+  pushed with the branch and verified via git ls-remote
+  (both at dd61407). PR #28 opened:
+  https://github.com/shippopotamuslabs/forge-reviewer/pull/28
