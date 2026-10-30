@@ -95,7 +95,10 @@ use self::cache::{cache_key_for, lock_cache, CacheKey};
 use self::confine::SnapshotRoot;
 use self::redaction::redact_line;
 
-pub use self::definitions::{tool_catalog_config, tool_specs, TOOLS_SCHEMA_JSON, TOOL_NAMES};
+pub use self::definitions::{
+    synthesis_tool_catalog_config, synthesis_tool_specs, tool_catalog_config, tool_specs,
+    SYNTHESIS_SCHEMA_JSON, SYNTHESIS_TOOL_NAMES, TOOLS_SCHEMA_JSON, TOOL_NAMES,
+};
 pub use self::error::ToolError;
 
 /// Maximum lines one `read_file` call returns.

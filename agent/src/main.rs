@@ -287,8 +287,10 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
     let pr_agent_runner: fan_out::PrAgentRunner = Arc::new(pr_agent::run_pr_agent);
     // Synthesis inputs captured before the fan-out move: the rendered
     // repo map, and clones of the diff, contract, and executor the
-    // synthesizer session needs after the producers report.
+    // synthesizer session needs after the producers report. The
+    // follow-up timeout is the PR-Agent stage budget.
     let synthesis_repo_map = snapshot.repo_map.render();
+    let followup_timeout = timeouts.pr_agent;
     let result = fan_out::run_fan_out(fan_out::FanOutInputs {
         snapshot,
         diff_text: diff_text.clone(),
@@ -329,10 +331,29 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
         contract: &resolution,
     };
     let synthesis_deadline = Instant::now() + Duration::from_secs(config.synthesis_timeout_secs);
+    // The synthesizer's tool router (FRG-27): the shared read executor
+    // plus the capped PR-Agent follow-up runner. The router is the
+    // session's executor; its invocation log drains into the decision
+    // log after the outcome match, on every path.
+    let followup_runner: synthesis::FollowupRunner = Arc::new(pr_agent::run_pr_agent_followup);
+    let followup_tools = Arc::new(synthesis::SynthesisTools::new(
+        executor.clone(),
+        followup_runner,
+        pr_agent::PrAgentRequest {
+            pr_url: args.pr_url.clone(),
+            context_files: config.pr_agent_context_files.clone(),
+            repo_map: synthesis_repo_map.clone(),
+            entry_max_lines: config.entry_max_lines,
+            timeout: followup_timeout,
+        },
+        config.pr_agent_followups,
+    ));
+    let followup_executor: Arc<dyn chomp::tools::ToolExecutor + Send + Sync> =
+        followup_tools.clone();
     let synthesis_error = match synthesis::run_synthesis_session(
         &synthesis_inputs,
         transport.as_ref(),
-        &executor,
+        &followup_executor,
         Some(synthesis_deadline),
     ) {
         synthesis::SynthesisOutcome::Completed {
@@ -408,6 +429,9 @@ fn run_review(args: &ReviewArgs) -> Result<(), String> {
             "all review producers failed: {}",
             failed.join(", ")
         ));
+    }
+    for followup in followup_tools.take_followups() {
+        decision_entries.push(outputs::pr_agent_followup(&followup));
     }
     if let Some(reason) = synthesis_error {
         return Err(format!("synthesis failed: {reason}"));

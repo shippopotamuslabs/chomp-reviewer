@@ -25,13 +25,14 @@ use agent_core::message::{AgentMessage, AgentRole, MessageMeta, ToolCallRecord, 
 use agent_core::session::{AgentConfig, SessionCapabilities};
 use agent_core::tool_semantics::{ToolCatalogConfig, ToolSemanticsConfig};
 use chomp::model_transport::ModelTransport;
-use chomp::tools::{tool_specs, ToolExecutor, TOOLS_SCHEMA_JSON};
+use chomp::tools::{synthesis_tool_specs, ToolExecutor, SYNTHESIS_SCHEMA_JSON};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::contract::ContractResolution;
 use crate::host::{drive_session, DriveOutcome};
 use crate::outputs::Finding;
+use crate::pr_agent::{followup_guide_text, PrAgentFollowupRequest, PrAgentOutcome};
 
 /// One producer finding tagged with its pre-dedup cluster.
 ///
@@ -229,29 +230,200 @@ pub struct DecisionEntry {
     pub reason: Option<String>,
 }
 
-/// The tool wiring for the synthesizer session: the four FRG-18 read
-/// tools, delegated to the shared executor. The explicit match is the
-/// FRG-27 slot — the `run_pr_agent` follow-up arm is added here,
-/// above the delegation, without restructuring the driver or the
-/// executor.
+/// The injected PR-Agent follow-up runner (FRG-27): the production
+/// value is [`crate::pr_agent::run_pr_agent_followup`]; tests script
+/// canned outcomes. Mirrors the `PrAgentRunner` precedent in
+/// `fan_out`.
+pub type FollowupRunner = Arc<dyn Fn(&PrAgentFollowupRequest) -> PrAgentOutcome + Send + Sync>;
+
+/// One recorded `run_pr_agent` invocation for the decision log: what
+/// the session asked about and what the host did with the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrAgentFollowup {
+    pub scope: Vec<String>,
+    pub question: String,
+    pub outcome: FollowupOutcome,
+}
+
+/// How one follow-up invocation ended: guide text received, refused
+/// by the host cap, or a scoped run that failed at the tool level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FollowupOutcome {
+    Completed,
+    CapExhausted,
+    Failed { reason: String },
+}
+
+/// The tool wiring for the synthesizer session (FRG-27): the four
+/// FRG-18 read tools, delegated to the shared executor, plus the
+/// synthesizer-only `run_pr_agent` follow-up served through the
+/// injected runner under the host-owned per-review cap. The counter
+/// and the invocation log live beside the driver loop (here): the
+/// third call in one review is refused with a cap-exhausted soft
+/// failure, and every invocation is recorded for the decision log —
+/// the model is told the cap in the prompt, but the prompt is not
+/// the enforcement.
 pub struct SynthesisTools {
     executor: Arc<dyn ToolExecutor + Send + Sync>,
+    runner: FollowupRunner,
+    base: crate::pr_agent::PrAgentRequest,
+    cap: usize,
+    calls: std::sync::Mutex<usize>,
+    log: std::sync::Mutex<Vec<PrAgentFollowup>>,
 }
 
 impl SynthesisTools {
-    pub fn new(executor: Arc<dyn ToolExecutor + Send + Sync>) -> Self {
-        Self { executor }
+    pub fn new(
+        executor: Arc<dyn ToolExecutor + Send + Sync>,
+        runner: FollowupRunner,
+        base: crate::pr_agent::PrAgentRequest,
+        cap: usize,
+    ) -> Self {
+        Self {
+            executor,
+            runner,
+            base,
+            cap,
+            calls: std::sync::Mutex::new(0),
+            log: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Drain the recorded follow-ups for the decision log. Main calls
+    /// this once after the session ends, on every outcome path.
+    pub fn take_followups(&self) -> Vec<PrAgentFollowup> {
+        self.log
+            .lock()
+            .expect("followup log lock")
+            .drain(..)
+            .collect()
+    }
+
+    fn record(&self, followup: PrAgentFollowup) {
+        self.log.lock().expect("followup log lock").push(followup);
+    }
+}
+
+/// The parsed follow-up arguments: a non-empty scope of non-empty
+/// file paths plus a non-empty focus question.
+struct FollowupArgs {
+    scope: Vec<String>,
+    question: String,
+}
+
+fn parse_followup_args(call: &ToolCallRecord) -> Result<FollowupArgs, String> {
+    let value: Value = serde_json::from_str(&call.arguments_json)
+        .map_err(|error| format!("run_pr_agent arguments are not JSON: {error}"))?;
+    let scope = value
+        .get("scope")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "run_pr_agent requires a `scope` array of file paths".to_string())?;
+    let scope: Vec<String> = scope
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect();
+    if scope.is_empty() {
+        return Err("run_pr_agent requires a non-empty `scope` of file paths".to_string());
+    }
+    let question = value
+        .get("question")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+        .ok_or_else(|| "run_pr_agent requires a non-empty `question`".to_string())?;
+    Ok(FollowupArgs {
+        scope,
+        question: question.to_string(),
+    })
+}
+
+/// The soft-failure record shape, matching the FRG-18 executor port:
+/// `{"error": …}`, `soft_failure: true`, stamped with the call id.
+/// Error text never echoes argument values.
+fn followup_soft_failure(call: &ToolCallRecord, error: &str) -> ToolResultRecord {
+    ToolResultRecord {
+        call_id: call.call_id.clone(),
+        result_json: serde_json::json!({ "error": error }).to_string(),
+        truncated: false,
+        soft_failure: true,
+        activated_tool_names: Vec::new(),
+        result_metadata: None,
     }
 }
 
 impl ToolExecutor for SynthesisTools {
     fn execute(&self, call: &ToolCallRecord) -> ToolResultRecord {
-        match call.name.as_str() {
-            // FRG-27: match the `run_pr_agent` tool name first and
-            // serve the capped follow-up here; the four read tools
-            // below keep delegating unchanged.
-            "grep" | "read_file" | "list_dir" | "read_symbol" => self.executor.execute(call),
-            _ => self.executor.execute(call),
+        if call.name.as_str() != "run_pr_agent" {
+            return self.executor.execute(call);
+        }
+        let args = match parse_followup_args(call) {
+            Ok(args) => args,
+            // Malformed arguments are not invocations: nothing to
+            // log (no scope/question was actually asked), just the
+            // soft failure the engine retries or routes around.
+            Err(error) => return followup_soft_failure(call, &error),
+        };
+        let mut calls = self.calls.lock().expect("followup counter lock");
+        if *calls >= self.cap {
+            self.record(PrAgentFollowup {
+                scope: args.scope,
+                question: args.question,
+                outcome: FollowupOutcome::CapExhausted,
+            });
+            return followup_soft_failure(
+                call,
+                &format!(
+                    "run_pr_agent follow-up cap exhausted ({} per review); adjudicate from the evidence gathered so far",
+                    self.cap
+                ),
+            );
+        }
+        *calls += 1;
+        drop(calls);
+        let request = PrAgentFollowupRequest {
+            base: self.base.clone(),
+            scope: args.scope.clone(),
+            question: args.question.clone(),
+        };
+        match (self.runner)(&request) {
+            PrAgentOutcome::Completed { json } => {
+                let (guide, truncated) = followup_guide_text(&json);
+                self.record(PrAgentFollowup {
+                    scope: args.scope,
+                    question: args.question,
+                    outcome: FollowupOutcome::Completed,
+                });
+                ToolResultRecord {
+                    call_id: call.call_id.clone(),
+                    result_json: serde_json::json!({ "guide": guide }).to_string(),
+                    truncated,
+                    soft_failure: false,
+                    activated_tool_names: Vec::new(),
+                    result_metadata: None,
+                }
+            }
+            // A scoped run that fails is a tool-level soft failure —
+            // the session continues and may finish without it — with
+            // the outage recorded, never a session crash.
+            outcome => {
+                let reason = match outcome {
+                    PrAgentOutcome::ProducerFailure { reason } => reason,
+                    PrAgentOutcome::TimedOut { reason } => reason,
+                    PrAgentOutcome::InvalidOutput { reason } => reason,
+                    PrAgentOutcome::Completed { .. } => unreachable!("completed handled above"),
+                };
+                self.record(PrAgentFollowup {
+                    scope: args.scope,
+                    question: args.question,
+                    outcome: FollowupOutcome::Failed {
+                        reason: reason.clone(),
+                    },
+                });
+                followup_soft_failure(call, &format!("scoped pr-agent run failed: {reason}"))
+            }
         }
     }
 }
@@ -262,7 +434,10 @@ impl ToolExecutor for SynthesisTools {
 /// and session, summarization disabled, driven to a terminal action,
 /// with the final assistant text parsed as the synthesis envelope.
 /// The engine budget is this session's own ([`agent_config`]); the
-/// caller supplies only the stage deadline.
+/// caller supplies only the stage deadline, and the executor — the
+/// [`SynthesisTools`] router the caller built, wrapping the shared
+/// read executor with the capped follow-up runner. The session sees
+/// the synthesizer-only five-tool schema set; lens sessions never do.
 pub fn run_synthesis_session(
     inputs: &SynthesisInputs<'_>,
     transport: &dyn ModelTransport,
@@ -278,7 +453,7 @@ pub fn run_synthesis_session(
     let mut config = agent_config();
     config.tool_semantics = ToolSemanticsConfig {
         catalog: ToolCatalogConfig {
-            tools: tool_specs(),
+            tools: synthesis_tool_specs(),
         },
         ..ToolSemanticsConfig::agnostic()
     };
@@ -288,7 +463,7 @@ pub fn run_synthesis_session(
     let io_params = match SessionIoParams::new(
         PROVIDER.to_string(),
         CONTEXT_WINDOW_TOKENS,
-        TOOLS_SCHEMA_JSON.to_string(),
+        SYNTHESIS_SCHEMA_JSON.to_string(),
         crate::sessions::system_prompt(SYNTHESIS_PROMPT),
     ) {
         Ok(params) => params,
@@ -321,9 +496,7 @@ pub fn run_synthesis_session(
         }
     };
 
-    let router: Arc<dyn ToolExecutor + Send + Sync> =
-        Arc::new(SynthesisTools::new(executor.clone()));
-    match drive_session(&engine, &handle, transport, &router, deadline) {
+    match drive_session(&engine, &handle, transport, executor, deadline) {
         DriveOutcome::Finished { budget_signaled } => {
             let snapshot = engine.export_snapshot(&handle);
             let Some(final_text) = snapshot
@@ -1087,6 +1260,32 @@ mod session_tests {
         )
     }
 
+    fn followup_base() -> crate::pr_agent::PrAgentRequest {
+        crate::pr_agent::PrAgentRequest {
+            pr_url: "https://github.com/example/project/pull/1".to_string(),
+            context_files: Vec::new(),
+            repo_map: String::new(),
+            entry_max_lines: 2000,
+            timeout: std::time::Duration::from_secs(30),
+        }
+    }
+
+    fn stub_followup_runner(json: &str) -> FollowupRunner {
+        let json = json.to_string();
+        Arc::new(move |_: &PrAgentFollowupRequest| PrAgentOutcome::Completed { json: json.clone() })
+    }
+
+    fn router_with(
+        executor: Arc<dyn ToolExecutor + Send + Sync>,
+        runner: FollowupRunner,
+    ) -> Arc<SynthesisTools> {
+        Arc::new(SynthesisTools::new(executor, runner, followup_base(), 2))
+    }
+
+    fn as_executor(router: &Arc<SynthesisTools>) -> Arc<dyn ToolExecutor + Send + Sync> {
+        router.clone()
+    }
+
     fn governing() -> ContractResolution {
         ContractResolution::Governing {
             entry_file: "AGENTS.md".to_string(),
@@ -1207,7 +1406,10 @@ mod session_tests {
                 &contract,
             ),
             &transport,
-            &executor,
+            &as_executor(&router_with(
+                executor,
+                stub_followup_runner(FOLLOWUP_REVIEW_JSON),
+            )),
             None,
         );
         match outcome {
@@ -1257,7 +1459,10 @@ mod session_tests {
         let outcome = run_synthesis_session(
             &inputs(&clustered, None, None, &diff, &map, &contract),
             &transport,
-            &executor,
+            &as_executor(&router_with(
+                executor,
+                stub_followup_runner(FOLLOWUP_REVIEW_JSON),
+            )),
             None,
         );
         match outcome {
@@ -1279,6 +1484,78 @@ mod session_tests {
             }
             other => panic!("expected a completed synthesis, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn followup_runs_end_to_end_inside_the_session() {
+        let fixture = fixture_repo();
+        let snapshot = fixture.snapshot();
+        let map = snapshot.repo_map.render();
+        let diff = fixture.diff_text();
+        let executor = executor_for(&snapshot);
+        let contract = governing();
+
+        let clustered = cluster_findings(&[producer(
+            "src/parse.rs",
+            5,
+            5,
+            "parse_port panics on empty PORT",
+            "The caller at src/main.rs passes the PORT environment value, which is empty when PORT is unset.",
+        )]);
+
+        let final_text = format!(
+            r#"{{"summary": "Confirmed by a second look.",
+                "findings": [{MERGED_FINDING}],
+                "decisions": [
+                    {{"producer": 1, "disposition": "kept", "final": 1}}
+                ]}}"#
+        );
+        let script = vec![
+            tool_call_response(
+                "run_pr_agent",
+                "{\"scope\": [\"src/parse.rs\", \"src/main.rs\"], \"question\": \"Does the caller ever pass an empty string?\"}",
+            ),
+            text_response(&final_text),
+        ];
+        let transport = ScriptedTransport::new(script, text_response("{}"));
+        let router = router_with(executor, stub_followup_runner(FOLLOWUP_REVIEW_JSON));
+
+        let outcome = run_synthesis_session(
+            &inputs(
+                &clustered,
+                Some("PR-Agent guide: check the PORT handling."),
+                None,
+                &diff,
+                &map,
+                &contract,
+            ),
+            &transport,
+            &as_executor(&router),
+            None,
+        );
+        match outcome {
+            SynthesisOutcome::Completed { findings, .. } => {
+                assert_eq!(findings.len(), 1);
+                assert_eq!(
+                    findings[0].citations,
+                    Some(vec!["src/main.rs:4".to_string()])
+                );
+            }
+            other => panic!("expected a completed synthesis, got {other:?}"),
+        }
+        // The session's follow-up is drained for the decision log with
+        // its scope, question, and success.
+        let logged = router.take_followups();
+        assert_eq!(logged.len(), 1);
+        assert_eq!(
+            logged[0].scope,
+            vec!["src/parse.rs".to_string(), "src/main.rs".to_string()]
+        );
+        assert_eq!(
+            logged[0].question,
+            "Does the caller ever pass an empty string?"
+        );
+        assert_eq!(logged[0].outcome, FollowupOutcome::Completed);
     }
 
     #[test]
@@ -1465,7 +1742,10 @@ mod session_tests {
         let outcome = run_synthesis_session(
             &inputs(&clustered, None, None, &diff, &map, &contract),
             &transport,
-            &executor,
+            &as_executor(&router_with(
+                executor,
+                stub_followup_runner(FOLLOWUP_REVIEW_JSON),
+            )),
             None,
         );
         let reason = match outcome {
@@ -1487,12 +1767,34 @@ mod session_tests {
         );
     }
 
+    const FOLLOWUP_REVIEW_JSON: &str = r#"{"review":{
+        "summary": "The caller passes the empty default.",
+        "key_issues_to_review": [
+            {"relevant_file": "src/parse.rs", "issue_header": "Possible Panic",
+             "issue_content": "The expect fires when PORT is unset.", "start_line": 5, "end_line": 5}
+        ],
+        "security_concerns": "No"}}"#;
+
+    fn followup_call(question: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            call_id: "followup-1".to_string(),
+            name: "run_pr_agent".to_string(),
+            arguments_json: serde_json::json!({
+                "scope": ["src/parse.rs"],
+                "question": question,
+            })
+            .to_string(),
+            attempt_metadata: None,
+            repair_metadata: None,
+        }
+    }
+
     #[test]
-    fn router_delegates_the_read_tools_and_marks_the_fr27_slot() {
+    fn router_delegates_the_read_tools() {
         let fixture = fixture_repo();
         let snapshot = fixture.snapshot();
         let executor = executor_for(&snapshot);
-        let router = SynthesisTools::new(executor);
+        let router = router_with(executor, stub_followup_runner(FOLLOWUP_REVIEW_JSON));
 
         for (name, arguments_json) in [
             ("grep", "{\"pattern\": \"parse_port\", \"path\": \"src\"}"),
@@ -1513,17 +1815,123 @@ mod session_tests {
                 "{name} delegates to the executor against the fixture"
             );
         }
-
-        let unknown = ToolCallRecord {
-            call_id: "router-2".to_string(),
-            name: "run_pr_agent".to_string(),
-            arguments_json: "{}".to_string(),
-            attempt_metadata: None,
-            repair_metadata: None,
-        };
         assert!(
-            router.execute(&unknown).soft_failure,
-            "until FRG-27 the follow-up name falls through to the executor's UnknownTool failure"
+            router.take_followups().is_empty(),
+            "read-tool delegation records no follow-ups"
+        );
+    }
+
+    #[test]
+    fn followup_first_two_succeed_third_is_refused_by_the_host() {
+        let fixture = fixture_repo();
+        let snapshot = fixture.snapshot();
+        let router = router_with(
+            executor_for(&snapshot),
+            stub_followup_runner(FOLLOWUP_REVIEW_JSON),
+        );
+
+        for question in ["first look", "second look"] {
+            let record = router.execute(&followup_call(question));
+            assert!(
+                !record.soft_failure,
+                "follow-up runs return guide text, not failures"
+            );
+            assert!(
+                record
+                    .result_json
+                    .contains("The caller passes the empty default"),
+                "guide text reaches the session: {}",
+                record.result_json
+            );
+            assert!(!record.truncated);
+        }
+        let refused = router.execute(&followup_call("third look"));
+        assert!(refused.soft_failure, "the third call is refused");
+        assert!(
+            refused.result_json.contains("cap exhausted"),
+            "refusal names the host cap: {}",
+            refused.result_json
+        );
+
+        // The cap is host state, not prompt text: two completions and
+        // one refusal, each carrying its scope and question.
+        let logged = router.take_followups();
+        assert_eq!(logged.len(), 3);
+        assert_eq!(logged[0].scope, vec!["src/parse.rs".to_string()]);
+        assert_eq!(logged[0].question, "first look");
+        assert_eq!(logged[0].outcome, FollowupOutcome::Completed);
+        assert_eq!(logged[1].outcome, FollowupOutcome::Completed);
+        assert_eq!(logged[2].outcome, FollowupOutcome::CapExhausted);
+        assert_eq!(logged[2].question, "third look");
+    }
+
+    #[test]
+    fn followup_scoped_failure_is_a_soft_failure_not_a_crash() {
+        let fixture = fixture_repo();
+        let snapshot = fixture.snapshot();
+        let failing: FollowupRunner =
+            Arc::new(
+                |_: &PrAgentFollowupRequest| PrAgentOutcome::ProducerFailure {
+                    reason: "scoped run could not read the PR".to_string(),
+                },
+            );
+        let router = router_with(executor_for(&snapshot), failing);
+
+        let record = router.execute(&followup_call("does it panic?"));
+        assert!(record.soft_failure);
+        assert!(
+            record.result_json.contains("scoped pr-agent run failed"),
+            "{}",
+            record.result_json
+        );
+        let logged = router.take_followups();
+        assert_eq!(logged.len(), 1);
+        assert_eq!(
+            logged[0].outcome,
+            FollowupOutcome::Failed {
+                reason: "scoped run could not read the PR".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn followup_malformed_args_are_rejected_without_logging() {
+        let fixture = fixture_repo();
+        let snapshot = fixture.snapshot();
+        let router = router_with(
+            executor_for(&snapshot),
+            stub_followup_runner(FOLLOWUP_REVIEW_JSON),
+        );
+
+        for (label, arguments_json) in [
+            ("not json", "definitely not json"),
+            ("missing scope", "{\"question\": \"q\"}"),
+            ("empty scope", "{\"scope\": [], \"question\": \"q\"}"),
+            ("blank paths", "{\"scope\": [\"  \"], \"question\": \"q\"}"),
+            ("missing question", "{\"scope\": [\"src/a.rs\"]}"),
+            (
+                "blank question",
+                "{\"scope\": [\"src/a.rs\"], \"question\": \"  \"}",
+            ),
+        ] {
+            let call = ToolCallRecord {
+                call_id: "bad-args".to_string(),
+                name: "run_pr_agent".to_string(),
+                arguments_json: arguments_json.to_string(),
+                attempt_metadata: None,
+                repair_metadata: None,
+            };
+            let record = router.execute(&call);
+            assert!(record.soft_failure, "{label} is a soft failure");
+            assert!(
+                !record.result_json.contains("src/a.rs"),
+                "{label} echoes no argument values: {}",
+                record.result_json
+            );
+        }
+        assert!(
+            router.take_followups().is_empty(),
+            "malformed calls are not invocations and log nothing"
         );
     }
 
@@ -1590,6 +1998,8 @@ mod session_tests {
     fn prompt_states_the_decision_vocabulary() {
         assert!(SYNTHESIS_PROMPT.contains("merged-into:"));
         assert!(SYNTHESIS_PROMPT.contains("unverified-claim"));
+        assert!(SYNTHESIS_PROMPT.contains("run_pr_agent"));
+        assert!(SYNTHESIS_PROMPT.contains("at most 2 calls per review"));
         assert!(SYNTHESIS_PROMPT.contains("Return ONLY the JSON object"));
         assert!(
             !SYNTHESIS_PROMPT.contains("{diff}"),

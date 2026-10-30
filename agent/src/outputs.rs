@@ -109,6 +109,32 @@ pub fn synthesis_conformance(conformance: &serde_json::Value) -> serde_json::Val
     })
 }
 
+/// One `run_pr_agent` follow-up invocation for the decision log
+/// (FRG-27): the scope the session asked about, its focus question,
+/// and whether the host ran it, refused it under the cap, or watched
+/// it fail — with the guide receipt or the failure grounds as detail.
+pub fn pr_agent_followup(followup: &crate::synthesis::PrAgentFollowup) -> serde_json::Value {
+    use crate::synthesis::FollowupOutcome;
+    let (outcome, detail) = match &followup.outcome {
+        FollowupOutcome::Completed => (
+            "completed",
+            "scoped guide text received and handed to the session".to_string(),
+        ),
+        FollowupOutcome::CapExhausted => (
+            "cap_exhausted",
+            "host follow-up cap refused the call without running PR-Agent".to_string(),
+        ),
+        FollowupOutcome::Failed { reason } => ("failed", reason.clone()),
+    };
+    serde_json::json!({
+        "kind": "pr_agent_followup",
+        "scope": followup.scope,
+        "question": followup.question,
+        "outcome": outcome,
+        "detail": detail,
+    })
+}
+
 fn write_json<T: serde::Serialize + ?Sized>(
     value: &T,
     path: &Path,
