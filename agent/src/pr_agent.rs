@@ -106,17 +106,161 @@ fn run_pr_agent_with_env(
     request: &PrAgentRequest,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> PrAgentOutcome {
-    let invocation = match build_invocation(request, lookup) {
+    let invocation = match build_invocation(request, &[], lookup) {
         Ok(invocation) => invocation,
         Err(reason) => return PrAgentOutcome::ProducerFailure { reason },
     };
+    run_invocation_with_cleanup(invocation, request.timeout)
+}
 
+/// Spawn a resolved invocation and remove its run dir on every path.
+/// Cleanup failure is not a producer failure.
+fn run_invocation_with_cleanup(invocation: Invocation, timeout: Duration) -> PrAgentOutcome {
     let run_dir = invocation.run_dir.clone();
-    let outcome = run_invocation(&invocation, request.timeout);
+    let outcome = run_invocation(&invocation, timeout);
     // Best-effort cleanup on all paths; failure to clean is not a
     // producer failure.
     let _ = fs::remove_dir_all(&run_dir);
     outcome
+}
+
+/// Request for one synthesizer follow-up run: the deterministic run's
+/// base plus the scope and question the session asked about.
+#[derive(Debug, Clone)]
+pub struct PrAgentFollowupRequest {
+    /// The FRG-23 base: PR URL, context files, repo map, caps.
+    pub base: PrAgentRequest,
+    /// Repo-relative file paths to focus the second look on.
+    pub scope: Vec<String>,
+    /// The focused question for PR-Agent to answer about the scope.
+    pub question: String,
+}
+
+/// Run one scoped PR-Agent follow-up for the synthesizer session.
+///
+/// The run is the FRG-23 machinery unchanged (NG2: PR-Agent is not
+/// forked or patched): the same subprocess, credentials, and
+/// artifact channel, plus one extra env pair — the scope and question
+/// as `[pr_reviewer] extra_instructions`. "Scoped accordingly" is
+/// front-loaded focus, not chunking: PR-Agent still reviews the whole
+/// diff (its own chunking remains its business), with the
+/// synthesizer's scope and question in its instructions.
+pub fn run_pr_agent_followup(request: &PrAgentFollowupRequest) -> PrAgentOutcome {
+    let invocation = match build_invocation(
+        &request.base,
+        &[(
+            "PR_REVIEWER__EXTRA_INSTRUCTIONS".to_string(),
+            followup_instructions(&request.scope, &request.question),
+        )],
+        &|name| std::env::var(name).ok(),
+    ) {
+        Ok(invocation) => invocation,
+        Err(reason) => return PrAgentOutcome::ProducerFailure { reason },
+    };
+    run_invocation_with_cleanup(invocation, request.base.timeout)
+}
+
+/// The extra-instructions text for a follow-up run: the scope as an
+/// explicit file list plus the verbatim focus question. PR-Agent
+/// renders this into its review prompt; nothing here is trusted by
+/// the host — it is model-to-model text, and the synthesizer treats
+/// the returned guide as evidence, never instructions.
+fn followup_instructions(scope: &[String], question: &str) -> String {
+    format!(
+        "Focused follow-up from the Forge synthesizer: this is a second look at a specific area, not a full re-review.\nScope: pay special attention to these files: {}.\nFocus question: {}\nGround the answer in the files above; say explicitly when the question cannot be answered from the diff.",
+        scope.join(", "),
+        question
+    )
+}
+
+/// Cap on the guide text handed back through the tool channel, in
+/// characters. A full review object can dwarf the session's context;
+/// the synthesizer asked a focused question, so a focused slice of
+/// the answer is the honest result. A judgment call, not a
+/// measurement.
+pub const FOLLOWUP_GUIDE_MAX_CHARS: usize = 12_000;
+
+/// Render the guide text for a follow-up tool result from the
+/// completed review JSON: the summary, each key issue with its file
+/// and line range, and non-trivial security concerns. Unknown shapes
+/// fall back to the review object as JSON rather than failing — the
+/// tool result must always carry something. Returns the text and
+/// whether it was truncated to [`FOLLOWUP_GUIDE_MAX_CHARS`].
+pub fn followup_guide_text(review_json: &str) -> (String, bool) {
+    let parsed: serde_json::Value = match serde_json::from_str(review_json) {
+        Ok(parsed) => parsed,
+        Err(_) => return (truncate_guide(review_json), true),
+    };
+    let review = match parsed.get("review") {
+        Some(review) if review.is_object() => review,
+        _ => return (truncate_guide(review_json), true),
+    };
+    let mut lines = Vec::new();
+    if let Some(summary) = review.get("summary").and_then(serde_json::Value::as_str) {
+        let summary = summary.trim();
+        if !summary.is_empty() {
+            lines.push(format!("Summary: {summary}"));
+        }
+    }
+    if let Some(issues) = review
+        .get("key_issues_to_review")
+        .and_then(serde_json::Value::as_array)
+    {
+        for issue in issues {
+            let file = issue
+                .get("relevant_file")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let header = issue
+                .get("issue_header")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("issue");
+            let content = issue
+                .get("issue_content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let range = match (
+                issue.get("start_line").and_then(serde_json::Value::as_u64),
+                issue.get("end_line").and_then(serde_json::Value::as_u64),
+            ) {
+                (Some(start), Some(end)) => format!(" [{start}-{end}]"),
+                _ => String::new(),
+            };
+            lines.push(format!("- {file}{range}: {header} — {content}"));
+        }
+    }
+    if let Some(concerns) = review
+        .get("security_concerns")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+    {
+        if !concerns.is_empty()
+            && !["no", "none", "n/a"].contains(&concerns.to_lowercase().as_str())
+        {
+            lines.push(format!("Security concerns: {concerns}"));
+        }
+    }
+    if lines.is_empty() {
+        let fallback = serde_json::to_string_pretty(review).unwrap_or_else(|_| review.to_string());
+        return (truncate_guide(&fallback), true);
+    }
+    let text = lines.join("\n");
+    if text.chars().count() > FOLLOWUP_GUIDE_MAX_CHARS {
+        (truncate_guide(&text), true)
+    } else {
+        (text, false)
+    }
+}
+
+/// Cap text at [`FOLLOWUP_GUIDE_MAX_CHARS`] on a char boundary, noting
+/// the truncation. The caller decides whether the cap fired.
+fn truncate_guide(text: &str) -> String {
+    if text.chars().count() <= FOLLOWUP_GUIDE_MAX_CHARS {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(FOLLOWUP_GUIDE_MAX_CHARS).collect();
+    format!("{kept}\n…[guide truncated to {FOLLOWUP_GUIDE_MAX_CHARS} chars]")
 }
 
 /// A fully-resolved invocation: what to spawn, with which argv, which
@@ -146,6 +290,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// caller must not spawn.
 fn build_invocation(
     request: &PrAgentRequest,
+    extra_env: &[(String, String)],
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Invocation, String> {
     let nonempty = |name: &str| {
@@ -231,6 +376,8 @@ fn build_invocation(
             run_dir.to_string_lossy().into_owned(),
         ),
     ];
+
+    env.extend(extra_env.iter().cloned());
 
     // An empty render (zero-entry snapshot) carries no artifact: pass
     // the map through anyway when non-empty (upstream truncates past
@@ -638,7 +785,8 @@ esac
         let dir = fixture_dir("wire");
         let env = full_env("python3-test");
         let request = test_request();
-        let invocation = build_invocation(&request, &env_lookup(&env)).expect("build invocation");
+        let invocation =
+            build_invocation(&request, &[], &env_lookup(&env)).expect("build invocation");
         assert_eq!(invocation.program, "python3-test");
         let expected_json = invocation.review_json.display().to_string();
         assert_eq!(
@@ -684,7 +832,7 @@ esac
         // be credited with a previous run's success.
         let env = full_env("python3");
         let invocation =
-            build_invocation(&test_request(), &env_lookup(&env)).expect("build invocation");
+            build_invocation(&test_request(), &[], &env_lookup(&env)).expect("build invocation");
         assert!(
             !invocation.review_json.exists(),
             "review.json {} must not predate the spawn",
@@ -698,7 +846,8 @@ esac
         let env = full_env("python3");
         let mut request = test_request();
         request.context_files = Vec::new();
-        let invocation = build_invocation(&request, &env_lookup(&env)).expect("build invocation");
+        let invocation =
+            build_invocation(&request, &[], &env_lookup(&env)).expect("build invocation");
         let pairs: HashMap<_, _> = invocation.env.into_iter().collect();
         assert_eq!(
             pairs.get("CONFIG__REPO_CONTEXT_FILES").map(String::as_str),
@@ -713,7 +862,8 @@ esac
         let env = full_env("python3");
         let mut request = test_request();
         request.repo_map = String::new();
-        let invocation = build_invocation(&request, &env_lookup(&env)).expect("build invocation");
+        let invocation =
+            build_invocation(&request, &[], &env_lookup(&env)).expect("build invocation");
         let pairs: HashMap<_, _> = invocation.env.into_iter().collect();
         assert!(
             !pairs.contains_key("ARTIFACT_PATH"),
@@ -726,13 +876,13 @@ esac
     fn missing_credentials_fail_before_spawn() {
         let mut env = full_env("python3");
         env.remove("GITHUB__USER_TOKEN");
-        let error = build_invocation(&test_request(), &env_lookup(&env))
+        let error = build_invocation(&test_request(), &[], &env_lookup(&env))
             .expect_err("missing token must fail");
         assert!(error.contains("GITHUB__USER_TOKEN"), "{error}");
 
         let mut env = full_env("python3");
         env.remove("OPENROUTER_API_KEY");
-        let error = build_invocation(&test_request(), &env_lookup(&env))
+        let error = build_invocation(&test_request(), &[], &env_lookup(&env))
             .expect_err("missing key must fail");
         assert!(error.contains("OPENROUTER_API_KEY"), "{error}");
     }
@@ -742,7 +892,7 @@ esac
         let mut env = full_env("python3");
         env.remove("FORGE_PR_AGENT_PYTHON");
         let invocation =
-            build_invocation(&test_request(), &env_lookup(&env)).expect("build invocation");
+            build_invocation(&test_request(), &[], &env_lookup(&env)).expect("build invocation");
         assert_eq!(invocation.program, "python3");
         fs::remove_dir_all(&invocation.run_dir).ok();
     }
@@ -1002,5 +1152,95 @@ esac
             );
         }
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- FRG-27 follow-up (pure + guide text, no spawn) ------------------------
+
+    fn followup_request() -> PrAgentFollowupRequest {
+        PrAgentFollowupRequest {
+            base: test_request(),
+            scope: vec!["src/parse.rs".to_string(), "src/main.rs".to_string()],
+            question: "Does the caller ever pass an empty string?".to_string(),
+        }
+    }
+
+    #[test]
+    fn followup_wires_scope_and_question_as_extra_instructions() {
+        let env = full_env("python3");
+        let request = followup_request();
+        let invocation = build_invocation(
+            &request.base,
+            &[(
+                "PR_REVIEWER__EXTRA_INSTRUCTIONS".to_string(),
+                followup_instructions(&request.scope, &request.question),
+            )],
+            &env_lookup(&env),
+        )
+        .expect("build follow-up invocation");
+        let pairs: HashMap<_, _> = invocation.env.into_iter().collect();
+        let instructions = pairs
+            .get("PR_REVIEWER__EXTRA_INSTRUCTIONS")
+            .expect("extra-instructions pair present");
+        assert!(
+            instructions.contains("src/parse.rs") && instructions.contains("src/main.rs"),
+            "scope files are front-loaded: {instructions}"
+        );
+        assert!(
+            instructions.contains("Does the caller ever pass an empty string?"),
+            "focus question is verbatim: {instructions}"
+        );
+        fs::remove_dir_all(&invocation.run_dir).ok();
+    }
+
+    const FOLLOWUP_REVIEW_JSON: &str = r#"{"review":{
+        "summary": "One real panic on empty PORT.",
+        "key_issues_to_review": [
+            {"relevant_file": "src/parse.rs", "issue_header": "Possible Panic",
+             "issue_content": "The expect fires when PORT is unset.", "start_line": 5, "end_line": 5},
+            {"relevant_file": "src/main.rs", "issue_header": "Unchecked Default",
+             "issue_content": "Empty default flows into the strict parser."}
+        ],
+        "security_concerns": "No"}}"#;
+
+    #[test]
+    fn followup_guide_renders_summary_issues_and_skips_no() {
+        let (text, truncated) = followup_guide_text(FOLLOWUP_REVIEW_JSON);
+        assert!(!truncated);
+        assert!(text.contains("Summary: One real panic"), "{text}");
+        assert!(
+            text.contains("- src/parse.rs [5-5]: Possible Panic — The expect fires"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- src/main.rs: Unchecked Default — Empty default"),
+            "{text}"
+        );
+        assert!(!text.contains("Security concerns"), "{text}");
+    }
+
+    #[test]
+    fn followup_guide_falls_back_and_truncates() {
+        // Unknown shape: the review object as JSON, capped.
+        let odd = "{\"review\":{\"score\":9,\"custom\":true}}";
+        let (text, truncated) = followup_guide_text(odd);
+        assert!(truncated, "the JSON fallback counts as truncated");
+        assert!(text.contains("\"score\""), "{text}");
+
+        // Long text: capped on a char boundary with a note.
+        let long = format!(
+            "{{\"review\":{{\"summary\":\"{}\"}}}}",
+            "x".repeat(FOLLOWUP_GUIDE_MAX_CHARS + 100)
+        );
+        let (text, truncated) = followup_guide_text(&long);
+        assert!(truncated);
+        assert!(text.ends_with(&format!(
+            "…[guide truncated to {FOLLOWUP_GUIDE_MAX_CHARS} chars]"
+        )));
+        assert_eq!(text.chars().count(), FOLLOWUP_GUIDE_MAX_CHARS + 34);
+
+        // Not JSON at all: carried through, capped.
+        let (text, truncated) = followup_guide_text("not json");
+        assert!(truncated);
+        assert_eq!(text, "not json");
     }
 }

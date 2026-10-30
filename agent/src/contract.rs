@@ -22,6 +22,11 @@ const DEFAULT_DEEP_REVIEW: bool = true;
 const DEFAULT_LENS_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_PR_AGENT_TIMEOUT_SECS: u64 = 900;
 const DEFAULT_SYNTHESIS_TIMEOUT_SECS: u64 = 600;
+/// Decision D6 (proposal §17): the synthesizer's `run_pr_agent`
+/// follow-up cap per review. Zero disables follow-ups (every call
+/// fails cap-exhausted); it is a setting, not an error, so unlike the
+/// timeouts it has no greater-than-zero validation.
+const DEFAULT_PR_AGENT_FOLLOWUPS: usize = 2;
 
 /// The `[forge]` section of a repository's `.pr_agent.toml` file.
 ///
@@ -47,6 +52,9 @@ pub struct ForgeConfig {
     pub pr_agent_timeout_secs: u64,
     /// Reserved for FRG-26 synthesis; unused by any stage in this ticket.
     pub synthesis_timeout_secs: u64,
+    /// Synthesizer's `run_pr_agent` follow-up cap per review (FRG-27,
+    /// proposal §11/D6). Enforced by the host; zero disables.
+    pub pr_agent_followups: usize,
 }
 
 impl Default for ForgeConfig {
@@ -60,6 +68,7 @@ impl Default for ForgeConfig {
             lens_timeout_secs: DEFAULT_LENS_TIMEOUT_SECS,
             pr_agent_timeout_secs: DEFAULT_PR_AGENT_TIMEOUT_SECS,
             synthesis_timeout_secs: DEFAULT_SYNTHESIS_TIMEOUT_SECS,
+            pr_agent_followups: DEFAULT_PR_AGENT_FOLLOWUPS,
         }
     }
 }
@@ -78,6 +87,7 @@ struct ForgeSection {
     lens_timeout_secs: Option<u64>,
     pr_agent_timeout_secs: Option<u64>,
     synthesis_timeout_secs: Option<u64>,
+    pr_agent_followups: Option<usize>,
 }
 
 impl From<ForgeSection> for ForgeConfig {
@@ -102,6 +112,9 @@ impl From<ForgeSection> for ForgeConfig {
             synthesis_timeout_secs: section
                 .synthesis_timeout_secs
                 .unwrap_or(DEFAULT_SYNTHESIS_TIMEOUT_SECS),
+            pr_agent_followups: section
+                .pr_agent_followups
+                .unwrap_or(DEFAULT_PR_AGENT_FOLLOWUPS),
         }
     }
 }
@@ -471,6 +484,29 @@ mod tests {
         assert_eq!(config.lens_timeout_secs, 30);
         assert_eq!(config.pr_agent_timeout_secs, 45);
         assert_eq!(config.synthesis_timeout_secs, 60);
+    }
+
+    #[test]
+    fn followup_cap_defaults_to_two_and_parses() {
+        let config = parse_config_str("", Path::new("fixture.toml")).expect("parse empty");
+        assert_eq!(config.pr_agent_followups, 2);
+
+        let config = parse_config_str(
+            "[forge]\npr_agent_followups = 1\n",
+            Path::new("fixture.toml"),
+        )
+        .expect("parse followup cap");
+        assert_eq!(config.pr_agent_followups, 1);
+    }
+
+    #[test]
+    fn zero_followups_disables_rather_than_erroring() {
+        let config = parse_config_str(
+            "[forge]\npr_agent_followups = 0\n",
+            Path::new("fixture.toml"),
+        )
+        .expect("zero followups parses: it disables the tool");
+        assert_eq!(config.pr_agent_followups, 0);
     }
 
     #[test]
