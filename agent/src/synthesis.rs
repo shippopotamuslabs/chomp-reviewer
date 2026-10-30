@@ -816,6 +816,14 @@ pub fn synthesis_fallback(clustered: &[ClusteredFinding], reason: &str) -> (Vec<
     (union, entry)
 }
 
+/// The fallback review's rollup summary (FRG-28): the posting layer
+/// needs a summary string, and the fallback path produces no session.
+/// Host-authored and clearly labeled — never mistaken for a model
+/// verdict.
+pub fn fallback_summary(reason: &str) -> String {
+    format!("Fallback review (synthesis budget exhausted: {reason}). Findings below are the deterministic union of producer findings, unmerged and uncalibrated.")
+}
+
 /// Read the linked-ticket artifact (D7): `None` without `--ticket-file`
 /// or with an empty file; the verbatim text otherwise, quoted into
 /// the prompt as untrusted background data. A file that passed input
@@ -1759,6 +1767,12 @@ mod session_tests {
             .map(|member| member.finding.clone())
             .collect();
         assert_eq!(union, stripped, "the union is the input multiset, untagged");
+        let summary = fallback_summary(&reason);
+        assert!(
+            summary.starts_with("Fallback review (synthesis budget exhausted: "),
+            "the fallback summary is host-labeled, never a model verdict: {summary}"
+        );
+        assert!(summary.contains(&reason));
         assert_eq!(entry["kind"], "synthesis");
         assert_eq!(entry["event"], "fallback_union");
         assert!(

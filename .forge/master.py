@@ -415,6 +415,34 @@ def find_marker_note_gitlab(api_url, project_id, iid, token, marker):
     return None
 
 
+def synthesis_outputs(decision_log):
+    """Extract the rollup summary and conformance object from a chomp
+    decision log (2.0 post-only path).
+
+    The synthesizer records both as log entries (FRG-26): the first
+    kind=synthesis/event=summary detail is the rollup summary, and the
+    first kind=synthesis_conformance object is the conformance context.
+    Absent entries degrade to an empty summary and no conformance —
+    the rollup posts what it has, never invented text.
+    """
+    summary = ""
+    conformance = None
+    if not isinstance(decision_log, dict):
+        return summary, conformance
+    for entry in decision_log.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("kind") == "synthesis" and entry.get("event") == "summary" and not summary:
+            detail = entry.get("detail")
+            if isinstance(detail, str):
+                summary = detail
+        if entry.get("kind") == "synthesis_conformance" and conformance is None:
+            candidate = entry.get("conformance")
+            if isinstance(candidate, dict):
+                conformance = candidate
+    return summary, conformance
+
+
 def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, diff,
                        tickets=None, conformance=None, ticket_details=None):
     """Post the consolidated review to GitLab: rollup note + inline
@@ -744,13 +772,66 @@ def write_recorded_json(iid, sha, platform, recorded, failed, tickets,
         json.dump(payload, f, indent=2)
 
 
+def post_and_record(platform, args, summary, findings, diff, ticket_keys,
+                    conformance, ticket_details, api_url, project_id, gitlab_token):
+    """Shared publish tail: post through the platform backend, then write
+    forge-recorded.json in its current shape for the verify path.
+
+    Both review paths end here — the 1.x LLM dedup and the 2.0 chomp
+    post-only mode. Posting functions are unchanged; this only factors
+    the common call, record, and count reporting.
+    """
+    try:
+        if platform == "github":
+            gh_api, gh_repo, gh_token = github_backend.gh_env()
+            recorded, failed = post_review_github(
+                gh_api, gh_repo, args.iid, gh_token, args.sha, summary, findings, diff,
+                tickets=ticket_keys, conformance=conformance,
+                ticket_details=ticket_details)
+        else:
+            recorded, failed = post_review_gitlab(
+                api_url, project_id, args.iid, gitlab_token, args.sha, summary, findings, diff,
+                tickets=ticket_keys, conformance=conformance,
+                ticket_details=ticket_details)
+    except DuplicateReviewPost as e:
+        # No-op, not a verify invocation: a concurrent run posted first.
+        # Verify routing is the workflow re-check's job; just record the
+        # suppression and exit 0 so the queued run stays green.
+        print(f"Duplicate consolidated review suppressed (existing id "
+              f"{e.existing_id}); this run posted nothing, a later run "
+              f"will verify.", file=sys.stderr)
+        write_recorded_json(args.iid, args.sha, platform, [], [], ticket_keys,
+                            conformance, duplicate_suppressed=True)
+        print("Recorded 0 discussions to forge-recorded.json", file=sys.stderr)
+        return
+
+    # Write recorded discussions for the verify job
+    write_recorded_json(args.iid, args.sha, platform, recorded, failed,
+                        ticket_keys, conformance)
+    print(f"Recorded {len(recorded)} discussions to forge-recorded.json", file=sys.stderr)
+    if failed:
+        print(f"ERROR: {len(failed)} findings could not be posted inline: {failed}", file=sys.stderr)
+
+    # Summary counts
+    counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+    for f in findings:
+        sev = f.get("severity", "Low")
+        if sev in counts:
+            counts[sev] += 1
+    print(f"Posted consolidated review: {counts}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iid", required=True, help="MR internal ID (GitHub: PR number)")
     parser.add_argument("--sha", required=True, help="MR head SHA")
-    parser.add_argument("--pr-agent", required=True, help="Path to PR-Agent findings markdown")
-    parser.add_argument("--thermos-a", required=True, help="Path to thermos-a JSON")
-    parser.add_argument("--thermos-b", required=True, help="Path to thermos-b JSON")
+    parser.add_argument("--pr-agent", default=None, help="Path to PR-Agent findings markdown (1.x path)")
+    parser.add_argument("--thermos-a", default=None, help="Path to thermos-a JSON (1.x path)")
+    parser.add_argument("--thermos-b", default=None, help="Path to thermos-b JSON (1.x path)")
+    parser.add_argument("--final-findings", default=None,
+                        help="Path to chomp final findings JSON (2.0 post-only path)")
+    parser.add_argument("--decisions", default=None,
+                        help="Path to chomp decision log JSON (2.0 post-only path)")
     parser.add_argument("--diff", required=True, help="Path to diff file")
     parser.add_argument("--prompt-dir", default=".forge/prompts")
     parser.add_argument("--ticket", default=None,
@@ -781,6 +862,49 @@ def main():
             sys.exit(1)
 
     model = get_model()
+
+    # 2.0 post-only path: chomp already synthesized. The LLM half is
+    # skipped entirely; findings, summary, and conformance come from
+    # chomp's outputs and post through the unchanged posting half.
+    post_only = args.final_findings is not None or args.decisions is not None
+    if post_only:
+        if not (args.final_findings and args.decisions):
+            print("ERROR: --final-findings and --decisions must be given together",
+                  file=sys.stderr)
+            sys.exit(1)
+        with open(args.diff) as f:
+            diff = f.read()
+        try:
+            with open(args.final_findings) as f:
+                findings = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot load final findings: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(findings, list):
+            print("ERROR: final findings must be a JSON array", file=sys.stderr)
+            sys.exit(1)
+        try:
+            with open(args.decisions) as f:
+                decision_log = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot load decision log: {e}", file=sys.stderr)
+            sys.exit(1)
+        summary, conformance = synthesis_outputs(decision_log)
+        ticket_text, ticket_keys = load_ticket(args.ticket)
+        ticket_details = load_ticket_details(args.ticket)
+        print(f"Posting {len(findings)} chomp findings", file=sys.stderr)
+        if args.dry_run:
+            print(json.dumps({"summary": summary, "findings": findings,
+                              "conformance": conformance}, indent=2))
+            return
+        post_and_record(platform, args, summary, findings, diff, ticket_keys,
+                        conformance, ticket_details, api_url, project_id, gitlab_token)
+        return
+
+    if not (args.pr_agent and args.thermos_a and args.thermos_b):
+        print("ERROR: 1.x path requires --pr-agent, --thermos-a, and --thermos-b",
+              file=sys.stderr)
+        sys.exit(1)
 
     # Load inputs
     with open(args.pr_agent) as f:
@@ -852,44 +976,8 @@ def main():
                 print("No linked ticket found.", file=sys.stderr)
         return
 
-    try:
-        if platform == "github":
-            gh_api, gh_repo, gh_token = github_backend.gh_env()
-            recorded, failed = post_review_github(
-                gh_api, gh_repo, args.iid, gh_token, args.sha, summary, findings, diff,
-                tickets=ticket_keys, conformance=conformance,
-                ticket_details=ticket_details)
-        else:
-            recorded, failed = post_review_gitlab(
-                api_url, project_id, args.iid, gitlab_token, args.sha, summary, findings, diff,
-                tickets=ticket_keys, conformance=conformance,
-                ticket_details=ticket_details)
-    except DuplicateReviewPost as e:
-        # No-op, not a verify invocation: a concurrent run posted first.
-        # Verify routing is the workflow re-check's job; just record the
-        # suppression and exit 0 so the queued run stays green.
-        print(f"Duplicate consolidated review suppressed (existing id "
-              f"{e.existing_id}); this run posted nothing, a later run "
-              f"will verify.", file=sys.stderr)
-        write_recorded_json(args.iid, args.sha, platform, [], [], ticket_keys,
-                            conformance, duplicate_suppressed=True)
-        print("Recorded 0 discussions to forge-recorded.json", file=sys.stderr)
-        return
-
-    # Write recorded discussions for the verify job
-    write_recorded_json(args.iid, args.sha, platform, recorded, failed,
-                        ticket_keys, conformance)
-    print(f"Recorded {len(recorded)} discussions to forge-recorded.json", file=sys.stderr)
-    if failed:
-        print(f"ERROR: {len(failed)} findings could not be posted inline: {failed}", file=sys.stderr)
-
-    # Summary counts
-    counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
-    for f in findings:
-        sev = f.get("severity", "Low")
-        if sev in counts:
-            counts[sev] += 1
-    print(f"Posted consolidated review: {counts}", file=sys.stderr)
+    post_and_record(platform, args, summary, findings, diff, ticket_keys,
+                    conformance, ticket_details, api_url, project_id, gitlab_token)
 
 if __name__ == "__main__":
     main()
