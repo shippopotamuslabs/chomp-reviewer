@@ -6,7 +6,7 @@ an optional LINEAR_API_KEY secret (declared, and forwarded to the PR-Agent
 producer step only) plus pr_reviewer.check_pr_additional_content enabled via
 dynaconf env override. The producer stays silent and fail-soft.
 
-Verified against the pinned pr-agent 0.46.0 source (wheel inspect):
+Verified against the pinned pr-agent 0.49.0 source (wheel inspect):
 - The package contains no "linear" reference: LINEAR_API_KEY is not a key
   pr-agent reads; forwarding is future-proof and a no-op when absent.
 - check_pr_additional_content appears only in pr-agent's help docs; no .py
@@ -92,7 +92,7 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
         )
         # Still plain-diff mode, still pinned unmodified install, still soft exits.
         self.assertIn("--diff-file=../forge/mr.diff", text)
-        self.assertIn('"pr-agent==${{ inputs.pr_agent_version }}"', text)
+        self.assertIn('"pr-agent[github]==${{ inputs.pr_agent_version }}"', text)
         steps = _steps(_read(WORKFLOW))
         body = [b for n, b in steps if n.startswith("PR-Agent producer")][0]
         self.assertEqual(body.count("exit 0"), 2, "both fallback paths must stay fail-soft")

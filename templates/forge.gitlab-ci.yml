@@ -114,7 +114,7 @@ forge:review:
       # Install PR-Agent from PyPI (unmodified upstream), pinned for reproducibility.
       # Uses a venv to avoid --break-system-packages on the shared runner.
       python3 -m venv /tmp/pr-agent-venv
-      /tmp/pr-agent-venv/bin/pip install -q "pr-agent==0.46.0" || { echo "ERROR: pip install pr-agent failed."; exit 1; }
+      /tmp/pr-agent-venv/bin/pip install -q "pr-agent[gitlab]==0.49.0" || { echo "ERROR: pip install pr-agent failed."; exit 1; }
       # Run in plain-diff mode (silent producer, no GitLab posting).
       # PR-Agent uses dynaconf: OPENROUTER__KEY (double underscore) maps to [openrouter].key.
       # OPENROUTER_API_KEY alone is NOT picked up, causing fallback to GPT-5/dummy_token.
