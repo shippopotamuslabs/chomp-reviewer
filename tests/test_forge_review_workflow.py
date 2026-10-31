@@ -192,6 +192,18 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
         self.assertIn("forge/chomp-findings.json", upload)
         self.assertIn("forge/chomp-decisions.json", upload)
 
+    def test_marker_steps_pass_env_pr_number_to_both_lookups(self):
+        # Regression (v2.1.1): the dual-marker inline snippets once passed
+        # a bare `number` variable to the legacy-marker lookup; it only
+        # evaluated when no chomp-marker review existed, which is every
+        # fresh PR, so the marker check crashed with NameError.
+        steps = _steps(_read(WORKFLOW))
+        for name, body in steps:
+            if "consolidated review" in name and "Check" in name or "Re-check" in name:
+                self.assertNotIn(", number, token", body, name)
+                self.assertEqual(
+                    body.count('os.environ["PR_NUMBER"]'), 2, name)
+
     def test_marker_recheck_step_order_and_routing(self):
         # FRG-11: a marker re-check immediately before Master routes the
         # queued run to verify; producers keep gating on the first check.

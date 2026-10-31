@@ -224,7 +224,7 @@ jobs:
           found = gh.find_marker_comment(
               api, repo, os.environ["PR_NUMBER"], token,
               "chomp:consolidated-review") or gh.find_marker_comment(
-              api, repo, number, token, "forge:consolidated-review")
+              api, repo, os.environ["PR_NUMBER"], token, "forge:consolidated-review")
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write("exists=%s\n" % ("yes" if found else "no"))
           print("Existing consolidated review:", "yes" if found else "no")
@@ -380,7 +380,7 @@ jobs:
           found = gh.find_marker_comment(
               api, repo, os.environ["PR_NUMBER"], token,
               "chomp:consolidated-review") or gh.find_marker_comment(
-              api, repo, number, token, "forge:consolidated-review")
+              api, repo, os.environ["PR_NUMBER"], token, "forge:consolidated-review")
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write("exists=%s\n" % ("yes" if found else "no"))
           print("Existing consolidated review:", "yes" if found else "no")
