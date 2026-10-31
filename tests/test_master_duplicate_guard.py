@@ -63,9 +63,16 @@ class PostReviewGithubGuardTest(unittest.TestCase):
         orig_attempt = master.github_backend.post_review_comment_attempt
         calls = []
 
+        queried = []
+
         def fake_find(api_url, repo, number, token, marker):
-            self.assertEqual(marker, "forge:consolidated-review")
-            return {"id": 999}
+            # The only pre-existing review is a pre-rename one: it is
+            # found via the legacy marker, never the chomp marker. The
+            # guard must still suppress the duplicate (dual-read).
+            queried.append(marker)
+            if marker == "forge:consolidated-review":
+                return {"id": 999}
+            return None
 
         def fail_issue(*a, **k):
             calls.append("issue")
@@ -88,6 +95,10 @@ class PostReviewGithubGuardTest(unittest.TestCase):
             master.github_backend.post_issue_comment = orig_issue
             master.github_backend.post_review_comment_attempt = orig_attempt
         self.assertEqual(ctx.exception.existing_id, 999)
+        self.assertEqual(
+            queried,
+            ["chomp:consolidated-review", "forge:consolidated-review"],
+            "guard must query the chomp marker first, then the legacy one")
         self.assertEqual(calls, [])
 
     def test_marker_absent_posts_rollup_and_inline(self):
@@ -120,7 +131,7 @@ class PostReviewGithubGuardTest(unittest.TestCase):
             master.github_backend.post_issue_comment = orig_issue
             master.github_backend.post_review_comment_attempt = orig_attempt
         self.assertEqual(failed, [])
-        self.assertIn("forge:consolidated-review", posted["rollup"])
+        self.assertIn("chomp:consolidated-review", posted["rollup"])
         self.assertEqual(recorded[0]["id"], 777)
 
 
@@ -171,7 +182,7 @@ class PostReviewGitlabGuardTest(unittest.TestCase):
         finally:
             master.gitlab_request = orig
         self.assertEqual(len(posts), 1)
-        self.assertIn("forge:consolidated-review", posts[0]["body"])
+        self.assertIn("chomp:consolidated-review", posts[0]["body"])
         self.assertEqual(failed, [])
 
 

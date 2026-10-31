@@ -1,10 +1,10 @@
-name: Forge Review
+name: Chomp Review
 
-# Reusable workflow: one consolidated Forge review per pull request.
+# Reusable workflow: one consolidated Chomp review per pull request.
 #
 # Callers (on GitHub) add a small workflow to their repo:
 #
-#   name: Forge Review
+#   name: Chomp Review
 #   on:
 #     pull_request:
 #       types: [opened, synchronize, reopened]
@@ -12,37 +12,44 @@ name: Forge Review
 #     contents: read
 #     pull-requests: read
 #   jobs:
-#     forge-review:
-#       uses: shippopotamuslabs/forge-reviewer/.github/workflows/forge-review.yml@<tag>
+#     chomp-review:
+#       uses: shippopotamuslabs/chomp-reviewer/.github/workflows/chomp-review.yml@<tag>
 #       with:
-#         forge_app_id: <your Forge app ID>   # default: 5455197
+#         chomp_app_id: <your Chomp app ID>   # default: 5455197
 #       secrets:
 #         OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-#         FORGE_APP_PRIVATE_KEY: ${{ secrets.FORGE_APP_PRIVATE_KEY }}
+#         CHOMP_APP_PRIVATE_KEY: ${{ secrets.CHOMP_APP_PRIVATE_KEY }}
 #
 # Pass the two secrets explicitly, never `secrets: inherit` - inherit
 # hands this workflow every secret the caller repo holds.
 #
 # Required secrets in the CALLER repo:
-#   OPENROUTER_API_KEY:     Thermos lenses + master dedup + verify
-#                           (and the chomp transport when forge_agent
+#   OPENROUTER_API_KEY:     Powers the 1.x producers (PR-Agent, Thermos)
+#                           (and the chomp transport when chomp_agent
 #                           is on or shadow).
-#   FORGE_APP_PRIVATE_KEY:  Private key of the caller's Forge GitHub
-#                           App (input forge_app_id; the default is the
-#                           Shippopotamus Forge App, ID 5455197). The
+#   CHOMP_APP_PRIVATE_KEY:  Private key of the caller's Chomp GitHub
+#                           App (input chomp_app_id; the default is the
+#                           Shippopotamus Chomp App, ID 5455197). The
 #                           review posts as that app's [bot] identity
 #                           via an installation token minted here.
 #
-# Forge 2.0 (chomp) runs behind the `forge_agent` input (default
+# Rename compatibility: the pre-rename forge_* inputs (forge_ref,
+# forge_app_id, forge_agent) and the FORGE_APP_PRIVATE_KEY secret are
+# still accepted as legacy aliases; chomp_* values win when both are
+# set. Reviews posted before the rename carry the legacy
+# forge:consolidated-review marker and keep verifying - recognition
+# accepts both markers, new reviews write the chomp: marker.
+#
+# The Chomp engine (2.0) runs behind the `chomp_agent` input (default
 # "off": byte-for-byte 1.x behavior). "on" replaces the three 1.x
 # producer steps with one chomp invocation and posts its final
 # findings through the unchanged Python posting layer. "shadow" runs
 # chomp alongside the normal 1.x review and records its
 # findings/decision log as run artifacts without posting anything
-# from 2.0 — the field check FRG-30 compares against.
+# from 2.0 - the field check CHOMP-30 compares against.
 #
 # Optional secrets in the CALLER repo:
-#   LINEAR_API_KEY:         Forwarded to the PR-Agent producer step only,
+#   LINEAR_API_KEY:         Read by the (pinned, unmodified) PR-Agent
 #                           so ticket-aware PR-Agent features resolve Linear
 #                           tickets for consumers who provide one. Absence
 #                           changes nothing.
@@ -60,16 +67,28 @@ name: Forge Review
 on:
   workflow_call:
     inputs:
+      chomp_ref:
+        description: "chomp-reviewer ref (tag/SHA/branch) to take the scripts from (empty = forge_ref)"
+        type: string
+        default: ""
+      chomp_app_id:
+        description: "GitHub App ID for the Chomp review identity (empty = forge_app_id)"
+        type: string
+        default: ""
+      chomp_agent:
+        description: 'Chomp engine ("off": 1.x behavior; "on": chomp posts; "shadow": chomp runs, 1.x posts; empty = forge_agent)'
+        type: string
+        default: ""
       forge_ref:
-        description: "forge-reviewer ref (tag/SHA/branch) to take the .forge scripts from"
+        description: "Legacy alias of chomp_ref"
         type: string
         default: "main"
       forge_app_id:
-        description: "GitHub App ID for the Forge review identity"
+        description: "Legacy alias of chomp_app_id"
         type: string
         default: "5455197"
       model:
-        description: "OpenRouter model ID (empty = Forge default)"
+        description: "OpenRouter model ID (empty = Chomp default)"
         type: string
         default: ""
       pr_agent_version:
@@ -77,55 +96,73 @@ on:
         type: string
         default: "0.49.0"
       forge_agent:
-        description: 'Forge 2.0 agent ("off": 1.x behavior; "on": chomp posts; "shadow": chomp runs, 1.x posts)'
+        description: 'Legacy alias of chomp_agent'
         type: string
         default: "off"
     secrets:
       OPENROUTER_API_KEY:
         required: true
+      CHOMP_APP_PRIVATE_KEY:
+        required: false
       FORGE_APP_PRIVATE_KEY:
-        required: true
+        required: false
       LINEAR_API_KEY:
         required: false
 
 jobs:
   review:
-    name: forge-review
+    name: chomp-review
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # One run per caller-repo PR at a time: never cancel a review
     # mid-post, and queue every push so each still gets its verify pass
     # in FIFO order instead of the default single-pending replacement.
     concurrency:
-      group: forge-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+      group: chomp-review-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: false
       queue: max
     steps:
       - name: Check required secrets
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          FORGE_APP_PRIVATE_KEY: ${{ secrets.FORGE_APP_PRIVATE_KEY }}
+          APP_PRIVATE_KEY: ${{ secrets.CHOMP_APP_PRIVATE_KEY || secrets.FORGE_APP_PRIVATE_KEY }}
         run: |
           missing=""
           [ -z "$OPENROUTER_API_KEY" ] && missing="$missing OPENROUTER_API_KEY"
-          [ -z "$FORGE_APP_PRIVATE_KEY" ] && missing="$missing FORGE_APP_PRIVATE_KEY"
+          [ -z "$APP_PRIVATE_KEY" ] && missing="$missing CHOMP_APP_PRIVATE_KEY (or legacy FORGE_APP_PRIVATE_KEY)"
           if [ -n "$missing" ]; then
-            echo "::error::Missing required Forge secret(s) in the caller repo:$missing"
+            echo "::error::Missing required Chomp secret(s) in the caller repo:$missing"
             exit 1
           fi
-          echo "Required Forge secrets are present."
+          echo "Required Chomp secrets are present."
 
-      - name: Mint Forge app token
+      - name: Resolve Chomp inputs
+        id: cfg
+        env:
+          CHOMP_REF: ${{ inputs.chomp_ref }}
+          FORGE_REF: ${{ inputs.forge_ref }}
+          CHOMP_APP_ID: ${{ inputs.chomp_app_id }}
+          FORGE_APP_ID: ${{ inputs.forge_app_id }}
+          CHOMP_AGENT: ${{ inputs.chomp_agent }}
+          FORGE_AGENT: ${{ inputs.forge_agent }}
+        run: |
+          {
+            echo "ref=${CHOMP_REF:-$FORGE_REF}"
+            echo "app_id=${CHOMP_APP_ID:-$FORGE_APP_ID}"
+            echo "agent=${CHOMP_AGENT:-$FORGE_AGENT}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mint Chomp app token
         id: app-token
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ inputs.forge_app_id }}
-          private-key: ${{ secrets.FORGE_APP_PRIVATE_KEY }}
+          app-id: ${{ steps.cfg.outputs.app_id }}
+          private-key: ${{ secrets.CHOMP_APP_PRIVATE_KEY || secrets.FORGE_APP_PRIVATE_KEY }}
           # v1 scopes the token to the caller repo only unless told otherwise;
-          # the Forge scripts checkout needs forge-reviewer in scope too.
+          # the Chomp scripts checkout needs chomp-reviewer in scope too.
           repositories: |
             ${{ github.event.repository.name }}
-            forge-reviewer
+            chomp-reviewer
 
       - name: Check out the pull request head
         uses: actions/checkout@v4
@@ -133,11 +170,11 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           path: repo
 
-      - name: Check out Forge scripts
+      - name: Check out Chomp scripts
         uses: actions/checkout@v4
         with:
-          repository: shippopotamuslabs/forge-reviewer
-          ref: ${{ inputs.forge_ref }}
+          repository: shippopotamuslabs/chomp-reviewer
+          ref: ${{ steps.cfg.outputs.ref }}
           path: forge
           token: ${{ steps.app-token.outputs.token }}
 
@@ -186,7 +223,8 @@ jobs:
           api, repo, token = gh.gh_env()
           found = gh.find_marker_comment(
               api, repo, os.environ["PR_NUMBER"], token,
-              "forge:consolidated-review")
+              "chomp:consolidated-review") or gh.find_marker_comment(
+              api, repo, number, token, "forge:consolidated-review")
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write("exists=%s\n" % ("yes" if found else "no"))
           print("Existing consolidated review:", "yes" if found else "no")
@@ -197,7 +235,7 @@ jobs:
         # the entry file from the base branch via `git show` in repo/,
         # so the base ref must resolve there. Targeted depth-1 fetch
         # (D8): no full unshallow, no history beyond the base tip.
-        if: steps.marker.outputs.exists != 'yes' && inputs.forge_agent != 'off'
+        if: steps.marker.outputs.exists != 'yes' && steps.cfg.outputs.agent != 'off'
         working-directory: repo
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -209,20 +247,20 @@ jobs:
           }
 
       - name: Install Rust toolchain
-        if: steps.marker.outputs.exists != 'yes' && inputs.forge_agent != 'off'
+        if: steps.marker.outputs.exists != 'yes' && steps.cfg.outputs.agent != 'off'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Restore chomp build cache
         # Keyed on the agent workspace lockfile (which pins the agent_core
         # revision) plus the workspace sources: cold on a fresh pin, a
         # cache restore at steady state.
-        if: steps.marker.outputs.exists != 'yes' && inputs.forge_agent != 'off'
+        if: steps.marker.outputs.exists != 'yes' && steps.cfg.outputs.agent != 'off'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "forge/agent -> target"
 
       - name: Build chomp (release)
-        if: steps.marker.outputs.exists != 'yes' && inputs.forge_agent != 'off'
+        if: steps.marker.outputs.exists != 'yes' && steps.cfg.outputs.agent != 'off'
         working-directory: forge/agent
         run: cargo build --release
 
@@ -230,8 +268,8 @@ jobs:
         # An orchestration failure here fails the job visibly (proposal
         # principle 7) — except in shadow mode, where the 1.x review
         # below must post regardless of what 2.0 does.
-        if: steps.marker.outputs.exists != 'yes' && inputs.forge_agent != 'off'
-        continue-on-error: ${{ inputs.forge_agent == 'shadow' }}
+        if: steps.marker.outputs.exists != 'yes' && steps.cfg.outputs.agent != 'off'
+        continue-on-error: ${{ steps.cfg.outputs.agent == 'shadow' }}
         working-directory: forge
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -256,7 +294,7 @@ jobs:
             --out-pr-agent chomp-pr-agent.md
 
       - name: PR-Agent producer (silent, plain-diff)
-        if: steps.marker.outputs.exists != 'yes' && (inputs.forge_agent == 'off' || inputs.forge_agent == 'shadow')
+        if: steps.marker.outputs.exists != 'yes' && (steps.cfg.outputs.agent == 'off' || steps.cfg.outputs.agent == 'shadow')
         working-directory: repo
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -298,7 +336,7 @@ jobs:
           fi
 
       - name: Thermos correctness lens
-        if: steps.marker.outputs.exists != 'yes' && (inputs.forge_agent == 'off' || inputs.forge_agent == 'shadow')
+        if: steps.marker.outputs.exists != 'yes' && (steps.cfg.outputs.agent == 'off' || steps.cfg.outputs.agent == 'shadow')
         working-directory: forge
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -312,7 +350,7 @@ jobs:
           fi
 
       - name: Thermos structure lens
-        if: steps.marker.outputs.exists != 'yes' && (inputs.forge_agent == 'off' || inputs.forge_agent == 'shadow')
+        if: steps.marker.outputs.exists != 'yes' && (steps.cfg.outputs.agent == 'off' || steps.cfg.outputs.agent == 'shadow')
         working-directory: forge
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -341,7 +379,8 @@ jobs:
           api, repo, token = gh.gh_env()
           found = gh.find_marker_comment(
               api, repo, os.environ["PR_NUMBER"], token,
-              "forge:consolidated-review")
+              "chomp:consolidated-review") or gh.find_marker_comment(
+              api, repo, number, token, "forge:consolidated-review")
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write("exists=%s\n" % ("yes" if found else "no"))
           print("Existing consolidated review:", "yes" if found else "no")
@@ -361,7 +400,7 @@ jobs:
             echo "Consolidated review already exists; running verification."
             python3 .forge/verify.py --iid "$PR_NUMBER" --sha "$HEAD_SHA" \
               --diff mr.diff
-          elif [ "${{ inputs.forge_agent }}" = "on" ]; then
+          elif [ "${{ steps.cfg.outputs.agent }}" = "on" ]; then
             echo "Forge 2.0 path: posting chomp's final findings."
             python3 .forge/master.py --iid "$PR_NUMBER" --sha "$HEAD_SHA" \
               --final-findings chomp-findings.json \
@@ -377,11 +416,11 @@ jobs:
               --ticket ticket.md
           fi
 
-      - name: Upload Forge 2.0 shadow outputs
+      - name: Upload Chomp 2.0 shadow outputs
         # Shadow mode only: chomp's findings + decision log as run
         # artifacts. Nothing from 2.0 is posted; the 1.x review above
         # is the PR's review.
-        if: always() && inputs.forge_agent == 'shadow'
+        if: always() && steps.cfg.outputs.agent == 'shadow'
         uses: actions/upload-artifact@v4
         with:
           name: forge-agent-shadow
@@ -390,7 +429,7 @@ jobs:
             forge/chomp-decisions.json
           if-no-files-found: ignore
 
-      - name: Upload Forge run record
+      - name: Upload Chomp run record
         if: always()
         uses: actions/upload-artifact@v4
         with:

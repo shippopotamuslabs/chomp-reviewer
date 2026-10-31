@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Forge verify: on subsequent pushes, check if open Forge discussions are addressed.
+Chomp verify: on subsequent pushes, check if open Chomp discussions are addressed.
 
 For each open discussion recorded by forge:master, uses the LLM to determine
 if the new diff addresses the finding. If ADDRESSED, resolves the discussion.
@@ -76,7 +76,7 @@ def gitlab_request(method, url, token, data=None, form_data=None, fatal=True):
 
 
 def get_forge_discussions(api_url, project_id, iid, token):
-    """Fetch all discussions, filter to open Forge-recorded ones."""
+    """Fetch all discussions, filter to open Chomp-recorded ones."""
     discussions = gitlab_request(
         "GET",
         f"{api_url}/projects/{project_id}/merge_requests/{iid}/discussions?per_page=100",
@@ -103,7 +103,8 @@ def get_forge_discussions(api_url, project_id, iid, token):
             continue
         # Check for forge marker in the first note
         first_body = notes[0].get("body", "")
-        if "forge:consolidated-review" not in first_body:
+        if not any(m in first_body for m in
+                   ("chomp:consolidated-review", "forge:consolidated-review")):
             continue
         # Extract finding details from the note
         forge_open.append({
@@ -142,9 +143,9 @@ def build_verdict_reply(verdict, reason, sha):
     """
     short = (sha or "")[:8] or "unknown"
     if verdict == "ADDRESSED":
-        header = f"✅ Forge verification at `{short}`: **ADDRESSED**"
+        header = f"✅ Chomp verification at `{short}`: **ADDRESSED**"
     else:
-        header = f"⏳ Forge verification at `{short}`: **NOT_ADDRESSED** (still open)"
+        header = f"⏳ Chomp verification at `{short}`: **NOT_ADDRESSED** (still open)"
     reason = (reason or "").strip()
     if reason:
         return f"{header}\n\n{reason}"
@@ -441,7 +442,7 @@ def build_conformance_recheck_body(sha, results):
     listed. Never a merge gate.
     """
     short = (sha or "")[:8] or "unknown"
-    lines = [f"Forge conformance re-check at `{short}`", ""]
+    lines = [f"Chomp conformance re-check at `{short}`", ""]
     for r in results:
         reason = (r.get("reason") or "").strip()
         suffix = f" — {reason}" if reason else ""
@@ -625,10 +626,10 @@ def main():
             gh_api, gh_repo, args.iid, gh_token)
     else:
         discussions = get_forge_discussions(api_url, project_id, args.iid, gitlab_token)
-    print(f"Found {len(discussions)} open Forge discussions", file=sys.stderr)
+    print(f"Found {len(discussions)} open Chomp discussions", file=sys.stderr)
 
     if not discussions:
-        print("No open Forge discussions to verify.", file=sys.stderr)
+        print("No open Chomp discussions to verify.", file=sys.stderr)
 
     addressed = 0
     not_addressed = 0

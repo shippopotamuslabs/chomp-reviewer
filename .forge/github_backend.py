@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GitHub backend for Forge: REST + GraphQL helpers used by master.py and
+GitHub backend for Chomp: REST + GraphQL helpers used by master.py and
 verify.py when running under GitHub Actions.
 
 Selected by environment: FORGE_PLATFORM=github, or automatically when
@@ -35,7 +35,7 @@ def github_request(method, url, token, data=None, fatal=True, accept=None):
         "Authorization": f"Bearer {token}",
         "Accept": accept or "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "forge-reviewer",
+        "User-Agent": "chomp-reviewer",
     }
     body = None
     if data is not None:
@@ -198,7 +198,7 @@ def fetch_pull_diff(api_url, repo, number, token):
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github.diff",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "forge-reviewer",
+            "User-Agent": "chomp-reviewer",
         },
     )
     try:
@@ -234,7 +234,7 @@ def fetch_file_at_ref(api_url, repo, path, ref, token):
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github.raw+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "forge-reviewer",
+            "User-Agent": "chomp-reviewer",
         },
     )
     try:
@@ -278,7 +278,9 @@ def find_marker_comment(api_url, repo, number, token, marker):
     """Return the first conversation comment containing marker, or None.
 
     The GitHub equivalent of the GitLab review-once check over MR notes:
-    the rollup comment carries the forge:consolidated-review marker.
+    the rollup comment carries the consolidated-review marker
+    (chomp:consolidated-review, or the legacy forge:consolidated-review on
+    reviews posted before the rename).
     """
     for comment in list_issue_comments(api_url, repo, number, token):
         if marker in (comment.get("body") or ""):
@@ -373,10 +375,11 @@ mutation($threadId: ID!) {
 
 
 def get_forge_review_threads(api_url, repo, number, token):
-    """Collect open Forge review threads for verify.
+    """Collect open Chomp review threads for verify.
 
     Mirrors verify.py's get_forge_discussions selection: threads whose
-    first comment carries the forge:consolidated-review marker and that
+    first comment carries a consolidated-review marker (chomp:, or the
+    legacy forge: marker from before the rename) and that
     are not resolved. Returns dicts {"id", "comment_id", "body",
     "comments"} where id is the GraphQL thread node ID (needed for
     resolution) and comment_id is the REST database ID of the first
@@ -404,7 +407,8 @@ def get_forge_review_threads(api_url, repo, number, token):
         if not comments:
             continue
         first_body = comments[0].get("body") or ""
-        if "forge:consolidated-review" not in first_body:
+        if not any(m in first_body for m in
+                   ("chomp:consolidated-review", "forge:consolidated-review")):
             continue
         forge_open.append({
             "id": thread["id"],

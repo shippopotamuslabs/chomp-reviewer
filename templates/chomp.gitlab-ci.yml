@@ -1,4 +1,4 @@
-# Forge CI-native consolidated code reviewer (reusable template).
+# Chomp CI-native consolidated code reviewer (reusable template).
 #
 # Usage in your .gitlab-ci.yml:
 #
@@ -29,7 +29,7 @@ variables:
   FORGE_PROJECT_ID: "86730853"
 
 # ---------------------------------------------------------------------------
-# Internal: download the .forge/ scripts from the forge-reviewer repo.
+# Internal: download the .forge/ scripts from the chomp-reviewer repo.
 # This makes the template versioned: pin FORGE_REF to a tag.
 # ---------------------------------------------------------------------------
 .forge-setup:
@@ -37,14 +37,14 @@ variables:
     - |
       set -o pipefail
       if [ "${FORGE_ENABLED}" != "true" ]; then
-        echo "Forge disabled: set FORGE_ENABLED=true to enable."
+        echo "Chomp disabled: set FORGE_ENABLED=true to enable."
         exit 0
       fi
       if [ -z "${PR_AGENT_GITLAB_TOKEN:-}" ]; then
         echo "ERROR: PR_AGENT_GITLAB_TOKEN not set."
         exit 1
       fi
-      echo "Downloading Forge scripts (ref ${FORGE_REF})..."
+      echo "Downloading Chomp scripts (ref ${FORGE_REF})..."
       mkdir -p .forge/prompts
       FORGE_API="https://gitlab.com/api/v4/projects/${FORGE_PROJECT_ID}"
       for f in fetch_diff.py thermos.py master.py verify.py openrouter_client.py; do
@@ -57,12 +57,12 @@ variables:
           "${FORGE_API}/repository/files/.forge%2Fprompts%2F${f}/raw?ref=${FORGE_REF}" \
           -o .forge/prompts/${f} || { echo "ERROR: failed to download ${f}"; exit 1; }
       done
-      echo "Forge scripts ready."
+      echo "Chomp scripts ready."
 
 # ---------------------------------------------------------------------------
-# forge:diff — fetches the MR diff once, shares via artifacts.
+# chomp:diff — fetches the MR diff once, shares via artifacts.
 # ---------------------------------------------------------------------------
-forge:diff:
+chomp:diff:
   stage: lint
   tags: [home-server]
   allow_failure: false
@@ -83,16 +83,16 @@ forge:diff:
     when: always
 
 # ---------------------------------------------------------------------------
-# forge:review — PR-Agent as a silent producer (plain-diff mode).
+# chomp:review — PR-Agent as a silent producer (plain-diff mode).
 # ---------------------------------------------------------------------------
-forge:review:
+chomp:review:
   stage: lint
   tags: [home-server]
   allow_failure: true
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
   needs:
-    - job: forge:diff
+    - job: chomp:diff
       artifacts: true
   script:
     - !reference [.forge-setup, script]
@@ -100,7 +100,7 @@ forge:review:
       set -o pipefail
       if [ "${FORGE_ENABLED}" != "true" ]; then exit 0; fi
       if [ -z "${PR_AGENT_GITLAB_TOKEN:-}" ]; then
-        echo "Forge review skipped: PR_AGENT_GITLAB_TOKEN not set."
+        echo "Chomp review skipped: PR_AGENT_GITLAB_TOKEN not set."
         exit 0
       fi
       if [ ! -s mr.diff ]; then
@@ -134,7 +134,7 @@ forge:review:
     when: always
 
 # ---------------------------------------------------------------------------
-# Forge thermos lenses (parallel producers).
+# Chomp thermos lenses (parallel producers).
 # ---------------------------------------------------------------------------
 .forge-thermos-base:
   stage: lint
@@ -143,10 +143,10 @@ forge:review:
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
   needs:
-    - job: forge:diff
+    - job: chomp:diff
       artifacts: true
 
-forge:thermos-correctness:
+chomp:thermos-correctness:
   extends: .forge-thermos-base
   script:
     - !reference [.forge-setup, script]
@@ -154,7 +154,7 @@ forge:thermos-correctness:
       set -o pipefail
       if [ "${FORGE_ENABLED}" != "true" ]; then exit 0; fi
       if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-        echo "Forge thermos skipped: OPENROUTER_API_KEY not set."
+        echo "Chomp thermos skipped: OPENROUTER_API_KEY not set."
         exit 0
       fi
       if [ ! -s mr.diff ]; then
@@ -168,7 +168,7 @@ forge:thermos-correctness:
     expire_in: 1 week
     when: always
 
-forge:thermos-structure:
+chomp:thermos-structure:
   extends: .forge-thermos-base
   script:
     - !reference [.forge-setup, script]
@@ -176,7 +176,7 @@ forge:thermos-structure:
       set -o pipefail
       if [ "${FORGE_ENABLED}" != "true" ]; then exit 0; fi
       if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-        echo "Forge thermos skipped: OPENROUTER_API_KEY not set."
+        echo "Chomp thermos skipped: OPENROUTER_API_KEY not set."
         exit 0
       fi
       if [ ! -s mr.diff ]; then
@@ -191,23 +191,23 @@ forge:thermos-structure:
     when: always
 
 # ---------------------------------------------------------------------------
-# forge:master — dedups all three sources, posts ONE consolidated review.
+# chomp:master — dedups all three sources, posts ONE consolidated review.
 # This is the only job that posts to GitLab.
 # ---------------------------------------------------------------------------
-forge:master:
+chomp:master:
   stage: lint
   tags: [home-server]
   allow_failure: true
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
   needs:
-    - job: forge:diff
+    - job: chomp:diff
       artifacts: true
-    - job: forge:review
+    - job: chomp:review
       artifacts: true
-    - job: forge:thermos-correctness
+    - job: chomp:thermos-correctness
       artifacts: true
-    - job: forge:thermos-structure
+    - job: chomp:thermos-structure
       artifacts: true
   script:
     - !reference [.forge-setup, script]
@@ -215,11 +215,11 @@ forge:master:
       set -o pipefail
       if [ "${FORGE_ENABLED}" != "true" ]; then exit 0; fi
       if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-        echo "Forge master skipped: OPENROUTER_API_KEY not set."
+        echo "Chomp master skipped: OPENROUTER_API_KEY not set."
         exit 0
       fi
       if [ -z "${PR_AGENT_GITLAB_TOKEN:-}" ]; then
-        echo "Forge master skipped: PR_AGENT_GITLAB_TOKEN not set."
+        echo "Chomp master skipped: PR_AGENT_GITLAB_TOKEN not set."
         exit 0
       fi
       # Review-once guard: check if a consolidated review already exists.
@@ -232,7 +232,7 @@ forge:master:
       req = urllib.request.Request(url, headers={"PRIVATE-TOKEN": token})
       try:
           notes = json.load(urllib.request.urlopen(req))
-          found = any("forge:consolidated-review" in (n.get("body") or "") for n in notes)
+          found = any(any(m in (n.get("body") or "") for m in ("chomp:consolidated-review", "forge:consolidated-review")) for n in notes)
           print("yes" if found else "no")
       except Exception as e:
           print(f"ERROR checking for existing review: {e}", file=sys.stderr)

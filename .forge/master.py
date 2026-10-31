@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Forge master reviewer: dedups findings via LLM, posts ONE consolidated review.
+Chomp master reviewer: dedups findings via LLM, posts ONE consolidated review.
 
 Usage:
     python3 .forge/master.py --iid 133 --sha <sha> \
@@ -32,7 +32,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from openrouter_client import get_model, call_openrouter
 import github_backend
 
-CONSOLIDATED_MARKER = "forge:consolidated-review"
+CONSOLIDATED_MARKER = "chomp:consolidated-review"
+# Reviews posted before the Chomp rename carry the legacy marker. Anything
+# that RECOGNIZES an existing review (duplicate suppression, verify) must
+# accept both; anything that WRITES a review uses CONSOLIDATED_MARKER.
+LEGACY_CONSOLIDATED_MARKER = "forge:consolidated-review"
+CONSOLIDATED_MARKERS = (CONSOLIDATED_MARKER, LEGACY_CONSOLIDATED_MARKER)
 
 
 class DuplicateReviewPost(Exception):
@@ -462,8 +467,12 @@ def post_review_gitlab(api_url, project_id, iid, token, sha, summary, findings, 
     rollup_body = build_rollup(sha, summary, findings, project_path,
                                tickets=tickets, conformance=conformance,
                                ticket_details=ticket_details)
-    existing = find_marker_note_gitlab(
-        api_url, project_id, iid, token, CONSOLIDATED_MARKER)
+    existing = None
+    for marker in CONSOLIDATED_MARKERS:
+        existing = find_marker_note_gitlab(
+            api_url, project_id, iid, token, marker)
+        if existing is not None:
+            break
     if existing is not None:
         raise DuplicateReviewPost(existing.get("id"))
     print("Posting rollup...", file=sys.stderr)
@@ -489,8 +498,12 @@ def post_review_github(api_url, repo, number, token, sha, summary, findings, dif
                                blob_base=f"https://github.com/{repo}/blob",
                                tickets=tickets, conformance=conformance,
                                ticket_details=ticket_details)
-    existing = github_backend.find_marker_comment(
-        api_url, repo, number, token, CONSOLIDATED_MARKER)
+    existing = None
+    for marker in CONSOLIDATED_MARKERS:
+        existing = github_backend.find_marker_comment(
+            api_url, repo, number, token, marker)
+        if existing is not None:
+            break
     if existing is not None:
         raise DuplicateReviewPost(existing.get("id"))
     print("Posting rollup...", file=sys.stderr)
@@ -662,7 +675,7 @@ def build_rollup(sha, summary, findings, project_path, blob_base=None,
             counts[sev] += 1
 
     lines = [
-        f"<!-- forge:consolidated-review sha:{sha} -->",
+        f"<!-- {CONSOLIDATED_MARKER} sha:{sha} -->",
         "## PR Reviewer Guide 🔍",
         "",
         summary,
@@ -743,11 +756,11 @@ def build_inline(sha, finding, meta=None):
     if meta and meta.get("relocated"):
         req = meta.get("requested", {})
         anchor_note = (
-            f"\n<!-- forge:anchor originally flagged "
+            f"\n<!-- chomp:anchor originally flagged "
             f"{req.get('file')}[L{req.get('line_start')}-{req.get('line_end')}] "
             f"— anchored to nearest valid diff line -->"
         )
-    return f"""<!-- forge:consolidated-review sha:{sha} -->{anchor_note}
+    return f"""<!-- {CONSOLIDATED_MARKER} sha:{sha} -->{anchor_note}
 {badge} — {title} <code>{cat}</code>
 
 {finding.get('description', '')}

@@ -190,7 +190,7 @@ def fetch_linear(key, api_key, opener=None):
             {"query": LINEAR_ISSUE_QUERY, "variables": {"q": key}},
             {"Authorization": api_key,
              "Content-Type": "application/json",
-             "User-Agent": "forge-reviewer"},
+             "User-Agent": "chomp-reviewer"},
             opener=opener)
         nodes = ((data or {}).get("data", {}) or {}).get(
             "issueSearch", {}) or {}
@@ -245,7 +245,7 @@ def fetch_github(ref, repo, token, api_url, opener=None):
             {"Authorization": "Bearer %s" % token,
              "Accept": "application/vnd.github+json",
              "X-GitHub-Api-Version": "2022-11-28",
-             "User-Agent": "forge-reviewer"},
+             "User-Agent": "chomp-reviewer"},
             opener=opener)
         labels = [(l.get("name", "") or "") for l in
                   (data.get("labels", []) or [])]
@@ -273,7 +273,7 @@ def fetch_pr_commits(api_url, repo, number, token, opener=None):
             {"Authorization": "Bearer %s" % token,
              "Accept": "application/vnd.github+json",
              "X-GitHub-Api-Version": "2022-11-28",
-             "User-Agent": "forge-reviewer"},
+             "User-Agent": "chomp-reviewer"},
             opener=opener)
         out = []
         for item in data or []:
