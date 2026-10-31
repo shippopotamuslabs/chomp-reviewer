@@ -191,7 +191,7 @@ class VerifyConformanceRecheckTest(unittest.TestCase):
         # Exactly ONE summary post for both criteria.
         self.assertEqual(len(self.posted), 1)
         body = self.posted[0]["body"]
-        self.assertIn("Forge conformance re-check at `newsha90`", body)
+        self.assertIn("Chomp conformance re-check at `newsha90`", body)
         self.assertIn("RESOLVED [not evident]", body)
         self.assertIn("STILL OPEN [contradicted]", body)
         # The already-addressed criterion is not re-evaluated.
@@ -303,7 +303,7 @@ class VerifyConformanceRecheckTest(unittest.TestCase):
                 **_recheck_kwargs(platform="github"))
         self.assertFalse(failed)
         self.assertEqual(len(posted), 1)
-        self.assertIn("Forge conformance re-check", posted[0]["body"])
+        self.assertIn("Chomp conformance re-check", posted[0]["body"])
 
 
 if __name__ == "__main__":

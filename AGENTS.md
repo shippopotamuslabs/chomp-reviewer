@@ -1,4 +1,4 @@
-# AGENTS.md — forge-reviewer contributor notes
+# AGENTS.md — chomp-reviewer contributor notes
 
 ## Gospels
 
@@ -50,11 +50,11 @@ submodule's contents from this repo.
 - `.forge/` scripts are stdlib-only (`urllib`, no third-party imports) so
   they run on a bare runner. Keep it that way.
 - Do not bump the `FORGE_REF` default (`v1.0.0`) in
-  `templates/forge.gitlab-ci.yml` per release — consumers pin `ref:` and
+  `templates/chomp.gitlab-ci.yml` per release — consumers pin `ref:` and
   `FORGE_REF` themselves (see README "Upgrading").
 - Compiled bytecode is untracked and gitignored (`__pycache__/`). Never
   commit `.pyc` files.
-- `forge:master` must never silently drop a finding: unpostable items log
+- `chomp:master` must never silently drop a finding: unpostable items log
   ERROR (not WARNING) and are recorded in `forge-recorded.json`.
 - Keep `verify.py` compatible with any `forge-recorded.json` shape changes
   (it re-fetches discussions via API; the JSON file is write-only context).
@@ -62,7 +62,7 @@ submodule's contents from this repo.
 ## PR titles and commit messages
 
 PR titles follow Conventional Commits, because squash merging makes the
-PR title the commit subject on main - and Forge's ticket cascade reads
+PR title the commit subject on main - and Chomp's ticket cascade reads
 titles when linking a PR to its ticket.
 
 Format:
@@ -83,8 +83,8 @@ Format:
 
 Examples:
 
-    feat(tickets): add linked-ticket extraction cascade (FRG-6)
-    docs(setup): document bring-your-own GitHub App (FRG-2)
+    feat(tickets): add linked-ticket extraction cascade (CHOMP-6)
+    docs(setup): document bring-your-own GitHub App (CHOMP-2)
 
 A CI check (pr-title) enforces the shape on every PR. Individual
 commit messages on a branch are NOT linted - write them for the

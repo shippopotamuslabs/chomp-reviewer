@@ -35,7 +35,7 @@ def call_openrouter(api_key, model, prompt, max_tokens=16000):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
             "HTTP-Referer": "https://gitlab.com/browntown.development-group/stratum",
-            "X-Title": "Forge Code Reviewer",
+            "X-Title": "Chomp Code Reviewer",
         },
     )
     try:

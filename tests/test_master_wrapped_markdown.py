@@ -99,8 +99,8 @@ class DescriptionQuotingTest(unittest.TestCase):
 class MarkerTest(unittest.TestCase):
     def test_marker_present_in_both_outputs(self):
         finding = _finding()
-        self.assertIn("forge:consolidated-review", _rollup(finding))
-        self.assertIn("forge:consolidated-review",
+        self.assertIn("chomp:consolidated-review", _rollup(finding))
+        self.assertIn("chomp:consolidated-review",
                       master.build_inline("abc", finding))
 
 

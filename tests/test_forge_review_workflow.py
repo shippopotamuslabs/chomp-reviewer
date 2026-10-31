@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Regression tests for the FRG-5 wiring in .github/workflows/forge-review.yml.
+"""Regression tests for the FRG-5 wiring in .github/workflows/chomp-review.yml
+(renamed from forge-review.yml in the Chomp rename, CHOMP-56).
 
 FRG-5 wires PR-Agent's ticket context into the Forge GitHub workflow:
 an optional LINEAR_API_KEY secret (declared, and forwarded to the PR-Agent
@@ -28,7 +29,7 @@ import re
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WORKFLOW = os.path.join(HERE, "..", ".github", "workflows", "forge-review.yml")
+WORKFLOW = os.path.join(HERE, "..", ".github", "workflows", "chomp-review.yml")
 README = os.path.join(HERE, "..", "README.md")
 
 
@@ -113,7 +114,7 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
         job_head = m.group(1)
         conc = re.search(
             r"(?m)^    concurrency:\n"
-            r"^      group: forge-review-\$\{\{ github\.repository \}\}"
+            r"^      group: chomp-review-\$\{\{ github\.repository \}\}"
             r"-\$\{\{ github\.event\.pull_request\.number \}\}\n"
             r"^      cancel-in-progress: false\n"
             r"^      queue: max\n",
@@ -122,13 +123,26 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
         self.assertIsNotNone(
             conc, "jobs.review must carry the per-PR concurrency block")
 
-    def test_forge_agent_flag_defaults_off(self):
-        """The 2.0 flag is opt-in: default "off" pins byte-for-byte 1.x behavior."""
+    def test_chomp_agent_flag_defaults_off(self):
+        """The 2.0 flag is opt-in: the effective default is "off", which
+        pins byte-for-byte 1.x behavior. Post-rename the primary input
+        is chomp_agent (default "" = unset); the resolver falls back to
+        forge_agent (default "off") when chomp_agent is unset, and a
+        chomp_agent value always wins when set."""
         text = _read(WORKFLOW)
-        _, _, tail = text.partition("forge_agent:")
-        block, _, _ = tail.partition("\njobs:")
+        _, _, tail = text.partition("\n      chomp_agent:")
+        block, _, _ = tail.partition("\n      forge_ref:")
+        self.assertIn("type: string", block)
+        self.assertIn('default: ""', block)
+        _, _, tail = text.partition("\n      forge_agent:")
+        block, _, _ = tail.partition("\n    secrets:")
         self.assertIn("type: string", block)
         self.assertIn('default: "off"', block)
+        steps = dict(_steps(text))
+        resolver = steps["Resolve Chomp inputs"]
+        self.assertIn('agent=${CHOMP_AGENT:-$FORGE_AGENT}', resolver)
+        self.assertIn('ref=${CHOMP_REF:-$FORGE_REF}', resolver)
+        self.assertIn('app_id=${CHOMP_APP_ID:-$FORGE_APP_ID}', resolver)
 
     def test_two_dot_zero_steps_run_only_behind_the_flag(self):
         """Fetch, toolchain, cache, build, and chomp steps are all
@@ -145,17 +159,17 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
             body = steps[name]
             self.assertIn(
                 "steps.marker.outputs.exists != 'yes'", body, name)
-            self.assertIn("inputs.forge_agent != 'off'", body, name)
+            self.assertIn("steps.cfg.outputs.agent != 'off'", body, name)
         for name in (
             "PR-Agent producer (silent, plain-diff)",
             "Thermos correctness lens",
             "Thermos structure lens",
         ):
             body = steps[name]
-            self.assertIn("inputs.forge_agent == 'off'", body, name)
-            self.assertIn("inputs.forge_agent == 'shadow'", body, name)
+            self.assertIn("steps.cfg.outputs.agent == 'off'", body, name)
+            self.assertIn("steps.cfg.outputs.agent == 'shadow'", body, name)
         chomp = steps["Chomp review (2.0 producers + synthesis)"]
-        self.assertIn("continue-on-error: ${{ inputs.forge_agent == 'shadow' }}", chomp)
+        self.assertIn("continue-on-error: ${{ steps.cfg.outputs.agent == 'shadow' }}", chomp)
 
     def test_master_posts_chomp_outputs_when_flag_on(self):
         """The Master step keeps its name and re-check routing, and
@@ -165,7 +179,7 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
         idx_recheck = names.index("Re-check for an existing consolidated review")
         self.assertTrue(names[idx_recheck + 1].startswith("Master"))
         master_body = steps[names[idx_recheck + 1]]
-        self.assertIn("${{ inputs.forge_agent }}", master_body)
+        self.assertIn("${{ steps.cfg.outputs.agent }}", master_body)
         self.assertIn("--final-findings chomp-findings.json", master_body)
         self.assertIn("--decisions chomp-decisions.json", master_body)
 
@@ -173,8 +187,8 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
         """Shadow mode uploads chomp's outputs as artifacts on every
         outcome; nothing else references the chomp files."""
         steps = dict(_steps(_read(WORKFLOW)))
-        upload = steps["Upload Forge 2.0 shadow outputs"]
-        self.assertIn("if: always() && inputs.forge_agent == 'shadow'", upload)
+        upload = steps["Upload Chomp 2.0 shadow outputs"]
+        self.assertIn("if: always() && steps.cfg.outputs.agent == 'shadow'", upload)
         self.assertIn("forge/chomp-findings.json", upload)
         self.assertIn("forge/chomp-decisions.json", upload)
 
@@ -197,7 +211,9 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
         recheck_id = [b for n, b in steps
                       if n == "Re-check for an existing consolidated review"][0]
         self.assertIn("id: marker_recheck", recheck_id)
-        self.assertIn("forge:consolidated-review", recheck_id)
+        self.assertIn("chomp:consolidated-review", recheck_id)
+        self.assertIn("forge:consolidated-review", recheck_id,
+                      "re-check must also recognize pre-rename reviews")
         self.assertIn("GITHUB_OUTPUT", recheck_id)
         self.assertIn('"exists=%s', recheck_id)
         self.assertIn('"yes" if found else "no"', recheck_id)

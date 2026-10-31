@@ -172,7 +172,7 @@ class BuildInlineAnchorNoteTest(unittest.TestCase):
             "sha", finding,
             {"relocated": True,
              "requested": {"file": "src/app.py", "line_start": 30, "line_end": 30}})
-        self.assertIn("forge:consolidated-review", body)
+        self.assertIn("chomp:consolidated-review", body)
         self.assertIn("src/app.py[L30-30]", body)
 
     def test_exact_hit_has_no_anchor_note(self):
@@ -182,8 +182,8 @@ class BuildInlineAnchorNoteTest(unittest.TestCase):
             "sha", finding,
             {"relocated": False,
              "requested": {"file": "src/app.py", "line_start": 11, "line_end": 11}})
-        self.assertIn("forge:consolidated-review", body)
-        self.assertNotIn("forge:anchor", body)
+        self.assertIn("chomp:consolidated-review", body)
+        self.assertNotIn("chomp:anchor", body)
 
 
 if __name__ == "__main__":
