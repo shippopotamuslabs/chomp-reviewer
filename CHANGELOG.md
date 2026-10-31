@@ -1,6 +1,16 @@
 # Changelog
 
-## v2.1.0 (unreleased)
+## v2.1.1 (2026-10-30)
+
+Fix: the reusable workflow's two inline marker-check steps passed an
+undefined `number` variable to the legacy-marker lookup. Python's `or`
+short-circuit hid it whenever a chomp-marker review already existed;
+on every fresh PR the lookup evaluated and the step crashed with
+NameError, failing the review job before any producer ran. Both steps
+now pass the PR number from the environment to both lookups, with a
+regression test pinning the snippet shape.
+
+## v2.1.0 (2026-10-30)
 
 - Rename: Forge Reviewer is now **Chomp Reviewer**. The GitHub App, this repo (`shippopotamuslabs/chomp-reviewer`), and the Linear team (CHOMP) were renamed first; this release renames everything the code controls.
   - Posted text: verification verdicts and conformance re-checks post as Chomp; the OpenRouter `X-Title` and the HTTP `User-Agent` follow.
