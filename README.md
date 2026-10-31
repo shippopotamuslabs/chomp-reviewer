@@ -134,19 +134,19 @@ The 2.0 engine changes nothing in the list above: same app, same permissions, sa
 
 ## Linked tickets & conformance
 
-Forge links PRs to Linear tickets and GitHub issues deterministically - no LLM involved. The ticket step extracts refs with a strict cascade: head branch name, then PR title, then PR body, then commit messages. The first source that yields a match wins per provider; multiple distinct tickets in that source are all checked. No match is normal: the review proceeds and the rollup notes no linked ticket.
+Chomp links PRs to Linear tickets and GitHub issues deterministically - no LLM involved. The ticket step extracts refs with a strict cascade: head branch name, then PR title, then PR body, then commit messages. The first source that yields a match wins per provider; multiple distinct tickets in that source are all checked. No match is normal: the review proceeds and the rollup notes no linked ticket.
 
 | Pattern | Example |
 |---------|---------|
 | Linear key in branch | `feature/FRG-5-login`, `FRG-5-slug`, `hotfix/FRG-5/...`, or Linear's canonical `gitBranchName` (e.g. `sean/frg-5-...`) |
-| Linear key in title/body/commits | `FRG-5`, `Closes FRG-5`, `Fixes FRG-5` |
+| Linear key in title/body/commits | `CHOMP-5`, `Closes CHOMP-5`, `Fixes CHOMP-5` |
 | GitHub issue | `#123`, `owner/repo#123` |
 
-To get linking: name the branch or PR after the ticket key, or reference it in the title, body, or commits. For Linear ticket fetching, set the optional `LINEAR_API_KEY` secret; GitHub issues need no new secret (Forge app token).
+To get linking: name the branch or PR after the ticket key, or reference it in the title, body, or commits. For Linear ticket fetching, set the optional `LINEAR_API_KEY` secret; GitHub issues need no new secret (Chomp app token).
 
 The ticket step writes `ticket.md` / `ticket.json` beside `mr.diff` and passes them to PR-Agent, both Thermos lenses, and master as delimited untrusted quoted context - ticket text is data, never instructions. The master rollup gains a `## Ticket conformance` section: resolved tickets with links, per-criterion addressed / not evident / contradicted verdicts with file/line evidence, a neutral unrelated-changes list, and one overall line (`conforms`, `partially conforms`, `does not conform`, or `no linked ticket`). On re-push, verify re-evaluates open criteria and posts a summary re-check comment. Advisory only, never a merge gate. Sparse tickets produce sparse verdicts.
 
-## Forge 2.0: configuration reference
+## The Chomp engine: configuration reference
 
 Every adopter-visible setting on the 2.0 path, defaults verified against the shipped `chomp` (`agent/src/contract.rs`) and the reusable workflow. The workflow inputs are the whole consumer surface in v1: `chomp` also reads an optional `--config` file for the remaining knobs, but the workflow does not pass one yet, so those run at their compiled-in defaults.
 
@@ -165,9 +165,9 @@ Every adopter-visible setting on the 2.0 path, defaults verified against the shi
 | `synthesis_timeout_secs` | `600` | compiled default | Wall-clock budget for the synthesizer session. |
 | `pr_agent_followups` | `2` | compiled default | How many times the synthesizer may re-run PR-Agent with focused follow-up guidance. `0` disables the tool. |
 
-Deliberately not knobs: Forge always runs the full fan-out (every lens, every review), the workflow ceiling stays 45 minutes, and the per-stage budgets above sit under it with room for the `chomp` build. Tuning of these defaults against shadow measurements is pending — the values above are the as-shipped ones, not tuned recommendations.
+Deliberately not knobs: Chomp always runs the full fan-out (every lens, every review), the workflow ceiling stays 45 minutes, and the per-stage budgets above sit under it with room for the `chomp` build. Tuning of these defaults against shadow measurements is pending — the values above are the as-shipped ones, not tuned recommendations.
 
-## Writing a contract Forge can use
+## Writing a contract Chomp can use
 
 The 2.0 contract lens reads the consumer repo's agent file the way a new team member would: entry file first (`AGENTS.md` by default), routing table when the file is long, then the linked contract documents. What makes a repo review well:
 
@@ -176,7 +176,7 @@ The 2.0 contract lens reads the consumer repo's agent file the way a new team me
 - **The base branch governs.** The lens always reads the contract documents at the PR's base revision, never at the PR head — a PR cannot smuggle in a weakened contract and then comply with it. Keep `main`'s contract documents authoritative and review changes to them as carefully as code.
 - **Absent is degraded, not fatal.** A repo with no agent file still gets reviewed: the lens says so in its output and the review leans on the diff, the code, and the generic lenses. Adding even a short agent file with pointers gives the contract lens something checkable to work with.
 
-The PR-Agent producer step also sets `PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT=true` (the dynaconf env override for `pr_reviewer.check_pr_additional_content`), intended to flag changes unrelated to the stated intent. Note: in the pinned pr-agent 0.49.0 plain-diff mode that flag and the forwarded `LINEAR_API_KEY` are not consumed upstream; Forge's own ticket artifact and conformance section provide the ticket awareness today.
+The PR-Agent producer step also sets `PR_REVIEWER__CHECK_PR_ADDITIONAL_CONTENT=true` (the dynaconf env override for `pr_reviewer.check_pr_additional_content`), intended to flag changes unrelated to the stated intent. Note: in the pinned pr-agent 0.49.0 plain-diff mode that flag and the forwarded `LINEAR_API_KEY` are not consumed upstream; Chomp's own ticket artifact and conformance section provide the ticket awareness today.
 
 ## Run the pieces yourself
 
@@ -210,7 +210,7 @@ OPENROUTER_API_KEY=<key> python3 .forge/master.py --iid <pr_number> --sha <head_
   --diff mr.diff --dry-run
 ```
 
-The full flow runs in GitHub Actions. Master and verify read pull request state, post comments, and resolve threads through the GitHub API and GraphQL, using the repository, pull request number, and head SHA from the workflow environment plus the Forge app token the workflow mints. Verify has a `--dry-run` flag that reports verdicts without resolving, and it still needs a real pull request and token to read threads from.
+The full flow runs in GitHub Actions. Master and verify read pull request state, post comments, and resolve threads through the GitHub API and GraphQL, using the repository, pull request number, and head SHA from the workflow environment plus the Chomp app token the workflow mints. Verify has a `--dry-run` flag that reports verdicts without resolving, and it still needs a real pull request and token to read threads from.
 
 ## Repository layout
 
@@ -231,15 +231,15 @@ The full flow runs in GitHub Actions. Master and verify read pull request state,
 
 ## Status
 
-Forge runs on GitHub. This repo lives in the `shippopotamuslabs` org, and a GitHub App named Shippopotamus Forge holds the review identity there: pull request and check permissions, with contents read-only. The reusable workflow ships from this repo, and consuming repos pin a release tag. Stratum is the first consumer: a proof pull request with deliberate defects caught every planted defect class before the port landed. The v1.1.0 tag lands on the port's merge commit.
+Chomp runs on GitHub. This repo lives in the `shippopotamuslabs` org, and a GitHub App named Shippopotamus Chomp holds the review identity there: pull request and check permissions, with contents read-only. The reusable workflow ships from this repo, and consuming repos pin a release tag. Stratum is the first consumer: a proof pull request with deliberate defects caught every planted defect class before the port landed. The v1.1.0 tag lands on the port's merge commit.
 
-Forge came out of the Stratum project's CI in September 2026 and has reviewed its changes since v1.0.0. The 1.x release line stands at v1.1.8. The 2.0 agent path is merged on `main` behind the `forge_agent` flag (default `off`) and is described in `CHANGELOG.md` under `v2.0.0`; the tag and release follow once the proof-suite evaluation and shadow measurements report.
+Chomp came out of the Stratum project's CI in September 2026 (as Forge; renamed 2026-10-30) and has reviewed its changes since v1.0.0. The 1.x release line stands at v1.1.8. The 2.0 agent path is merged on `main` behind the `chomp_agent` flag (default `off`) and is described in `CHANGELOG.md` under `v2.0.0`; the tag and release follow once the proof-suite evaluation and shadow measurements report.
 
 ## Versioning and upgrades
 
 Releases are Git tags: `v1.0.0` through `v1.1.8` at the time of writing, plus an unreleased `v2.0.0` changelog entry for the flag-gated 2.0 path. There is no version file. `CHANGELOG.md` carries one entry per tag, and the entries describe the failure each fix addresses.
 
-To upgrade a consuming project, check the changelog, then change the pinned ref in the caller workflow and the `forge_ref` input to the same new value. Projects pin their own ref; nothing upgrades underneath a consumer.
+To upgrade a consuming project, check the changelog, then change the pinned ref in the caller workflow and the `chomp_ref` input to the same new value. Projects pin their own ref; nothing upgrades underneath a consumer.
 
 ## Contributing
 
@@ -249,4 +249,4 @@ Read `AGENTS.md` before changing anything. The short version: every behavior cha
 
 0BSD license. Do whatever you want with the code. Just don't expect it to work or sue me.
 
- PR-Agent runs unmodified from PyPI at review time and stays under its own license, AGPL-3.0. Running an unmodified AGPL package inside your own CI carries no source-offer obligation for your code.
+PR-Agent runs unmodified from PyPI at review time and stays under its own license, MIT.
