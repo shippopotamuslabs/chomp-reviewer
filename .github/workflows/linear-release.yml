@@ -1,0 +1,42 @@
+name: Linear Release
+
+# CHOMP-57: a version tag is this repo's release act. When one lands,
+# the issues it shipped move from Merged to Released in Linear via
+# .github/scripts/linear_release.py. The official Linear Releases
+# integration does this natively but is Business-plan only; this
+# workspace is on Basic, so the flip is hand-rolled here.
+#
+# Needs the LINEAR_API_KEY repo secret (a Linear personal API key).
+# Until it exists the script logs a notice and exits green, so tag
+# pushes never show a failed check. This workflow is not a required
+# status check and must not be added to branch protection.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to process (e.g. v2.1.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  linear-release:
+    name: linear-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the tag with full history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Flip shipped issues to Released in Linear
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: python3 .github/scripts/linear_release.py "${{ inputs.tag || github.ref_name }}"
