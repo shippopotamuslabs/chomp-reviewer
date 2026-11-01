@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.1.2 (2026-11-01)
+
+Fix: queued runs acted on their trigger SHA instead of the live head (CHOMP-58). The reusable workflow serializes runs per PR, so a verify run executes minutes after its trigger; it fetched final-state files at the stale trigger SHA and posted NOT_ADDRESSED verdicts for findings already fixed on the current head, and the first review could post already stale. Verify and master now fetch the live head before posting anything: a superseded run posts nothing, logs the superseding SHA, and exits as a no-op — the queued run for the live head does the real work. An unreadable live head never supersedes. The same guard covers the GitLab path.
+
+The consolidated rollup now carries currency (CHOMP-59): after a verify pass, the rollup gains a `Last verified at` line naming the head the open findings were re-checked against. The marker line keeps the originally reviewed SHA; duplicate suppression and marker recognition are unchanged.
+
+Consumer action: bump both pins to v2.1.2 together.
+
 ## v2.1.1 (2026-10-30)
 
 Fix: the reusable workflow's two inline marker-check steps passed an
