@@ -169,6 +169,139 @@ def post_discussion_reply(api_url, project_id, iid, disc_id, token, body):
     )
 
 
+def superseded_by(run_sha, live_sha):
+    """True when the live head has moved past the SHA this run targets.
+
+    Queued runs execute minutes after their trigger (workflow concurrency
+    queue), so a verify run's --sha routinely names a superseded commit.
+    Verdicts computed against it are false noise on the current head —
+    the queued run for the newer head performs the real verify. An
+    unknown live head (None) never supersedes (CHOMP-58).
+    """
+    return bool(run_sha) and bool(live_sha) and run_sha != live_sha
+
+
+def live_head_sha(platform, api_url, project_id, iid, token,
+                  gh_api, gh_repo, gh_token):
+    """Fetch the MR/PR's live head SHA, or None when it cannot be read."""
+    if platform == "github":
+        return github_backend.fetch_live_head_sha(
+            gh_api, gh_repo, iid, gh_token)
+    try:
+        mr = gitlab_request(
+            "GET",
+            f"{api_url}/projects/{project_id}/merge_requests/{iid}",
+            token, fatal=False)
+    except Exception:
+        return None
+    return (mr or {}).get("sha") or None
+
+
+LAST_VERIFIED_RE = re.compile(
+    r"<!-- chomp:last-verified sha:[0-9a-f]+ -->\n"
+    r"Last verified at `[^`]+`\.\n?")
+
+
+def apply_rollup_currency(body, sha):
+    """Return the rollup body with its currency line set to sha (CHOMP-59).
+
+    The consolidated-review marker line is load-bearing (duplicate
+    suppression and verify both find the rollup by it), so it is never
+    rewritten: the reviewed SHA stays as provenance and a separate
+    last-verified line carries currency. Re-applying replaces the
+    previous currency line instead of stacking a new one.
+    """
+    block = (f"<!-- chomp:last-verified sha:{sha} -->\n"
+             f"Last verified at `{(sha or '')[:8]}`.")
+    body = LAST_VERIFIED_RE.sub("", body or "")
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if "consolidated-review" in line:
+            lines.insert(i + 1, block)
+            return "\n".join(lines)
+    lines.insert(0, block)
+    return "\n".join(lines)
+
+
+SUPERSEDED_RE = re.compile(
+    r"<!-- chomp:superseded sha:[0-9a-f]+ -->\n"
+    r"Superseded by a review at `[^`]+`\.\n?")
+
+
+def mark_rollup_superseded(body, by_sha):
+    """Return the rollup body labelled superseded by a newer review.
+
+    For a wholesale replacement (a fresh consolidated review posted for a
+    newer head): the old rollup stays readable as history but never reads
+    as the current review. Idempotent per by_sha, like the currency line.
+    """
+    block = (f"<!-- chomp:superseded sha:{by_sha} -->\n"
+             f"Superseded by a review at `{(by_sha or '')[:8]}`.")
+    body = SUPERSEDED_RE.sub("", body or "")
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if "consolidated-review" in line:
+            lines.insert(i + 1, block)
+            return "\n".join(lines)
+    lines.insert(0, block)
+    return "\n".join(lines)
+
+
+def update_rollup_currency(platform, api_url, project_id, iid, sha, token,
+                           gh_api, gh_repo, gh_token):
+    """Edit the consolidated rollup so its currency names sha (CHOMP-59).
+
+    Returns True when the edit was needed but failed (the caller counts
+    it like a reply failure); False when updated or when there is no
+    rollup to update. GitHub edits the issue comment; GitLab edits the
+    rollup note.
+    """
+    try:
+        if platform == "github":
+            comment = None
+            for marker in ("chomp:consolidated-review",
+                           "forge:consolidated-review"):
+                comment = github_backend.find_marker_comment(
+                    gh_api, gh_repo, iid, gh_token, marker)
+                if comment:
+                    break
+            if not comment:
+                return False
+            new_body = apply_rollup_currency(comment.get("body") or "", sha)
+            if new_body == (comment.get("body") or ""):
+                return False
+            github_backend.update_issue_comment(
+                gh_api, gh_repo, comment["id"], gh_token, new_body)
+        else:
+            notes = gitlab_request(
+                "GET",
+                f"{api_url}/projects/{project_id}/merge_requests/{iid}"
+                f"/notes?per_page=100",
+                token, fatal=False)
+            note = None
+            for candidate in notes or []:
+                if any(m in (candidate.get("body") or "") for m in
+                       ("chomp:consolidated-review",
+                        "forge:consolidated-review")):
+                    note = candidate
+                    break
+            if not note:
+                return False
+            new_body = apply_rollup_currency(note.get("body") or "", sha)
+            if new_body == (note.get("body") or ""):
+                return False
+            gitlab_request(
+                "PUT",
+                f"{api_url}/projects/{project_id}/merge_requests/{iid}"
+                f"/notes/{note['id']}",
+                token, data={"body": new_body}, fatal=False)
+        print(f"Rollup currency updated to {sha[:8]}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"ERROR: rollup currency update failed: {e}", file=sys.stderr)
+        return True
+
+
 FOCUS_FILES_RE = re.compile(r"((?:[\w\-.]+/)*[\w\-.]+?\.\w+)\[L?\d+(?:-\d+)?\]")
 DIFF_BUDGET_CHARS = 30000
 
@@ -620,6 +753,19 @@ def main():
         print("No diff content; nothing to verify.", file=sys.stderr)
         return
 
+    # Live-head guard (CHOMP-58): a queued run executes minutes after its
+    # trigger, behind earlier runs. If head has moved past this run's
+    # SHA, every verdict it could post would judge a superseded commit —
+    # post nothing; the queued run for the live head verifies for real.
+    if not args.dry_run:
+        live_sha = live_head_sha(platform, api_url, project_id, args.iid,
+                                 gitlab_token, gh_api, gh_repo, gh_token)
+        if superseded_by(args.sha, live_sha):
+            print(f"Superseded: this run targets {args.sha[:8]} but live "
+                  f"head is {live_sha[:8]}; posting nothing, the run for "
+                  f"the live head will verify.", file=sys.stderr)
+            return
+
     # Get open Forge discussions (GitHub: review threads)
     if platform == "github":
         discussions = github_backend.get_forge_review_threads(
@@ -730,6 +876,16 @@ def main():
     if resolve_failed:
         print(f"ERROR: {resolve_failed} discussions could not be resolved", file=sys.stderr)
 
+    # Rollup currency (CHOMP-59): this run re-checked the open findings
+    # against args.sha, so the consolidated comment's last-verified line
+    # now names it. Only when at least one discussion was verified — a
+    # run that verified nothing must not claim a re-check happened.
+    currency_failed = False
+    if discussions and not args.dry_run:
+        currency_failed = update_rollup_currency(
+            platform, api_url, project_id, args.iid, args.sha,
+            gitlab_token, gh_api, gh_repo, gh_token)
+
     conformance_post_failed = verify_conformance_recheck(
         platform, api_url, project_id, args.iid, args.sha, diff,
         gitlab_token, gh_api, gh_repo, gh_token,
@@ -737,7 +893,8 @@ def main():
     )
     if conformance_post_failed:
         print("ERROR: conformance re-check could not be posted", file=sys.stderr)
-    if reply_failed or resolve_failed or conformance_post_failed:
+    if reply_failed or resolve_failed or conformance_post_failed \
+            or currency_failed:
         sys.exit(1)
 
 

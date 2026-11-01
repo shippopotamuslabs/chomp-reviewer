@@ -69,6 +69,8 @@ The rollup and every inline comment carry a `chomp:consolidated-review` marker. 
 
 Since v1.1.5 the reusable workflow serializes runs per pull request itself: one job-level concurrency group per repo and PR (`chomp-review-<repo>-<PR>`, never cancelled mid-post), so queued pushes each still get their verify pass in turn, and master re-checks the marker immediately before posting (on GitHub and GitLab) as a final guard against double-posting. Callers need no change beyond bumping both pins to the new tag together; pins before v1.1.5 can double-post on a rapid double-push.
 
+Since v2.1.2 a queued run checks the live head before it posts anything. A run whose head has moved on posts nothing and logs the superseding SHA; the queued run for the live head does the review or verify. Verdicts and reviews therefore always describe the head they name. After a verify pass, the rollup gains a `Last verified at` line naming the head the open findings were re-checked against; the marker line keeps the originally reviewed SHA.
+
 Verify collects the open Chomp review threads, skipping the rollup comment and threads that already resolved. For each finding it builds the evidence fresh:
 
 - the current pull request diff, scoped to the files the finding cites

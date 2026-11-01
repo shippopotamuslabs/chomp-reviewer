@@ -92,6 +92,24 @@ def get_pull_request(api_url, repo, number, token):
         "GET", f"{api_url}/repos/{repo}/pulls/{number}", token)
 
 
+def fetch_live_head_sha(api_url, repo, number, token):
+    """Return the PR's live head SHA, or None when it cannot be read.
+
+    The live-head guard (CHOMP-58) compares this against the SHA a queued
+    run was triggered for: runs execute minutes after their trigger, so
+    the two routinely differ. An unreadable head is "unknown", never
+    evidence of supersession — callers must proceed on None.
+    """
+    try:
+        pr = github_request(
+            "GET", f"{api_url}/repos/{repo}/pulls/{number}", token,
+            fatal=False)
+    except Exception:
+        return None
+    head = (pr or {}).get("head") or {}
+    return head.get("sha") or None
+
+
 def fetch_pull_files(api_url, repo, number, token):
     """List every file changed in the PR via the pulls files API.
 
@@ -293,6 +311,13 @@ def post_issue_comment(api_url, repo, number, token, body):
     return github_request(
         "POST", f"{api_url}/repos/{repo}/issues/{number}/comments",
         token, data={"body": body})
+
+
+def update_issue_comment(api_url, repo, comment_id, token, body):
+    """Edit an existing PR conversation comment (the rollup, CHOMP-59)."""
+    return github_request(
+        "PATCH", f"{api_url}/repos/{repo}/issues/comments/{comment_id}",
+        token, data={"body": body}, fatal=False)
 
 
 def post_review_comment(api_url, repo, number, token, body, commit_id,

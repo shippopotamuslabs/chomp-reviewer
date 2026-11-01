@@ -50,6 +50,41 @@ class DuplicateReviewPost(Exception):
                          % (existing_id,))
         self.existing_id = existing_id
 
+class SupersededReviewPost(Exception):
+    """The PR/MR head moved past this run's SHA before it could post.
+
+    Carries the live head SHA in live_sha (CHOMP-58).
+    """
+    def __init__(self, live_sha):
+        super().__init__("head superseded by %s" % (live_sha,))
+        self.live_sha = live_sha
+
+
+def live_head_supersedes(sha, live_sha):
+    """True when the live head has moved past the SHA this run targets.
+
+    Queued runs execute minutes after their trigger, so the review they
+    computed can be stale at post time. An unknown live head (None)
+    never supersedes.
+    """
+    return bool(sha) and bool(live_sha) and sha != live_sha
+
+
+def fetch_live_head_sha_gitlab(api_url, project_id, iid, token):
+    """Return the MR's live head SHA via the GitLab API, or None.
+
+    gitlab_request exits on HTTP errors; that SystemExit is the failure
+    signal here, because an unreadable head must not block a review.
+    """
+    try:
+        mr = gitlab_request(
+            "GET",
+            f"{api_url}/projects/{project_id}/merge_requests/{iid}",
+            token)
+    except SystemExit:
+        return None
+    return (mr or {}).get("sha") or None
+
 def detect_platform():
     """Select the review platform backend from the environment.
 
@@ -768,7 +803,8 @@ def build_inline(sha, finding, meta=None):
 {build_agent_prompt(finding)}"""
 
 def write_recorded_json(iid, sha, platform, recorded, failed, tickets,
-                        conformance, duplicate_suppressed=False):
+                        conformance, duplicate_suppressed=False,
+                        superseded_by=None):
     """Write forge-recorded.json for the verify job (write-only context)."""
     payload = {
         "iid": iid,
@@ -781,6 +817,8 @@ def write_recorded_json(iid, sha, platform, recorded, failed, tickets,
     }
     if duplicate_suppressed:
         payload["duplicate_suppressed"] = True
+    if superseded_by:
+        payload["superseded_by"] = superseded_by
     with open("forge-recorded.json", "w") as f:
         json.dump(payload, f, indent=2)
 
@@ -794,6 +832,28 @@ def post_and_record(platform, args, summary, findings, diff, ticket_keys,
     post-only mode. Posting functions are unchanged; this only factors
     the common call, record, and count reporting.
     """
+    # Live-head guard (CHOMP-58): this run may have waited in the
+    # workflow queue while head moved. Posting now would pin a review
+    # computed for a superseded SHA onto the current tip. Post nothing;
+    # the queued run for the live head finds no marker and reviews it.
+    if platform == "github":
+        gh_api0, gh_repo0, gh_token0 = github_backend.gh_env()
+        live_sha = github_backend.fetch_live_head_sha(
+            gh_api0, gh_repo0, args.iid, gh_token0)
+    else:
+        live_sha = fetch_live_head_sha_gitlab(
+            api_url, project_id, args.iid, gitlab_token)
+    if live_head_supersedes(args.sha, live_sha):
+        print(f"Superseded: this run targets {args.sha[:8]} but live "
+              f"head is {live_sha[:8]}; posting nothing, the run for "
+              f"the live head will review.", file=sys.stderr)
+        write_recorded_json(args.iid, args.sha, platform, [], [],
+                            ticket_keys, conformance,
+                            superseded_by=live_sha)
+        print("Recorded 0 discussions to forge-recorded.json",
+              file=sys.stderr)
+        return
+
     try:
         if platform == "github":
             gh_api, gh_repo, gh_token = github_backend.gh_env()
