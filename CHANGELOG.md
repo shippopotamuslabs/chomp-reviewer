@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.2.0 (2026-11-06)
+
+Feature: the reusable workflow refuses oversized PRs deterministically (CHOMP-61). A new `max_diff_lines` workflow input (default 2000) caps the diff Chomp will review, in changed lines (additions + deletions) measured on the fetched diff. A PR over the limit gets the consolidated review posted with a single size verdict — its changed-line and file counts against the limit, and an instruction to break it up — and the chomp-review job fails with that verdict as the reason. No producers run and nothing reaches synthesis, where an oversized diff previously died with a context-compaction failure and posted nothing (stratum PR #96, 13,419 changed lines, 2026-11-06). PRs at or under the limit review exactly as before, and verify-mode re-pushes skip the gate.
+
+Consumer action: none required. Callers who want a different cap pass `max_diff_lines` when they next bump pins.
+
 ## v2.1.2 (2026-11-01)
 
 Fix: queued runs acted on their trigger SHA instead of the live head (CHOMP-58). The reusable workflow serializes runs per PR, so a verify run executes minutes after its trigger; it fetched final-state files at the stale trigger SHA and posted NOT_ADDRESSED verdicts for findings already fixed on the current head, and the first review could post already stale. Verify and master now fetch the live head before posting anything: a superseded run posts nothing, logs the superseding SHA, and exits as a no-op — the queued run for the live head does the real work. An unreadable live head never supersedes. The same guard covers the GitLab path.
