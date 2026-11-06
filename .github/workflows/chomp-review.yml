@@ -95,6 +95,10 @@ on:
         description: "Pinned PR-Agent version (installed unmodified from PyPI)"
         type: string
         default: "0.49.0"
+      max_diff_lines:
+        description: "Largest PR diff Chomp will review, in changed lines (additions + deletions); a bigger PR gets a posted 'too big' verdict and a failed check (CHOMP-61)"
+        type: string
+        default: "2000"
       forge_agent:
         description: 'Legacy alias of chomp_agent'
         type: string
@@ -229,6 +233,26 @@ jobs:
               fh.write("exists=%s\n" % ("yes" if found else "no"))
           print("Existing consolidated review:", "yes" if found else "no")
           PY
+
+      - name: Enforce the PR size limit
+        # CHOMP-61: an oversized PR is unreviewable, and synthesis
+        # dies on one with a compaction failure that posts nothing —
+        # an ambiguous red check and no review. The gate measures
+        # mr.diff before any producer runs, posts the size verdict
+        # as the consolidated review, and fails the job. Verify-mode
+        # runs (a consolidated review already exists) skip the gate:
+        # re-pushes still get their verify pass.
+        if: steps.marker.outputs.exists != 'yes'
+        working-directory: forge
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
+        run: |
+          python3 .forge/size_gate.py --diff mr.diff \
+            --max-lines "$MAX_DIFF_LINES" \
+            --iid "$PR_NUMBER" --sha "$HEAD_SHA"
 
       - name: Fetch base branch for the contract channel
         # Forge 2.0 only (flag on or shadow): the contract lens resolves

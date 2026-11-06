@@ -96,6 +96,7 @@ jobs:
       chomp_ref: v2.1.0   # the release this repo runs
       chomp_app_id: 1234567   # your Chomp app's ID - see "Your own Chomp app" below
       # chomp_agent: "on"   # opt-in: run reviews through the 2.0 engine path (see "The Chomp engine")
+      # max_diff_lines: "2000"   # largest diff Chomp will review; a bigger PR gets a posted 'too big' verdict and a failed check
     secrets:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       FORGE_APP_PRIVATE_KEY: ${{ secrets.FORGE_APP_PRIVATE_KEY }}
@@ -157,6 +158,7 @@ Every adopter-visible setting on the 2.0 path, defaults verified against the shi
 | `forge_agent` | `off` | workflow input | `off`: 1.x behavior. `on`: 2.0 runs and posts. `shadow`: 2.0 runs, 1.x posts, 2.0 findings + decision log upload as artifacts. |
 | `model` | `openrouter/meta/muse-spark-1.3-contributor` | workflow input (empty = default) | Review model for every 2.0 session and for PR-Agent. The `openrouter/` prefix is stripped before direct API calls. Per-lens model overrides are not implemented. |
 | `pr_agent_version` | `0.49.0` | workflow input | PR-Agent version installed unmodified from PyPI. |
+| `max_diff_lines` | `2000` | workflow input | Largest PR diff Chomp will review, in changed lines (additions + deletions). A bigger PR gets the consolidated review posted with a single size verdict and the review job fails; no producers run. |
 | `forge_ref` | `main` | caller (pinned per repo) | Forge ref the workflow checks out and builds `chomp` from. For 2.0 it must contain the Rust host. |
 | `entry_file` | `AGENTS.md` | compiled default | The agent file every session reads first. |
 | `entry_max_lines` | `2000` | compiled default | Lines of the entry file kept before the session sees the routing table instead. |

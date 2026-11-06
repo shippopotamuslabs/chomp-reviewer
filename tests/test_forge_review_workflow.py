@@ -241,5 +241,53 @@ class ForgeReviewWorkflowTest(unittest.TestCase):
                               % n)
 
 
+class SizeGateWorkflowTest(unittest.TestCase):
+    """CHOMP-61: the size gate refuses oversized PRs deterministically.
+
+    The max_diff_lines input carries the cap (default 2000 changed
+    lines); one marker-gated step runs size_gate.py after the diff is
+    fetched and before every producer, so an oversized PR posts its
+    size verdict and fails without anything reaching synthesis.
+    """
+
+    def test_max_diff_lines_input_defaults_to_2000(self):
+        text = _read(WORKFLOW)
+        _, _, tail = text.partition("\n      max_diff_lines:")
+        block, _, _ = tail.partition("\n      forge_agent:")
+        self.assertIn("type: string", block)
+        self.assertIn('default: "2000"', block)
+
+    def test_size_gate_step_shape(self):
+        steps = _steps(_read(WORKFLOW))
+        gates = [b for n, b in steps if n == "Enforce the PR size limit"]
+        self.assertEqual(len(gates), 1, "expected exactly one size gate step")
+        body = gates[0]
+        self.assertIn("steps.marker.outputs.exists != 'yes'", body)
+        self.assertIn("python3 .forge/size_gate.py", body)
+        self.assertIn('--max-lines "$MAX_DIFF_LINES"', body)
+        self.assertIn("MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}", body)
+        self.assertIn('PR_NUMBER: ${{ github.event.pull_request.number }}', body)
+        self.assertIn('HEAD_SHA: ${{ github.event.pull_request.head.sha }}', body)
+
+    def test_size_gate_runs_after_marker_check_before_producers(self):
+        names = [n for n, _ in _steps(_read(WORKFLOW))]
+        gate = names.index("Enforce the PR size limit")
+        self.assertGreater(
+            gate, names.index("Check for an existing consolidated review"))
+        for later in (
+            "Fetch base branch for the contract channel",
+            "Chomp review (2.0 producers + synthesis)",
+            "PR-Agent producer (silent, plain-diff)",
+            "Thermos correctness lens",
+            "Thermos structure lens",
+        ):
+            self.assertLess(gate, names.index(later), later)
+        master = next(i for i, n in enumerate(names) if n.startswith("Master"))
+        self.assertLess(gate, master)
+
+    def test_readme_documents_max_diff_lines(self):
+        self.assertIn("max_diff_lines", _read(README))
+
+
 if __name__ == "__main__":
     unittest.main()
